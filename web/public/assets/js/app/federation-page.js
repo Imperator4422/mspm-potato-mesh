@@ -204,7 +204,7 @@ function hasNumberValue(value) {
   return toFiniteNumber(value) != null;
 }
 
-const TILE_LAYER_URL = 'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png';
+const TILE_LAYER_URL = 'https://map.invalid-domain.org/styles/basic-preview/{z}/{x}/{y}.png';
 
 /**
  * Initialize the federation page by fetching instances, rendering the map,

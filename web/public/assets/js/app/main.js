@@ -851,7 +851,7 @@ export function initializeApp(config) {
 
 
   // --- Map setup ---
-  const TILE_LAYER_URL = 'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png';
+  const TILE_LAYER_URL = 'https://map.invalid-domain.org/styles/basic-preview/{z}/{x}/{y}.png';
   const TILE_FILTER_LIGHT = config.tileFilters.light;
   const TILE_FILTER_DARK = config.tileFilters.dark;
 
