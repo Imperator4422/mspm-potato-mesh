@@ -537,6 +537,20 @@ RSpec.describe PotatoMesh::Config do
     end
   end
 
+  describe ".tile_layer_url" do
+    it "returns the default URL when not configured" do
+      within_env("TILE_LAYER_URL" => nil) do
+        expect(described_class.tile_layer_url).to eq("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png")
+      end
+    end
+
+    it "returns the configured URL" do
+      within_env("TILE_LAYER_URL" => "https://example.com/{z}/{x}/{y}.png") do
+        expect(described_class.tile_layer_url).to eq("https://example.com/{z}/{x}/{y}.png")
+      end
+    end
+  end
+
   # Execute the provided block with temporary environment overrides.
   #
   # @param values [Hash{String=>String, nil}] key/value pairs to set in ENV.

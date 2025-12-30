@@ -125,6 +125,7 @@ module PotatoMesh
           mapZoom: PotatoMesh::Config.map_zoom,
           maxDistanceKm: PotatoMesh::Config.max_distance_km,
           tileFilters: PotatoMesh::Config.tile_filters,
+          tileLayerUrl: PotatoMesh::Config.tile_layer_url,
           instanceDomain: app_constant(:INSTANCE_DOMAIN),
           instancesFeatureEnabled: federation_enabled? && !private_mode?,
         }

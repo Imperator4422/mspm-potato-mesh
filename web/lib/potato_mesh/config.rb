@@ -27,6 +27,7 @@ module PotatoMesh
     DEFAULT_REFRESH_INTERVAL_SECONDS = 60
     DEFAULT_TILE_FILTER_LIGHT = "grayscale(1) saturate(0) brightness(0.92) contrast(1.05)"
     DEFAULT_TILE_FILTER_DARK = "grayscale(1) invert(1) brightness(0.9) contrast(1.08)"
+    DEFAULT_TILE_LAYER_URL = "https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png"
     DEFAULT_MAP_CENTER_LAT = 38.761944
     DEFAULT_MAP_CENTER_LON = -27.090833
     DEFAULT_MAP_CENTER = "#{DEFAULT_MAP_CENTER_LAT},#{DEFAULT_MAP_CENTER_LON}"
@@ -215,6 +216,13 @@ module PotatoMesh
         light: map_tile_filter_light,
         dark: map_tile_filter_dark,
       }.freeze
+    end
+
+    # Retrieve the configured tile layer URL for map tiles.
+    #
+    # @return [String] tile layer URL.
+    def tile_layer_url
+      fetch_string("TILE_LAYER_URL", DEFAULT_TILE_LAYER_URL)
     end
 
     # Retrieve the raw comma separated Prometheus report identifiers.

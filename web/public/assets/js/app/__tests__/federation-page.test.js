@@ -36,7 +36,8 @@ test('federation map centers on configured coordinates and follows theme filters
   const configPayload = {
     mapCenter: { lat: 10, lon: 20 },
     mapZoom: 7,
-    tileFilters: { light: 'brightness(1)', dark: 'invert(1)' }
+    tileFilters: { light: 'brightness(1)', dark: 'invert(1)' },
+    tileLayerUrl: 'https://example.com/{z}/{x}/{y}.png'
   };
   const configEl = createElement('div');
   configEl.setAttribute('data-app-config', JSON.stringify(configPayload));
@@ -231,7 +232,8 @@ test('federation table sorting, contact rendering, and legend creation', async (
   const configPayload = {
     mapCenter: { lat: 0, lon: 0 },
     mapZoom: 3,
-    tileFilters: { light: 'none', dark: 'invert(1)' }
+    tileFilters: { light: 'none', dark: 'invert(1)' },
+    tileLayerUrl: 'https://example.com/{z}/{x}/{y}.png'
   };
   const configEl = createElement('div');
   configEl.setAttribute('data-app-config', JSON.stringify(configPayload));
