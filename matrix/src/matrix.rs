@@ -134,12 +134,50 @@ impl MatrixAppserviceClient {
         }
     }
 
-    /// Send a plain text message into the configured room as puppet user_id.
-    pub async fn send_text_message_as(&self, user_id: &str, body_text: &str) -> anyhow::Result<()> {
+    /// Ensure the puppet user is joined to the configured room.
+    pub async fn ensure_user_joined_room(&self, user_id: &str) -> anyhow::Result<()> {
+        #[derive(Serialize)]
+        struct JoinReq {}
+
+        let encoded_room = urlencoding::encode(&self.cfg.room_id);
+        let encoded_user = urlencoding::encode(user_id);
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/join?user_id={}&{}",
+            self.cfg.homeserver,
+            encoded_room,
+            encoded_user,
+            self.auth_query()
+        );
+
+        let resp = self.http.post(&url).json(&JoinReq {}).send().await?;
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            let status = resp.status();
+            let body_snip = resp.text().await.unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "Matrix join failed for {} in {} with status {} ({})",
+                user_id,
+                self.cfg.room_id,
+                status,
+                body_snip
+            ))
+        }
+    }
+
+    /// Send a text message with HTML formatting into the configured room as puppet user_id.
+    pub async fn send_formatted_message_as(
+        &self,
+        user_id: &str,
+        body_text: &str,
+        formatted_body: &str,
+    ) -> anyhow::Result<()> {
         #[derive(Serialize)]
         struct MsgContent<'a> {
             msgtype: &'a str,
             body: &'a str,
+            format: &'a str,
+            formatted_body: &'a str,
         }
 
         let txn_id = self.txn_counter.fetch_add(1, Ordering::SeqCst);
@@ -158,24 +196,23 @@ impl MatrixAppserviceClient {
         let content = MsgContent {
             msgtype: "m.text",
             body: body_text,
+            format: "org.matrix.custom.html",
+            formatted_body,
         };
 
         let resp = self.http.put(&url).json(&content).send().await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // optional: pull a short body snippet for debugging
             let body_snip = resp.text().await.unwrap_or_default();
 
-            // Log for observability
             tracing::warn!(
-                "Failed to send message as {}: status {}, body: {}",
+                "Failed to send formatted message as {}: status {}, body: {}",
                 user_id,
                 status,
                 body_snip
             );
 
-            // Propagate an error so callers know this message was NOT delivered
             return Err(anyhow::anyhow!(
                 "Matrix send failed for {} with status {}",
                 user_id,
@@ -358,40 +395,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_text_message_as_success() {
+    async fn test_ensure_user_joined_room_success() {
         let mut server = mockito::Server::new_async().await;
         let user_id = "@test:example.org";
         let room_id = "!roomid:example.org";
         let encoded_user = urlencoding::encode(user_id);
         let encoded_room = urlencoding::encode(room_id);
-
-        let client = {
-            let mut cfg = dummy_cfg();
-            cfg.homeserver = server.url();
-            cfg.room_id = room_id.to_string();
-            MatrixAppserviceClient::new(reqwest::Client::new(), cfg)
-        };
-        let txn_id = client.txn_counter.load(Ordering::SeqCst);
         let query = format!("user_id={}&access_token=AS_TOKEN", encoded_user);
-        let path = format!(
-            "/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
-            encoded_room, txn_id
-        );
+        let path = format!("/_matrix/client/v3/rooms/{}/join", encoded_room);
 
         let mock = server
-            .mock("PUT", path.as_str())
+            .mock("POST", path.as_str())
             .match_query(query.as_str())
             .with_status(200)
             .create();
 
-        let result = client.send_text_message_as(user_id, "hello").await;
+        let mut cfg = dummy_cfg();
+        cfg.homeserver = server.url();
+        cfg.room_id = room_id.to_string();
+        let client = MatrixAppserviceClient::new(reqwest::Client::new(), cfg);
+        let result = client.ensure_user_joined_room(user_id).await;
 
         mock.assert();
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_send_text_message_as_fail() {
+    async fn test_ensure_user_joined_room_fail() {
+        let mut server = mockito::Server::new_async().await;
+        let user_id = "@test:example.org";
+        let room_id = "!roomid:example.org";
+        let encoded_user = urlencoding::encode(user_id);
+        let encoded_room = urlencoding::encode(room_id);
+        let query = format!("user_id={}&access_token=AS_TOKEN", encoded_user);
+        let path = format!("/_matrix/client/v3/rooms/{}/join", encoded_room);
+
+        let mock = server
+            .mock("POST", path.as_str())
+            .match_query(query.as_str())
+            .with_status(403)
+            .create();
+
+        let mut cfg = dummy_cfg();
+        cfg.homeserver = server.url();
+        cfg.room_id = room_id.to_string();
+        let client = MatrixAppserviceClient::new(reqwest::Client::new(), cfg);
+        let result = client.ensure_user_joined_room(user_id).await;
+
+        mock.assert();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_send_formatted_message_as_success() {
         let mut server = mockito::Server::new_async().await;
         let user_id = "@test:example.org";
         let room_id = "!roomid:example.org";
@@ -414,12 +470,20 @@ mod tests {
         let mock = server
             .mock("PUT", path.as_str())
             .match_query(query.as_str())
-            .with_status(500)
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "msgtype": "m.text",
+                "body": "`[meta]` hello",
+                "format": "org.matrix.custom.html",
+                "formatted_body": "<code>[meta]</code> hello",
+            })))
+            .with_status(200)
             .create();
 
-        let result = client.send_text_message_as(user_id, "hello").await;
+        let result = client
+            .send_formatted_message_as(user_id, "`[meta]` hello", "<code>[meta]</code> hello")
+            .await;
 
         mock.assert();
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 }
