@@ -183,7 +183,7 @@ module PotatoMesh
     #
     # @return [String] semantic version identifier.
     def version_fallback
-      "0.5.9"
+      "0.5.10"
     end
 
     # Default refresh interval for frontend polling routines.
@@ -442,6 +442,13 @@ module PotatoMesh
     # @return [String] human friendly site label.
     def site_name
       fetch_string("SITE_NAME", "PotatoMesh Demo")
+    end
+
+    # Retrieve the configured announcement banner copy.
+    #
+    # @return [String, nil] announcement string when configured.
+    def announcement
+      fetch_string("ANNOUNCEMENT", nil)
     end
 
     # Retrieve the default radio channel label.
