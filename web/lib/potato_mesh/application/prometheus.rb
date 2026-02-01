@@ -158,7 +158,7 @@ module PotatoMesh
       end
 
       def update_all_prometheus_metrics_from_nodes
-        nodes = query_nodes(1000)
+        nodes = query_nodes(10000)
 
         NODES_GAUGE.set(nodes.size)
 

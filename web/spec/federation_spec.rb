@@ -330,7 +330,7 @@ RSpec.describe PotatoMesh::App::Federation do
 
       mapping = { [seed_domain, "/api/instances"] => [payload_entries, :instances] }
       attributes_list.each_with_index do |attributes, index|
-        mapping[[attributes[:domain], "/api/nodes?since=#{recent_cutoff}&limit=1000"]] = [node_payload, :nodes]
+        mapping[[attributes[:domain], "/api/nodes?since=#{recent_cutoff}&limit=10000"]] = [node_payload, :nodes]
         mapping[[attributes[:domain], "/api/nodes"]] = [node_payload, :nodes]
         mapping[[attributes[:domain], "/api/instances"]] = [[], :instances]
         allow(federation_helpers).to receive(:remote_instance_attributes_from_payload).with(payload_entries[index]).and_return([attributes, "signature-#{index}", nil])
@@ -348,9 +348,9 @@ RSpec.describe PotatoMesh::App::Federation do
       federation_helpers.ingest_known_instances_from!(db, seed_domain)
 
       expect(captured_paths).to include(
-        [attributes_list[0][:domain], "/api/nodes?since=#{recent_cutoff}&limit=1000"],
-        [attributes_list[1][:domain], "/api/nodes?since=#{recent_cutoff}&limit=1000"],
-        [attributes_list[2][:domain], "/api/nodes?since=#{recent_cutoff}&limit=1000"],
+        [attributes_list[0][:domain], "/api/nodes?since=#{recent_cutoff}&limit=10000"],
+        [attributes_list[1][:domain], "/api/nodes?since=#{recent_cutoff}&limit=10000"],
+        [attributes_list[2][:domain], "/api/nodes?since=#{recent_cutoff}&limit=10000"],
       )
       expect(attributes_list.map { |attrs| attrs[:nodes_count] }).to all(eq(node_payload.length))
     end

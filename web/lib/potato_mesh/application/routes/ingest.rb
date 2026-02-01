@@ -35,12 +35,12 @@ module PotatoMesh
             unless data.is_a?(Hash)
               halt 400, { error: "invalid payload" }.to_json
             end
-            halt 400, { error: "too many nodes" }.to_json if data.size > 1000
+            halt 400, { error: "too many nodes" }.to_json if data.size > 10000
             db = open_database
             data.each do |node_id, node|
               upsert_node(db, node_id, node)
             end
-            PotatoMesh::App::Prometheus::NODES_GAUGE.set(query_nodes(1000).length)
+            PotatoMesh::App::Prometheus::NODES_GAUGE.set(query_nodes(10000).length)
             { status: "ok" }.to_json
           ensure
             db&.close
@@ -55,7 +55,7 @@ module PotatoMesh
               halt 400, { error: "invalid JSON" }.to_json
             end
             messages = data.is_a?(Array) ? data : [data]
-            halt 400, { error: "too many messages" }.to_json if messages.size > 1000
+            halt 400, { error: "too many messages" }.to_json if messages.size > 10000
             db = open_database
             messages.each do |msg|
               insert_message(db, msg)
@@ -303,7 +303,7 @@ module PotatoMesh
               halt 400, { error: "invalid JSON" }.to_json
             end
             positions = data.is_a?(Array) ? data : [data]
-            halt 400, { error: "too many positions" }.to_json if positions.size > 1000
+            halt 400, { error: "too many positions" }.to_json if positions.size > 10000
             db = open_database
             positions.each do |pos|
               insert_position(db, pos)
@@ -322,7 +322,7 @@ module PotatoMesh
               halt 400, { error: "invalid JSON" }.to_json
             end
             neighbor_payloads = data.is_a?(Array) ? data : [data]
-            halt 400, { error: "too many neighbor packets" }.to_json if neighbor_payloads.size > 1000
+            halt 400, { error: "too many neighbor packets" }.to_json if neighbor_payloads.size > 10000
             db = open_database
             neighbor_payloads.each do |packet|
               insert_neighbors(db, packet)
@@ -341,7 +341,7 @@ module PotatoMesh
               halt 400, { error: "invalid JSON" }.to_json
             end
             telemetry_packets = data.is_a?(Array) ? data : [data]
-            halt 400, { error: "too many telemetry packets" }.to_json if telemetry_packets.size > 1000
+            halt 400, { error: "too many telemetry packets" }.to_json if telemetry_packets.size > 10000
             db = open_database
             telemetry_packets.each do |packet|
               insert_telemetry(db, packet)
@@ -360,7 +360,7 @@ module PotatoMesh
               halt 400, { error: "invalid JSON" }.to_json
             end
             trace_packets = data.is_a?(Array) ? data : [data]
-            halt 400, { error: "too many traces" }.to_json if trace_packets.size > 1000
+            halt 400, { error: "too many traces" }.to_json if trace_packets.size > 10000
             db = open_database
             trace_packets.each do |packet|
               insert_trace(db, packet)

@@ -2777,8 +2777,8 @@ RSpec.describe "Potato Mesh Sinatra app" do
       end
     end
 
-    it "returns 400 when more than 1000 nodes are provided" do
-      payload = (0..1000).each_with_object({}) do |i, acc|
+    it "returns 400 when more than 10000 nodes are provided" do
+      payload = (0..10000).each_with_object({}) do |i, acc|
         acc["node-#{i}"] = {}
       end
 
@@ -3640,8 +3640,8 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(JSON.parse(last_response.body)).to eq("error" => "invalid JSON")
       end
 
-      it "returns 400 when more than 1000 telemetry packets are provided" do
-        payload = Array.new(1001) { |i| { "id" => i + 1, "rx_time" => reference_time.to_i - i } }
+      it "returns 400 when more than 10000 telemetry packets are provided" do
+        payload = Array.new(10001) { |i| { "id" => i + 1, "rx_time" => reference_time.to_i - i } }
 
         post "/api/telemetry", payload.to_json, auth_headers
 
@@ -3759,8 +3759,8 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(JSON.parse(last_response.body)).to eq("error" => "invalid JSON")
       end
 
-      it "returns 400 when more than 1000 traces are provided" do
-        payload = Array.new(1001) { |i| { "id" => i + 1, "rx_time" => reference_time.to_i - i } }
+      it "returns 400 when more than 10000 traces are provided" do
+        payload = Array.new(10001) { |i| { "id" => i + 1, "rx_time" => reference_time.to_i - i } }
 
         post "/api/traces", payload.to_json, auth_headers
 
@@ -3774,8 +3774,17 @@ RSpec.describe "Potato Mesh Sinatra app" do
       end
     end
 
-    it "returns 400 when more than 1000 messages are provided" do
-      payload = Array.new(1001) { |i| { "packet_id" => i + 1 } }
+    describe "POST /api/positions" do
+      it "returns 400 when more than 10000 positions are provided" do
+        payload = Array.new(10001, {})
+        post "/api/positions", payload.to_json, auth_headers
+        expect(last_response.status).to eq(400)
+        expect(JSON.parse(last_response.body)).to eq("error" => "too many positions")
+      end
+    end
+
+    it "returns 400 when more than 10000 messages are provided" do
+      payload = Array.new(10001) { |i| { "packet_id" => i + 1 } }
 
       post "/api/messages", payload.to_json, auth_headers
 

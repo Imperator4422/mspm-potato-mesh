@@ -17,7 +17,7 @@
 module PotatoMesh
   module App
     module Queries
-      MAX_QUERY_LIMIT = 1000
+      MAX_QUERY_LIMIT = 10000
       DEFAULT_TELEMETRY_WINDOW_SECONDS = 86_400
       DEFAULT_TELEMETRY_BUCKET_SECONDS = 300
       TELEMETRY_ZERO_INVALID_COLUMNS = %w[battery_level voltage].freeze

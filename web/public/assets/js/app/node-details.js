@@ -25,9 +25,9 @@ import {
 } from './snapshot-aggregator.js';
 
 const DEFAULT_FETCH_OPTIONS = Object.freeze({ cache: 'no-store' });
-const TELEMETRY_LIMIT = 1000;
+const TELEMETRY_LIMIT = 10000;
 const POSITION_LIMIT = SNAPSHOT_WINDOW;
-const NEIGHBOR_LIMIT = 1000;
+const NEIGHBOR_LIMIT = 10000;
 
 /**
  * Determine whether the supplied value behaves like a plain object.
