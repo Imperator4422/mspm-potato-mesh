@@ -18,7 +18,7 @@
  * Maximum number of chat messages that the API can return in a single request.
  * @type {number}
  */
-export const MESSAGE_LIMIT = 10000;
+export const MESSAGE_LIMIT = 2000;
 
 /**
  * Normalise a candidate limit for the messages API to remain within supported bounds.

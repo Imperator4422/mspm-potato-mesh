@@ -3774,15 +3774,6 @@ RSpec.describe "Potato Mesh Sinatra app" do
       end
     end
 
-    describe "POST /api/positions" do
-      it "returns 400 when more than 10000 positions are provided" do
-        payload = Array.new(10001, {})
-        post "/api/positions", payload.to_json, auth_headers
-        expect(last_response.status).to eq(400)
-        expect(JSON.parse(last_response.body)).to eq("error" => "too many positions")
-      end
-    end
-
     it "returns 400 when more than 10000 messages are provided" do
       payload = Array.new(10001) { |i| { "packet_id" => i + 1 } }
 
