@@ -781,12 +781,21 @@ module PotatoMesh
           params << num
         end
 
+        # Calculate telemetry rate over the last 7 days
+        week_ago = Time.now.to_i - (7 * 24 * 60 * 60)
+        recent_count = db.get_first_value(
+          "SELECT COUNT(*) FROM telemetry WHERE node_id = ? AND COALESCE(rx_time, telemetry_time, 0) >= ?",
+          [id, week_ago]
+        )
+        telemetry_avg = recent_count ? (recent_count.to_f / 7.0) : 0.0
+
         metric_updates = {
           "battery_level" => battery,
           "voltage" => voltage,
           "channel_utilization" => channel_util,
           "air_util_tx" => air_util_tx,
           "uptime_seconds" => uptime,
+          "telemetry_24h_avg" => telemetry_avg,
         }
 
         metric_updates.each do |column, value|

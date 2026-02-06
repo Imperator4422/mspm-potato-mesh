@@ -152,6 +152,7 @@ export function initializeApp(config) {
     battery_level: { getValue: n => n.battery_level, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
     voltage: { getValue: n => n.voltage, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
     uptime_seconds: { getValue: n => n.uptime_seconds, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
+    telemetry_24h_avg: { getValue: n => n.telemetry_24h_avg, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
     channel_utilization: { getValue: n => n.channel_utilization, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
     air_util_tx: { getValue: n => n.air_util_tx, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
     temperature: { getValue: n => n.temperature, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
@@ -595,7 +596,7 @@ export function initializeApp(config) {
       if (typeof fullscreenContainer.requestFullscreen === 'function') {
         const result = fullscreenContainer.requestFullscreen();
         if (result && typeof result.catch === 'function') {
-          result.catch(() => {});
+          result.catch(() => { });
         }
         return;
       }
@@ -622,7 +623,7 @@ export function initializeApp(config) {
       if (typeof document.exitFullscreen === 'function') {
         const result = document.exitFullscreen();
         if (result && typeof result.catch === 'function') {
-          result.catch(() => {});
+          result.catch(() => { });
         }
         return;
       }
@@ -1437,12 +1438,12 @@ export function initializeApp(config) {
       title.textContent = 'Legend';
 
       const itemsContainer = L.DomUtil.create('div', 'legend-items', div);
-    legendRoleButtons.clear();
-    for (const [role, color] of Object.entries(roleColors)) {
-      if (!CHAT_ENABLED && role === 'CLIENT_HIDDEN') continue;
-      const item = L.DomUtil.create('button', 'legend-item', itemsContainer);
-      item.type = 'button';
-      item.setAttribute('aria-pressed', 'false');
+      legendRoleButtons.clear();
+      for (const [role, color] of Object.entries(roleColors)) {
+        if (!CHAT_ENABLED && role === 'CLIENT_HIDDEN') continue;
+        const item = L.DomUtil.create('button', 'legend-item', itemsContainer);
+        item.type = 'button';
+        item.setAttribute('aria-pressed', 'false');
         item.dataset.role = role;
         const swatch = L.DomUtil.create('span', 'legend-swatch', item);
         swatch.style.background = color;
@@ -1546,24 +1547,24 @@ export function initializeApp(config) {
     setLegendVisibility(false);
   }
 
-    themeToggle.addEventListener('click', () => {
-      const dark = document.body.classList.toggle('dark');
-      const themeValue = dark ? 'dark' : 'light';
-      document.body.setAttribute('data-theme', themeValue);
-      if (document.documentElement) {
-        document.documentElement.setAttribute('data-theme', themeValue);
+  themeToggle.addEventListener('click', () => {
+    const dark = document.body.classList.toggle('dark');
+    const themeValue = dark ? 'dark' : 'light';
+    document.body.setAttribute('data-theme', themeValue);
+    if (document.documentElement) {
+      document.documentElement.setAttribute('data-theme', themeValue);
+    }
+    themeToggle.textContent = dark ? '☀️' : '🌙';
+    if (window.__themeCookie) {
+      if (typeof window.__themeCookie.persistTheme === 'function') {
+        window.__themeCookie.persistTheme(themeValue);
+      } else if (typeof window.__themeCookie.setCookie === 'function') {
+        window.__themeCookie.setCookie('theme', themeValue);
       }
-      themeToggle.textContent = dark ? '☀️' : '🌙';
-      if (window.__themeCookie) {
-        if (typeof window.__themeCookie.persistTheme === 'function') {
-          window.__themeCookie.persistTheme(themeValue);
-        } else if (typeof window.__themeCookie.setCookie === 'function') {
-          window.__themeCookie.setCookie('theme', themeValue);
-        }
-      }
-      window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: themeValue } }));
-      if (typeof window.applyFiltersToAllTiles === 'function') window.applyFiltersToAllTiles();
-    });
+    }
+    window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: themeValue } }));
+    if (typeof window.applyFiltersToAllTiles === 'function') window.applyFiltersToAllTiles();
+  });
 
   let lastFocusBeforeInfo = null;
 
@@ -1769,17 +1770,17 @@ export function initializeApp(config) {
     const titleAttr = safeTitle ? ` title="${safeTitle}"` : '';
     const roleValue = normalizeRole(role != null && role !== '' ? role : (nodeData && nodeData.role));
     let infoAttr = '';
-      if (nodeData && typeof nodeData === 'object') {
-        const info = {
-          nodeId: nodeData.node_id ?? nodeData.nodeId ?? '',
-          nodeNum: nodeData.num ?? nodeData.node_num ?? nodeData.nodeNum ?? null,
-          shortName: short != null ? String(short) : (nodeData.short_name ?? ''),
-          longName: nodeData.long_name ?? longName ?? '',
-          role: roleValue,
-          hwModel: nodeData.hw_model ?? nodeData.hwModel ?? '',
-          telemetryTime: nodeData.telemetry_time ?? nodeData.telemetryTime ?? null,
-        };
-        Object.assign(info, collectTelemetryMetrics(nodeData));
+    if (nodeData && typeof nodeData === 'object') {
+      const info = {
+        nodeId: nodeData.node_id ?? nodeData.nodeId ?? '',
+        nodeNum: nodeData.num ?? nodeData.node_num ?? nodeData.nodeNum ?? null,
+        shortName: short != null ? String(short) : (nodeData.short_name ?? ''),
+        longName: nodeData.long_name ?? longName ?? '',
+        role: roleValue,
+        hwModel: nodeData.hw_model ?? nodeData.hwModel ?? '',
+        telemetryTime: nodeData.telemetry_time ?? nodeData.telemetryTime ?? null,
+      };
+      Object.assign(info, collectTelemetryMetrics(nodeData));
       const attrParts = [` data-node-info="${escapeHtml(JSON.stringify(info))}"`];
       const attrNodeIdRaw = info.nodeId != null ? String(info.nodeId).trim() : '';
       if (attrNodeIdRaw) {
@@ -3173,8 +3174,8 @@ export function initializeApp(config) {
    */
   function formatTime(d) {
     return pad(d.getHours()) + ":" +
-          pad(d.getMinutes()) + ":" +
-          pad(d.getSeconds());
+      pad(d.getMinutes()) + ":" +
+      pad(d.getSeconds());
   }
 
   /**
@@ -3185,8 +3186,8 @@ export function initializeApp(config) {
    */
   function formatDate(d) {
     return d.getFullYear() + "-" +
-          pad(d.getMonth() + 1) + "-" +
-          pad(d.getDate());
+      pad(d.getMonth() + 1) + "-" +
+      pad(d.getDate());
   }
 
   /**
@@ -3401,9 +3402,9 @@ export function initializeApp(config) {
     if (!unixSec) return "";
     if (unixSec < 0) return "0s";
     if (unixSec < 60) return `${unixSec}s`;
-    if (unixSec < 3600) return `${Math.floor(unixSec/60)}m ${Math.floor((unixSec%60))}s`;
-    if (unixSec < 86400) return `${Math.floor(unixSec/3600)}h ${Math.floor((unixSec%3600)/60)}m`;
-    return `${Math.floor(unixSec/86400)}d ${Math.floor((unixSec%86400)/3600)}h`;
+    if (unixSec < 3600) return `${Math.floor(unixSec / 60)}m ${Math.floor((unixSec % 60))}s`;
+    if (unixSec < 86400) return `${Math.floor(unixSec / 3600)}h ${Math.floor((unixSec % 3600) / 60)}m`;
+    return `${Math.floor(unixSec / 86400)}d ${Math.floor((unixSec % 86400) / 3600)}h`;
   }
 
   /**
@@ -3413,14 +3414,14 @@ export function initializeApp(config) {
    * @param {number} [nowSec] Reference timestamp.
    * @returns {string} Human readable relative time.
    */
-  function timeAgo(unixSec, nowSec = Date.now()/1000) {
+  function timeAgo(unixSec, nowSec = Date.now() / 1000) {
     if (!unixSec) return "";
     const diff = Math.floor(nowSec - Number(unixSec));
     if (diff < 0) return "0s";
     if (diff < 60) return `${diff}s`;
-    if (diff < 3600) return `${Math.floor(diff/60)}m ${Math.floor((diff%60))}s`;
-    if (diff < 86400) return `${Math.floor(diff/3600)}h ${Math.floor((diff%3600)/60)}m`;
-    return `${Math.floor(diff/86400)}d ${Math.floor((diff%86400)/3600)}h`;
+    if (diff < 3600) return `${Math.floor(diff / 60)}m ${Math.floor((diff % 60))}s`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}h ${Math.floor((diff % 3600) / 60)}m`;
+    return `${Math.floor(diff / 86400)}d ${Math.floor((diff % 86400) / 3600)}h`;
   }
 
   /**
@@ -3824,6 +3825,7 @@ export function initializeApp(config) {
         <td class="nodes-col nodes-col--battery">${fmtAlt(n.battery_level, "%")}</td>
         <td class="nodes-col nodes-col--voltage">${fmtAlt(n.voltage, "V")}</td>
         <td class="nodes-col nodes-col--uptime">${timeHum(n.uptime_seconds)}</td>
+        <td class="nodes-col nodes-col--telemetry-rate">${n.telemetry_24h_avg != null ? n.telemetry_24h_avg.toFixed(1) : ""}</td>
         <td class="nodes-col nodes-col--channel-util">${fmtTx(n.channel_utilization)}</td>
         <td class="nodes-col nodes-col--air-util-tx">${fmtTx(n.air_util_tx)}</td>
         <td class="nodes-col nodes-col--temperature">${fmtTemperature(n.temperature)}</td>
@@ -3890,10 +3892,10 @@ export function initializeApp(config) {
     }
     const traceSegments = traceLinesLayer
       ? buildTraceSegments(allTraces, nodes, {
-          limitDistance: LIMIT_DISTANCE,
-          maxDistanceKm: MAX_DISTANCE_KM,
-          colorForNode: node => getRoleColor(node.role)
-        })
+        limitDistance: LIMIT_DISTANCE,
+        maxDistanceKm: MAX_DISTANCE_KM,
+        colorForNode: node => getRoleColor(node.role)
+      })
       : [];
 
     if (neighborLinesLayer && Array.isArray(allNeighbors) && allNeighbors.length) {
@@ -4007,8 +4009,8 @@ export function initializeApp(config) {
               }
               const clickTarget =
                 event.originalEvent &&
-                typeof Element !== 'undefined' &&
-                event.originalEvent.target instanceof Element
+                  typeof Element !== 'undefined' &&
+                  event.originalEvent.target instanceof Element
                   ? event.originalEvent.target
                   : null;
               const anchorEl = polyline.getElement() || clickTarget;
@@ -4212,7 +4214,7 @@ export function initializeApp(config) {
     const q = normaliseChatFilterQuery(filterQuery);
     const filteredNodes = allNodes.filter(n => matchesTextFilter(n, q) && matchesRoleFilter(n));
     const sortedNodes = sortNodes(filteredNodes);
-    const nowSec = Date.now()/1000;
+    const nowSec = Date.now() / 1000;
     renderTable(sortedNodes, nowSec);
     renderMap(sortedNodes, nowSec);
     updateCount(sortedNodes, nowSec);

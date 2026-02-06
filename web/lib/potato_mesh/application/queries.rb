@@ -245,7 +245,8 @@ module PotatoMesh
                  battery_level, voltage, last_heard, first_heard,
                  uptime_seconds, channel_utilization, air_util_tx,
                  position_time, location_source, precision_bits,
-                 latitude, longitude, altitude, lora_freq, modem_preset
+                 latitude, longitude, altitude, lora_freq, modem_preset,
+                 telemetry_24h_avg
           FROM nodes
         SQL
         sql += "    WHERE #{where_clauses.join(" AND ")}\n" if where_clauses.any?
