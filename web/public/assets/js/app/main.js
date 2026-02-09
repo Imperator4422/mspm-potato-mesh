@@ -194,7 +194,7 @@ export function initializeApp(config) {
     logger: console,
   });
   const NODE_LIMIT = 2000;
-  const TRACE_LIMIT = 200;
+  const TRACE_LIMIT = 500;
   const TRACE_MAX_AGE_SECONDS = 28 * 24 * 60 * 60;
   const SNAPSHOT_LIMIT = SNAPSHOT_WINDOW;
   const CHAT_LIMIT = MESSAGE_LIMIT;

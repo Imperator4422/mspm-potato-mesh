@@ -43,13 +43,13 @@ export const roleIdToName = Object.freeze({
 export const roleColors = Object.freeze({
   CLIENT_HIDDEN: '#A9CBE8',
   SENSOR: '#A8D5BA',
-  TRACKER: '#B9DFAC',
-  CLIENT_MUTE: '#CDE7A9',
-  CLIENT: '#E8E6A1',
-  CLIENT_BASE: '#F6D0A6',
-  REPEATER: '#F7B7A3',
-  ROUTER_LATE: '#F29AA3',
-  ROUTER: '#E88B94',
+  TRACKER: '#99e67f',
+  CLIENT_MUTE: '#bcef75',
+  CLIENT: '#f3ef74',
+  CLIENT_BASE: '#fdbf79',
+  REPEATER: '#fa997b',
+  ROUTER_LATE: '#ff5061',
+  ROUTER: '#ff0019',
   LOST_AND_FOUND: '#C3A8E8'
 });
 

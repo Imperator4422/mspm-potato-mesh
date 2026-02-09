@@ -62,9 +62,9 @@ body.dark {
   --input-border: rgba(230, 235, 240, 0.24);
   --input-placeholder: rgba(230, 235, 240, 0.55);
   --control-accent: var(--accent);
-  --announcement-bg: #3b2500;
-  --announcement-fg: #ffd184;
-  --announcement-border: #a56a00;
+  --announcement-bg: #1e262c;
+  --announcement-fg: #eee;
+  --announcement-border: #757575;
 }
 
 html,
@@ -2164,7 +2164,7 @@ body.dark .chat-entry-reply {
 }
 
 body.dark .short-name {
-  color: #555;
+  color: #000000;
 }
 
 body.dark .chat-entry-date {

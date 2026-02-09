@@ -40,7 +40,7 @@ const HOUR_MS = 3_600_000;
 const TELEMETRY_WINDOW_MS = DAY_MS * 7;
 const DEFAULT_CHART_DIMENSIONS = Object.freeze({ width: 660, height: 360 });
 const DEFAULT_CHART_MARGIN = Object.freeze({ top: 28, right: 80, bottom: 64, left: 80 });
-const TRACE_LIMIT = 200;
+const TRACE_LIMIT = 500;
 /**
  * Telemetry chart definitions describing axes and series metadata.
  *
@@ -120,7 +120,7 @@ const TELEMETRY_CHART_SPECS = Object.freeze([
         position: 'left',
         label: 'Utilization (%)',
         min: 0,
-        max: 100,
+        max: 25,
         ticks: 4,
         color: '#2ca25f',
       },
