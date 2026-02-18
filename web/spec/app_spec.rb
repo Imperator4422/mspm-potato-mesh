@@ -15,6 +15,7 @@
 # frozen_string_literal: true
 
 require "spec_helper"
+require "base64"
 require "sqlite3"
 require "json"
 require "time"
@@ -25,6 +26,9 @@ require "socket"
 RSpec.describe "Potato Mesh Sinatra app" do
   let(:app) { Sinatra::Application }
   let(:application_class) { PotatoMesh::Application }
+  INSERT_NODE_WITH_LAST_HEARD_SQL = "INSERT INTO nodes(node_id, num, last_heard, first_heard) VALUES (?,?,?,?)".freeze
+  INSERT_NODE_WITH_METADATA_SQL = "INSERT INTO nodes(node_id, num, short_name, long_name, hw_model, role, last_heard, first_heard) VALUES(?,?,?,?,?,?,?,?)".freeze
+  SELECT_NODE_LAST_HEARD_SQL = "SELECT last_heard FROM nodes WHERE node_id = ?".freeze
 
   describe "configuration" do
     it "sets the default HTTP port to the baked-in value" do
@@ -405,7 +409,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
     it "stores and clears the initial federation thread" do
       delay = 3
       allow(PotatoMesh::Config).to receive(:initial_federation_delay_seconds).and_return(delay)
-      expect(Kernel).to receive(:sleep).with(delay)
+      expect(app).to receive(:federation_sleep_with_shutdown).with(delay).and_return(true)
       expect(app).to receive(:announce_instance_to_all_domains)
       allow(Thread).to receive(:new) do |&block|
         dummy_thread.block = block
@@ -925,7 +929,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         with_db do |db|
           db.execute(
-            "INSERT INTO nodes(node_id, num, last_heard, first_heard) VALUES (?,?,?,?)",
+            INSERT_NODE_WITH_LAST_HEARD_SQL,
             [node_id, node_num, rx_time - 120, rx_time - 180],
           )
 
@@ -2864,7 +2868,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         count = db.get_first_value("SELECT COUNT(*) FROM nodes WHERE node_id = ?", [node["node_id"]])
         expect(count).to eq(1)
 
-        last_heard = db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [node["node_id"]])
+        last_heard = db.get_first_value(SELECT_NODE_LAST_HEARD_SQL, [node["node_id"]])
         expect(last_heard).to eq(expected_last_heard(node))
       end
     end
@@ -2927,6 +2931,26 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "POST /api/messages" do
+    SELECT_MESSAGE_ENCRYPTED_SQL = "SELECT encrypted FROM messages WHERE id = ?".freeze
+    SELECT_NEIGHBOR_COUNT_BY_NODE_SQL = "SELECT COUNT(*) FROM neighbors WHERE node_id = ?".freeze
+    NODE_INFO_LONG_NAME = "Node Info".freeze
+    FIRST_MESSAGE_INGESTOR_ID = "!1111aaaa".freeze
+    SHARED_TEST_INGESTOR_ID = "!aaaa1111".freeze
+    DEADBEEF_NODE_ID = "!deadbeef".freeze
+    NEIGHBOR_EMPTY_UPDATE_ROOT_ID = "!cafed00d".freeze
+    NEIGHBOR_ROOT_ID = "!1a2b3c01".freeze
+    NEIGHBOR_PRIMARY_ID = "!1a2b3c02".freeze
+    NEIGHBOR_SNR_CLEAR_ROOT_ID = "!1a2b3c10".freeze
+    NEIGHBOR_SNR_CLEAR_PEER_ID = "!1a2b3c11".freeze
+    NEIGHBOR_CHUNK_ROOT_ID = "!1a2b3c30".freeze
+
+    def post_twice_for_ingestor(endpoint, first_payload, second_payload)
+      post endpoint, first_payload.to_json, auth_headers
+      expect(last_response).to be_ok
+      post endpoint, second_payload.to_json, auth_headers
+      expect(last_response).to be_ok
+    end
+
     it "persists messages from fixture data" do
       import_nodes_fixture
       import_messages_fixture
@@ -3010,6 +3034,36 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(reaction_row["emoji"]).to eq("🔥")
     end
 
+    it "stores message ingestor and preserves the first reporter" do
+      first_payload = {
+        "id" => 77_001,
+        "rx_time" => reference_time.to_i - 10,
+        "from_id" => "!ingmsg01",
+        "channel" => 0,
+        "portnum" => "TEXT_MESSAGE_APP",
+        "text" => "first reporter",
+        "ingestor" => FIRST_MESSAGE_INGESTOR_ID,
+      }
+      second_payload = first_payload.merge(
+        "text" => "updated text",
+        "ingestor" => "!2222bbbb",
+      )
+
+      post_twice_for_ingestor("/api/messages", first_payload, second_payload)
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row("SELECT text, ingestor FROM messages WHERE id = ?", [first_payload["id"]])
+        expect(row["text"]).to eq("updated text")
+        expect(row["ingestor"]).to eq(FIRST_MESSAGE_INGESTOR_ID)
+      end
+
+      get "/api/messages?limit=10"
+      expect(last_response).to be_ok
+      row = JSON.parse(last_response.body).find { |entry| entry["id"] == first_payload["id"] }
+      expect(row["ingestor"]).to eq(FIRST_MESSAGE_INGESTOR_ID)
+    end
+
     it "creates hidden nodes for unknown message senders" do
       payload = {
         "id" => 9_999,
@@ -3074,7 +3128,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         "id" => 10_001,
         "rx_time" => reference_time.to_i,
         "from_id" => "!cafef00d",
-        "to_id" => "!deadbeef",
+        "to_id" => DEADBEEF_NODE_ID,
         "channel" => 0,
         "portnum" => "TEXT_MESSAGE_APP",
         "text" => "Spec participant placeholder",
@@ -3091,12 +3145,12 @@ RSpec.describe "Potato Mesh Sinatra app" do
           <<~SQL,
           SELECT node_id, num, short_name, long_name, role, last_heard, first_heard
           FROM nodes
-          WHERE node_id IN ("!cafef00d", "!deadbeef")
+          WHERE node_id IN ("!cafef00d", "#{DEADBEEF_NODE_ID}")
           ORDER BY node_id
         SQL
         )
 
-        expect(rows.map { |row| row["node_id"] }).to contain_exactly("!cafef00d", "!deadbeef")
+        expect(rows.map { |row| row["node_id"] }).to contain_exactly("!cafef00d", DEADBEEF_NODE_ID)
         rows.each do |row|
           expect(row["num"]).to be_an(Integer)
           expect(row["role"]).to eq("CLIENT_HIDDEN")
@@ -3295,6 +3349,30 @@ RSpec.describe "Potato Mesh Sinatra app" do
         end
       end
 
+      it "stores position ingestor and preserves the first reporter" do
+        first_payload = {
+          "id" => 19_001,
+          "node_id" => "!ingpos01",
+          "rx_time" => reference_time.to_i - 80,
+          "latitude" => 52.1,
+          "longitude" => 13.2,
+          "ingestor" => SHARED_TEST_INGESTOR_ID,
+        }
+        second_payload = first_payload.merge(
+          "latitude" => 53.3,
+          "ingestor" => "!bbbb2222",
+        )
+
+        post_twice_for_ingestor("/api/positions", first_payload, second_payload)
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          row = db.get_first_row("SELECT latitude, ingestor FROM positions WHERE id = ?", [first_payload["id"]])
+          expect_same_value(row["latitude"], 53.3)
+          expect(row["ingestor"]).to eq(SHARED_TEST_INGESTOR_ID)
+        end
+      end
+
       it "fills first_heard when updating an existing node without one" do
         node_id = "!specposfh"
         rx_time = reference_time.to_i - 90
@@ -3437,6 +3515,48 @@ RSpec.describe "Potato Mesh Sinatra app" do
         end
       end
 
+      it "does not update existing neighbor last_heard from third-party neighbor reports" do
+        reporter_id = "!abc123ef"
+        existing_neighbor_id = "!00ff0011"
+        prior_last_heard = reference_time.to_i - 4 * 60 * 60
+        rx_time = reference_time.to_i - 60 * 60
+        neighbor_rx_time = rx_time - 120
+
+        with_db do |db|
+          db.execute(
+            INSERT_NODE_WITH_LAST_HEARD_SQL,
+            [reporter_id, 0xabc123ef, prior_last_heard, prior_last_heard],
+          )
+          db.execute(
+            INSERT_NODE_WITH_LAST_HEARD_SQL,
+            [existing_neighbor_id, 0x00ff0011, prior_last_heard, prior_last_heard],
+          )
+        end
+
+        payload = {
+          "node_id" => reporter_id,
+          "node_num" => 0xabc123ef,
+          "rx_time" => rx_time,
+          "neighbors" => [
+            { "node_id" => existing_neighbor_id, "snr" => -7.5, "rx_time" => neighbor_rx_time },
+          ],
+        }
+
+        post "/api/neighbors", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect(JSON.parse(last_response.body)).to eq("status" => "ok")
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          reporter_row = db.get_first_row(SELECT_NODE_LAST_HEARD_SQL, [reporter_id])
+          neighbor_row = db.get_first_row(SELECT_NODE_LAST_HEARD_SQL, [existing_neighbor_id])
+
+          expect(reporter_row["last_heard"]).to eq(rx_time)
+          expect(neighbor_row["last_heard"]).to eq(prior_last_heard)
+        end
+      end
+
       it "handles broadcasts with no neighbors" do
         rx_time = reference_time.to_i - 60
         payload = {
@@ -3468,6 +3588,127 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(JSON.parse(last_response.body)).to be_empty
       end
 
+      it "removes stored neighbors when a later packet contains no neighbors" do
+        seed_payload = {
+          "node_id" => NEIGHBOR_EMPTY_UPDATE_ROOT_ID,
+          "rx_time" => reference_time.to_i - 50,
+          "neighbors" => [
+            { "node_id" => DEADBEEF_NODE_ID, "snr" => -2.0 },
+          ],
+          "ingestor" => SHARED_TEST_INGESTOR_ID,
+        }
+        empty_payload = {
+          "node_id" => NEIGHBOR_EMPTY_UPDATE_ROOT_ID,
+          "rx_time" => reference_time.to_i - 10,
+          "neighbors" => [],
+          "ingestor" => "!bbbb2222",
+        }
+
+        post "/api/neighbors", seed_payload.to_json, auth_headers
+        expect(last_response).to be_ok
+        post "/api/neighbors", empty_payload.to_json, auth_headers
+        expect(last_response).to be_ok
+
+        with_db(readonly: true) do |db|
+          remaining = db.get_first_value(SELECT_NEIGHBOR_COUNT_BY_NODE_SQL, [NEIGHBOR_EMPTY_UPDATE_ROOT_ID])
+          expect(remaining).to eq(0)
+        end
+      end
+
+      it "stores neighbor ingestor and preserves the first reporter per tuple" do
+        base = {
+          "node_id" => NEIGHBOR_ROOT_ID,
+          "rx_time" => reference_time.to_i - 45,
+          "neighbors" => [
+            { "node_id" => NEIGHBOR_PRIMARY_ID, "snr" => -1.5 },
+            { "node_id" => "!1a2b3c03", "snr" => -2.5 },
+          ],
+          "ingestor" => "!aaaa9999",
+        }
+        update = {
+          "node_id" => NEIGHBOR_ROOT_ID,
+          "rx_time" => reference_time.to_i - 30,
+          "neighbors" => [
+            { "node_id" => NEIGHBOR_PRIMARY_ID, "snr" => -0.5 },
+          ],
+          "ingestor" => "!bbbb8888",
+        }
+
+        post_twice_for_ingestor("/api/neighbors", base, update)
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          rows = db.execute("SELECT neighbor_id, snr, ingestor FROM neighbors WHERE node_id = ? ORDER BY neighbor_id", [NEIGHBOR_ROOT_ID])
+          expect(rows.size).to eq(1)
+          expect(rows.first["neighbor_id"]).to eq(NEIGHBOR_PRIMARY_ID)
+          expect_same_value(rows.first["snr"], -0.5)
+          expect(rows.first["ingestor"]).to eq("!aaaa9999")
+        end
+      end
+
+      it "clears stored neighbor snr when an updated entry omits snr" do
+        initial = {
+          "node_id" => NEIGHBOR_SNR_CLEAR_ROOT_ID,
+          "rx_time" => reference_time.to_i - 40,
+          "neighbors" => [
+            { "node_id" => NEIGHBOR_SNR_CLEAR_PEER_ID, "snr" => -3.25 },
+          ],
+        }
+        update = {
+          "node_id" => NEIGHBOR_SNR_CLEAR_ROOT_ID,
+          "rx_time" => reference_time.to_i - 20,
+          "neighbors" => [
+            { "node_id" => NEIGHBOR_SNR_CLEAR_PEER_ID },
+          ],
+        }
+
+        post "/api/neighbors", initial.to_json, auth_headers
+        expect(last_response).to be_ok
+        post "/api/neighbors", update.to_json, auth_headers
+        expect(last_response).to be_ok
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          row = db.get_first_row(
+            "SELECT snr, rx_time FROM neighbors WHERE node_id = ? AND neighbor_id = ?",
+            [NEIGHBOR_SNR_CLEAR_ROOT_ID, NEIGHBOR_SNR_CLEAR_PEER_ID],
+          )
+          expect(row["snr"]).to be_nil
+          expect(row["rx_time"]).to eq(update["rx_time"])
+        end
+      end
+
+      it "removes stale neighbors in chunked deletes" do
+        initial_neighbors = Array.new(1_100) do |i|
+          { "node_id" => format("!%08x", 0x2000_0000 + i), "snr" => -2.0 }
+        end
+        initial = {
+          "node_id" => NEIGHBOR_CHUNK_ROOT_ID,
+          "rx_time" => reference_time.to_i - 35,
+          "neighbors" => initial_neighbors,
+        }
+        update = {
+          "node_id" => NEIGHBOR_CHUNK_ROOT_ID,
+          "rx_time" => reference_time.to_i - 25,
+          "neighbors" => [
+            { "node_id" => "!20000000", "snr" => -1.0 },
+          ],
+        }
+
+        post "/api/neighbors", initial.to_json, auth_headers
+        expect(last_response).to be_ok
+        post "/api/neighbors", update.to_json, auth_headers
+        expect(last_response).to be_ok
+
+        with_db(readonly: true) do |db|
+          count = db.get_first_value(
+            SELECT_NEIGHBOR_COUNT_BY_NODE_SQL,
+            [NEIGHBOR_CHUNK_ROOT_ID],
+          )
+          expect(count).to eq(1)
+        end
+      end
+
       it "returns 400 when more than 1000 neighbor packets are provided" do
         payload = Array.new(1001) do |i|
           { "node_id" => format("!%08x", i), "rx_time" => reference_time.to_i - i }
@@ -3481,6 +3722,30 @@ RSpec.describe "Potato Mesh Sinatra app" do
         with_db(readonly: true) do |db|
           count = db.get_first_value("SELECT COUNT(*) FROM neighbors")
           expect(count).to eq(0)
+        end
+      end
+
+      it "handles large neighbor lists without SQLite bind overflows" do
+        neighbors = Array.new(1_100) do |i|
+          { "node_id" => format("!%08x", 0x1000_0000 + i), "snr" => -1.0 }
+        end
+        payload = {
+          "node_id" => "!1a2b3c20",
+          "rx_time" => reference_time.to_i - 15,
+          "neighbors" => neighbors,
+        }
+
+        post "/api/neighbors", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect(JSON.parse(last_response.body)).to eq("status" => "ok")
+
+        with_db(readonly: true) do |db|
+          count = db.get_first_value(
+            SELECT_NEIGHBOR_COUNT_BY_NODE_SQL,
+            ["!1a2b3c20"],
+          )
+          expect(count).to eq(1_100)
         end
       end
     end
@@ -3640,6 +3905,27 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(JSON.parse(last_response.body)).to eq("error" => "invalid JSON")
       end
 
+      it "stores telemetry ingestor and preserves the first reporter" do
+        payload = {
+          "id" => 23_001,
+          "node_id" => "!ingtel01",
+          "rx_time" => reference_time.to_i - 70,
+          "telemetry" => { "deviceMetrics" => { "batteryLevel" => 90 } },
+          "battery_level" => 90,
+          "ingestor" => "!1111bbbb",
+        }
+        updated = payload.merge("battery_level" => 80, "ingestor" => "!2222cccc")
+
+        post_twice_for_ingestor("/api/telemetry", payload, updated)
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          row = db.get_first_row("SELECT battery_level, ingestor FROM telemetry WHERE id = ?", [payload["id"]])
+          expect_same_value(row["battery_level"], 80.0)
+          expect(row["ingestor"]).to eq("!1111bbbb")
+        end
+      end
+
       it "returns 400 when more than 10000 telemetry packets are provided" do
         payload = Array.new(10001) { |i| { "id" => i + 1, "rx_time" => reference_time.to_i - i } }
 
@@ -3757,6 +4043,28 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         expect(last_response.status).to eq(400)
         expect(JSON.parse(last_response.body)).to eq("error" => "invalid JSON")
+      end
+
+      it "stores trace ingestor and preserves the first reporter" do
+        payload = {
+          "id" => 31_001,
+          "request_id" => 77,
+          "src" => 0x10000001,
+          "dest" => 0x10000002,
+          "rx_time" => reference_time.to_i - 50,
+          "hops" => [0x10000001, 0x10000002],
+          "ingestor" => "!aaaa0001",
+        }
+        update = payload.merge("snr" => 7.5, "ingestor" => "!bbbb0002")
+
+        post_twice_for_ingestor("/api/traces", payload, update)
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          row = db.get_first_row("SELECT snr, ingestor FROM traces WHERE id = ?", [payload["id"]])
+          expect_same_value(row["snr"], 7.5)
+          expect(row["ingestor"]).to eq("!aaaa0001")
+        end
       end
 
       it "returns 400 when more than 10000 traces are provided" do
@@ -3937,7 +4245,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         expect(row["encrypted"]).to eq(encrypted_b64)
 
         node_row = db.get_first_row(
-          "SELECT last_heard FROM nodes WHERE node_id = ?",
+          SELECT_NODE_LAST_HEARD_SQL,
           [sender_id],
         )
 
@@ -3980,6 +4288,1071 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(node_entry["text"]).to be_nil
       expect(node_entry["from_id"]).to eq(sender_id)
       expect(node_entry["to_id"]).to eq(receiver_id)
+    end
+
+    it "keeps encrypted text-port messages even when the PSK is configured" do
+      psk_b64 = "Nmh7EooP2Tsc+7pvPwXLcEDDuYhk+fBo2GLnbA1Y1sg="
+      previous_psk = ENV["MESHTASTIC_PSK_B64"]
+      ENV["MESHTASTIC_PSK_B64"] = psk_b64
+
+      begin
+        payload = {
+          "packet_id" => 3_915_687_257,
+          "rx_time" => reference_time.to_i,
+          "rx_iso" => reference_time.utc.iso8601,
+          "from_id" => "!9e95cf60",
+          "channel" => 35,
+          "portnum" => "TEXT_MESSAGE_APP",
+          "encrypted" => "Q1R7tgI5yXzMXu/3",
+        }
+
+        post "/api/messages", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect(JSON.parse(last_response.body)).to eq("status" => "ok")
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          row = db.get_first_row(
+            "SELECT text, encrypted, channel_name FROM messages WHERE id = ?",
+            [payload["packet_id"]],
+          )
+
+          expect(row["text"]).to be_nil
+          expect(row["encrypted"]).to eq("Q1R7tgI5yXzMXu/3")
+          expect(row["channel_name"]).to be_nil
+        end
+      ensure
+        if previous_psk.nil?
+          ENV.delete("MESHTASTIC_PSK_B64")
+        else
+          ENV["MESHTASTIC_PSK_B64"] = previous_psk
+        end
+      end
+    end
+
+    it "keeps encrypted payloads when the decrypted portnum is not text" do
+      psk_b64 = "Nmh7EooP2Tsc+7pvPwXLcEDDuYhk+fBo2GLnbA1Y1sg="
+      previous_psk = ENV["MESHTASTIC_PSK_B64"]
+      ENV["MESHTASTIC_PSK_B64"] = psk_b64
+
+      begin
+        encode_varint = lambda do |value|
+          bytes = []
+          remaining = value
+          loop do
+            byte = remaining & 0x7f
+            remaining >>= 7
+            if remaining.zero?
+              bytes << byte
+              break
+            end
+            bytes << (byte | 0x80)
+          end
+          bytes.pack("C*")
+        end
+
+        build_data_message = lambda do |portnum, payload|
+          tag_portnum = (1 << 3) | 0
+          tag_payload = (2 << 3) | 2
+          [
+            tag_portnum,
+          ].pack("C") + encode_varint.call(portnum) +
+            [tag_payload].pack("C") + encode_varint.call(payload.bytesize) + payload
+        end
+
+        encrypt_message = lambda do |plaintext, packet_id, from_id|
+          key = PotatoMesh::App::Meshtastic::ChannelHash.expanded_key(psk_b64)
+          from_num = PotatoMesh::App::Meshtastic::Cipher.normalize_node_num(from_id, nil)
+          nonce = PotatoMesh::App::Meshtastic::Cipher.build_nonce(packet_id, from_num)
+          cipher_name = key.bytesize == 16 ? "aes-128-ctr" : "aes-256-ctr"
+          cipher = OpenSSL::Cipher.new(cipher_name)
+          cipher.encrypt
+          cipher.key = key
+          cipher.iv = nonce
+          Base64.strict_encode64(cipher.update(plaintext) + cipher.final)
+        end
+
+        payload_bytes = "OK".b
+        plaintext = build_data_message.call(3, payload_bytes)
+        encrypted_payload = encrypt_message.call(plaintext, 3_915_687_260, "!9e95cf60")
+
+        payload = {
+          "packet_id" => 3_915_687_260,
+          "rx_time" => reference_time.to_i,
+          "rx_iso" => reference_time.utc.iso8601,
+          "from_id" => "!9e95cf60",
+          "channel" => 35,
+          "encrypted" => encrypted_payload,
+        }
+
+        post "/api/messages", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect(JSON.parse(last_response.body)).to eq("status" => "ok")
+
+        with_db(readonly: true) do |db|
+          db.results_as_hash = true
+          row = db.get_first_row(
+            "SELECT text, encrypted, portnum FROM messages WHERE id = ?",
+            [payload["packet_id"]],
+          )
+
+          expect(row["text"]).to be_nil
+          expect(row["encrypted"]).to eq(encrypted_payload)
+          expect(row["portnum"]).to be_nil
+        end
+      ensure
+        if previous_psk.nil?
+          ENV.delete("MESHTASTIC_PSK_B64")
+        else
+          ENV["MESHTASTIC_PSK_B64"] = previous_psk
+        end
+      end
+    end
+
+    it "skips decryption in test mode unless PSK is set" do
+      previous_psk = ENV["MESHTASTIC_PSK_B64"]
+      previous_rack = ENV["RACK_ENV"]
+      ENV.delete("MESHTASTIC_PSK_B64")
+      ENV["RACK_ENV"] = "test"
+
+      message = {
+        "encrypted" => "otu3OyMrTIUlcaisLVDyAnLW",
+      }
+
+      result = PotatoMesh::Application.decrypt_meshtastic_message(
+        message,
+        3_189_171_433,
+        "!7c5b0920",
+        nil,
+        3,
+      )
+
+      expect(result).to be_nil
+    ensure
+      if previous_psk.nil?
+        ENV.delete("MESHTASTIC_PSK_B64")
+      else
+        ENV["MESHTASTIC_PSK_B64"] = previous_psk
+      end
+      if previous_rack.nil?
+        ENV.delete("RACK_ENV")
+      else
+        ENV["RACK_ENV"] = previous_rack
+      end
+    end
+
+    it "touches node last seen when encrypted payloads cannot be decrypted" do
+      encoded_payload = Base64.strict_encode64("cipher".b)
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(nil)
+      allow(PotatoMesh::Application).to receive(:touch_node_last_seen).and_call_original
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 910_010,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      expect(PotatoMesh::Application).to have_received(:touch_node_last_seen).with(
+        anything,
+        anything,
+        anything,
+        hash_including(source: :message),
+      )
+    end
+
+    it "stores modem metadata when touching nodes via messages" do
+      payload = {
+        "packet_id" => 910_011,
+        "rx_time" => reference_time.to_i,
+        "rx_iso" => reference_time.utc.iso8601,
+        "from_id" => "!7c5b0920",
+        "text" => "modem metadata",
+        "lora_freq" => 868,
+        "modem_preset" => "MediumFast",
+      }
+
+      post "/api/messages", payload.to_json, auth_headers
+
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body)).to eq("status" => "ok")
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT lora_freq, modem_preset FROM nodes WHERE node_id = ?",
+          ["!7c5b0920"],
+        )
+
+        expect(row["lora_freq"]).to eq(868)
+        expect(row["modem_preset"]).to eq("MediumFast")
+      end
+    end
+
+    it "stores decoded telemetry when decrypting non-text payloads" do
+      payload_bytes = "telemetry".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+      telemetry_payload = {
+        "time" => reference_time.to_i,
+        "deviceMetrics" => { "batteryLevel" => 77.5 },
+      }
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 67,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "TELEMETRY_APP",
+          "payload" => telemetry_payload,
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_001,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "lora_freq" => 868,
+            "modem_preset" => "MediumFast",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT id, payload_b64, battery_level FROM telemetry WHERE id = ?",
+          [900_001],
+        )
+
+        expect(row["payload_b64"]).to eq(encoded_payload)
+        expect(row["battery_level"]).to eq(77.5)
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT lora_freq, modem_preset FROM nodes WHERE node_id = ?",
+          ["!7c5b0920"],
+        )
+
+        expect(row["lora_freq"]).to eq(868)
+        expect(row["modem_preset"]).to eq("MediumFast")
+      end
+    end
+
+    it "stores decoded positions when decrypting position payloads" do
+      payload_bytes = "position".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+      position_payload = {
+        "latitude_i" => 525598720,
+        "longitude_i" => 136577024,
+        "altitude" => 11,
+        "time" => reference_time.to_i,
+        "precision_bits" => 13,
+      }
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 3,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "POSITION_APP",
+          "payload" => position_payload,
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_002,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "lora_freq" => 868,
+            "modem_preset" => "MediumFast",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT id, latitude, longitude, altitude, payload_b64 FROM positions WHERE id = ?",
+          [900_002],
+        )
+
+        expect(row["payload_b64"]).to eq(encoded_payload)
+        expect(row["latitude"]).to be_within(0.0001).of(52.559872)
+        expect(row["longitude"]).to be_within(0.0001).of(13.6577024)
+        expect(row["altitude"]).to eq(11)
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT lora_freq, modem_preset FROM nodes WHERE node_id = ?",
+          ["!7c5b0920"],
+        )
+
+        expect(row["lora_freq"]).to eq(868)
+        expect(row["modem_preset"]).to eq("MediumFast")
+      end
+    end
+
+    it "normalizes numeric node identifiers to hex ids" do
+      payload = {
+        "packet_id" => 920_001,
+        "rx_time" => reference_time.to_i,
+        "rx_iso" => reference_time.utc.iso8601,
+        "from_id" => "1128114236",
+        "to_id" => "2086340896",
+        "text" => "numeric ids",
+      }
+
+      post "/api/messages", payload.to_json, auth_headers
+
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body)).to eq("status" => "ok")
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT from_id, to_id FROM messages WHERE id = ?",
+          [payload["packet_id"]],
+        )
+
+        expect(row["from_id"]).to eq("!433da83c")
+        expect(row["to_id"]).to eq("!7c5b0920")
+      end
+    end
+
+    it "clears encrypted payloads when non-text payloads are decoded" do
+      payload_bytes = "position".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+      position_payload = {
+        "latitude_i" => 525598720,
+        "longitude_i" => 136577024,
+        "altitude" => 11,
+        "time" => reference_time.to_i,
+        "precision_bits" => 13,
+      }
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 3,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::Application).to receive(:debug_log).and_call_original
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "POSITION_APP",
+          "payload" => position_payload,
+        },
+      )
+      allow(PotatoMesh::Application).to receive(:touch_node_last_seen).and_call_original
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_005,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          SELECT_MESSAGE_ENCRYPTED_SQL,
+          [900_005],
+        )
+
+        expect(row["encrypted"]).to be_nil
+      end
+
+      expect(PotatoMesh::Application).to have_received(:touch_node_last_seen).with(
+        anything,
+        anything,
+        anything,
+        hash_including(source: :position),
+      )
+      expect(PotatoMesh::Application).not_to have_received(:touch_node_last_seen).with(
+        anything,
+        anything,
+        anything,
+        hash_including(source: :message),
+      )
+      expect(PotatoMesh::Application).to have_received(:debug_log).with(
+        "Cleared encrypted payload after decoding",
+        hash_including(context: "data_processing.insert_message", message_id: 900_005, portnum: 3),
+      )
+    end
+
+    it "keeps encrypted payloads when decoded neighbor data is empty" do
+      payload_bytes = "neighbor".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+      neighbor_payload = {
+        "node_id" => "!7c5b0920",
+        "neighbors" => [],
+      }
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 71,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "NEIGHBORINFO_APP",
+          "payload" => neighbor_payload,
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_006,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          SELECT_MESSAGE_ENCRYPTED_SQL,
+          [900_006],
+        )
+
+        expect(row["encrypted"]).to eq(encoded_payload)
+      end
+    end
+
+    it "updates node modem metadata when touching last seen" do
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, last_heard, first_heard) VALUES (?,?,?)",
+          ["!7c5b0920", reference_time.to_i - 10, reference_time.to_i - 10],
+        )
+
+        PotatoMesh::Application.touch_node_last_seen(
+          db,
+          "!7c5b0920",
+          nil,
+          rx_time: reference_time.to_i,
+          source: :message,
+          lora_freq: 868,
+          modem_preset: "MediumFast",
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT lora_freq, modem_preset FROM nodes WHERE node_id = ?",
+          ["!7c5b0920"],
+        )
+
+        expect(row["lora_freq"]).to eq(868)
+        expect(row["modem_preset"]).to eq("MediumFast")
+      end
+    end
+
+    it "preserves modem metadata when touch last seen omits it" do
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, last_heard, first_heard, lora_freq, modem_preset) VALUES (?,?,?,?,?)",
+          ["!7c5b0920", reference_time.to_i - 10, reference_time.to_i - 10, 868, "MediumFast"],
+        )
+
+        PotatoMesh::Application.touch_node_last_seen(
+          db,
+          "!7c5b0920",
+          nil,
+          rx_time: reference_time.to_i,
+          source: :message,
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT lora_freq, modem_preset FROM nodes WHERE node_id = ?",
+          ["!7c5b0920"],
+        )
+
+        expect(row["lora_freq"]).to eq(868)
+        expect(row["modem_preset"]).to eq("MediumFast")
+      end
+    end
+
+    it "skips decrypted payload storage when portnum is unsupported" do
+      with_db do |db|
+        stored = PotatoMesh::Application.store_decrypted_payload(
+          db,
+          { "lora_freq" => 868, "modem_preset" => "MediumFast" },
+          900_007,
+          { payload: "ok".b, portnum: 5, text: nil },
+          rx_time: reference_time.to_i,
+          rx_iso: reference_time.utc.iso8601,
+          from_id: "!7c5b0920",
+          to_id: "^all",
+          channel: 0,
+          portnum: 5,
+          hop_limit: 2,
+          snr: 1.0,
+          rssi: -70,
+        )
+
+        expect(stored).to be(false)
+      end
+    end
+
+    it "stores decoded neighbors when decrypting neighborinfo payloads" do
+      payload_bytes = "neighbor".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+      neighbor_payload = {
+        "node_id" => "!7c5b0920",
+        "neighbors" => [
+          { "node_id" => "!1d60dd3c", "snr" => 4.5, "last_rx_time" => reference_time.to_i },
+        ],
+      }
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 71,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "NEIGHBORINFO_APP",
+          "payload" => neighbor_payload,
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_003,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT node_id, neighbor_id, snr FROM neighbors WHERE node_id = ? AND neighbor_id = ?",
+          ["!7c5b0920", "!1d60dd3c"],
+        )
+
+        expect(row["node_id"]).to eq("!7c5b0920")
+        expect(row["neighbor_id"]).to eq("!1d60dd3c")
+        expect(row["snr"]).to eq(4.5)
+      end
+    end
+
+    it "stores decoded traces when decrypting traceroute payloads" do
+      payload_bytes = "trace".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+      trace_payload = {
+        "route" => [1, 2, 3, 4],
+      }
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 70,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "TRACEROUTE_APP",
+          "payload" => trace_payload,
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_004,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        trace_row = db.get_first_row(
+          "SELECT id, dest FROM traces WHERE id = ?",
+          [900_004],
+        )
+        hop_rows = db.execute(
+          "SELECT hop_index, node_id FROM trace_hops WHERE trace_id = ? ORDER BY hop_index",
+          [900_004],
+        )
+        hop_node_ids = hop_rows.map do |row|
+          if row.is_a?(Hash)
+            row["node_id"] || row[:node_id] || row[1]
+          else
+            row[1]
+          end
+        end
+
+        expect(trace_row["id"]).to eq(900_004)
+        expect(trace_row["dest"]).to eq(4)
+        expect(hop_node_ids).to eq([1, 2, 3, 4])
+      end
+    end
+
+    it "keeps encrypted messages when decrypted payload resolves to text portnum" do
+      encrypted_payload = Base64.strict_encode64("cipher".b)
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        nil,
+        {
+          portnum: 1,
+          payload: "plain".b,
+          text: "decoded",
+          channel_name: nil,
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 910_001,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encrypted_payload,
+          },
+        )
+
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 910_001,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encrypted_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT text, encrypted FROM messages WHERE id = ?",
+          [910_001],
+        )
+
+        expect(row["text"]).to be_nil
+        expect(row["encrypted"]).to eq(encrypted_payload)
+      end
+    end
+
+    it "stores decoded node data when decrypting nodeinfo payloads" do
+      payload_bytes = "nodeinfo".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+      node_payload = {
+        "id" => "!7c5b0920",
+        "num" => 2_085_057_824,
+        "last_heard" => reference_time.to_i,
+        "user" => {
+          "short_name" => "NODE",
+          "long_name" => NODE_INFO_LONG_NAME,
+          "hw_model" => "TBEAM",
+          "role" => "CLIENT",
+        },
+      }
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 4,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "NODEINFO_APP",
+          "payload" => node_payload,
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_008,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT node_id, short_name, long_name, hw_model FROM nodes WHERE node_id = ?",
+          ["!7c5b0920"],
+        )
+
+        expect(row["node_id"]).to eq("!7c5b0920")
+        expect(row["short_name"]).to eq("NODE")
+        expect(row["long_name"]).to eq(NODE_INFO_LONG_NAME)
+        expect(row["hw_model"]).to eq("TBEAM")
+      end
+    end
+
+    it "keeps encrypted payloads when decoded nodeinfo payload is invalid" do
+      payload_bytes = "nodeinfo".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 4,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "NODEINFO_APP",
+          "payload" => {},
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_009,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          SELECT_MESSAGE_ENCRYPTED_SQL,
+          [900_009],
+        )
+
+        expect(row["encrypted"]).to eq(encoded_payload)
+      end
+    end
+
+    it "keeps encrypted payloads when decoded nodeinfo payload lacks identifying user fields" do
+      payload_bytes = "nodeinfo".b
+      encoded_payload = Base64.strict_encode64(payload_bytes)
+
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(
+        {
+          portnum: 4,
+          payload: payload_bytes,
+          text: nil,
+          channel_name: nil,
+        },
+      )
+      allow(PotatoMesh::App::Meshtastic::PayloadDecoder).to receive(:decode).and_return(
+        {
+          "type" => "NODEINFO_APP",
+          "payload" => { "id" => "!7c5b0920", "num" => 2_085_057_824 },
+        },
+      )
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 900_010,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encoded_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          SELECT_MESSAGE_ENCRYPTED_SQL,
+          [900_010],
+        )
+
+        expect(row["encrypted"]).to eq(encoded_payload)
+      end
+    end
+
+    it "normalizes snake_case decoded nodeinfo payloads" do
+      payload = {
+        "user" => {
+          "short_name" => "NODE",
+          "long_name" => NODE_INFO_LONG_NAME,
+          "hw_model" => "TBEAM",
+          "public_key" => "pk",
+          "is_unmessagable" => true,
+        },
+        "device_metrics" => {
+          "battery_level" => 87,
+          "channel_utilization" => 12.5,
+          "air_util_tx" => 2.75,
+          "uptime_seconds" => 1200,
+        },
+        "position" => {
+          "precision_bits" => 13,
+          "location_source" => "LOC_MANUAL",
+        },
+        "last_heard" => reference_time.to_i,
+        "hops_away" => 2,
+        "is_favorite" => true,
+        "hw_model" => "TBEAM",
+      }
+
+      normalized = PotatoMesh::Application.send(:normalize_decrypted_nodeinfo_payload, payload)
+
+      expect(normalized.dig("user", "shortName")).to eq("NODE")
+      expect(normalized.dig("user", "longName")).to eq(NODE_INFO_LONG_NAME)
+      expect(normalized.dig("user", "hwModel")).to eq("TBEAM")
+      expect(normalized.dig("user", "publicKey")).to eq("pk")
+      expect(normalized.dig("user", "isUnmessagable")).to be(true)
+      expect(normalized.dig("deviceMetrics", "batteryLevel")).to eq(87)
+      expect(normalized.dig("deviceMetrics", "channelUtilization")).to eq(12.5)
+      expect(normalized.dig("deviceMetrics", "airUtilTx")).to eq(2.75)
+      expect(normalized.dig("deviceMetrics", "uptimeSeconds")).to eq(1200)
+      expect(normalized.dig("position", "precisionBits")).to eq(13)
+      expect(normalized.dig("position", "locationSource")).to eq("LOC_MANUAL")
+      expect(normalized["lastHeard"]).to eq(reference_time.to_i)
+      expect(normalized["hopsAway"]).to eq(2)
+      expect(normalized["isFavorite"]).to be(true)
+      expect(normalized["hwModel"]).to eq("TBEAM")
+    end
+
+    it "rejects malformed normalized nodeinfo payloads" do
+      invalid_payload = {
+        "user" => { "shortName" => "NODE" },
+        "deviceMetrics" => "invalid",
+        "position" => "invalid",
+      }
+
+      valid = PotatoMesh::Application.send(:valid_decrypted_nodeinfo_payload?, invalid_payload)
+      normalized = PotatoMesh::Application.send(:normalize_decrypted_nodeinfo_payload, nil)
+
+      expect(valid).to be(false)
+      expect(normalized).to eq({})
+    end
+
+    it "prefers decrypted message fields over encrypted ones" do
+      encrypted_payload = Base64.strict_encode64("cipher".b)
+      encrypted_message = {
+        "packet_id" => 3_189_171_433,
+        "rx_time" => 1_767_957_187,
+        "rx_iso" => Time.at(1_767_957_187).utc.iso8601,
+        "from_id" => "!7c5b0920",
+        "to_id" => "^all",
+        "channel" => 3,
+        "encrypted" => encrypted_payload,
+        "rssi" => -117,
+        "hop_limit" => 7,
+        "lora_freq" => 868,
+        "modem_preset" => "MediumFast",
+        "channel_name" => "PUBLIC",
+        "snr" => -14.0,
+      }
+      decrypted_message = {
+        "packet_id" => 3_189_171_433,
+        "rx_time" => 1_767_957_191,
+        "rx_iso" => Time.at(1_767_957_191).utc.iso8601,
+        "from_id" => "!7c5b0920",
+        "to_id" => "^all",
+        "channel" => 7,
+        "portnum" => "TEXT_MESSAGE_APP",
+        "text" => "FF-TB Beacon",
+        "rssi" => -79,
+        "hop_limit" => 5,
+        "lora_freq" => 868,
+        "modem_preset" => "MediumFast",
+        "channel_name" => "PUBLIC",
+        "snr" => 9.75,
+      }
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(db, encrypted_message)
+        PotatoMesh::Application.insert_message(db, decrypted_message)
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT text, encrypted, channel, rssi, hop_limit, snr, portnum FROM messages WHERE id = ?",
+          [encrypted_message["packet_id"]],
+        )
+
+        expect(row["text"]).to eq("FF-TB Beacon")
+        expect(row["encrypted"]).to be_nil
+        expect(row["channel"]).to eq(7)
+        expect(row["rssi"]).to eq(-79)
+        expect(row["hop_limit"]).to eq(5)
+        expect(row["snr"]).to eq(9.75)
+        expect(row["portnum"]).to eq("TEXT_MESSAGE_APP")
+      end
+    end
+
+    it "clears encrypted data when a plaintext update arrives" do
+      encrypted_payload = Base64.strict_encode64("cipher".b)
+      base_time = reference_time.to_i - 20
+      updated_time = reference_time.to_i - 10
+      encrypted_message = {
+        "packet_id" => 3_189_171_434,
+        "rx_time" => base_time,
+        "rx_iso" => Time.at(base_time).utc.iso8601,
+        "from_id" => "!7c5b0920",
+        "to_id" => "^all",
+        "channel" => 3,
+        "encrypted" => encrypted_payload,
+        "rssi" => -117,
+        "hop_limit" => 7,
+        "snr" => -14.0,
+      }
+      plaintext_message = {
+        "packet_id" => 3_189_171_434,
+        "rx_time" => updated_time,
+        "rx_iso" => Time.at(updated_time).utc.iso8601,
+        "from_id" => "!7c5b0920",
+        "to_id" => "^all",
+        "channel" => 7,
+        "portnum" => "TEXT_MESSAGE_APP",
+        "text" => "FF-TB Beacon",
+        "rssi" => -79,
+        "hop_limit" => 5,
+        "snr" => 9.75,
+      }
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(db, encrypted_message)
+        PotatoMesh::Application.insert_message(db, plaintext_message)
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT text, encrypted, channel, rssi, hop_limit, snr, rx_time FROM messages WHERE id = ?",
+          [encrypted_message["packet_id"]],
+        )
+
+        expect(row["text"]).to eq("FF-TB Beacon")
+        expect(row["encrypted"]).to be_nil
+        expect(row["channel"]).to eq(7)
+        expect(row["rssi"]).to eq(-79)
+        expect(row["hop_limit"]).to eq(5)
+        expect(row["snr"]).to eq(9.75)
+        expect(row["rx_time"]).to eq(updated_time)
+      end
+    end
+
+    it "does not overwrite decrypted messages with encrypted payloads" do
+      encrypted_payload = Base64.strict_encode64("cipher".b)
+      decrypted_text = "decoded"
+      allow(PotatoMesh::Application).to receive(:decrypt_meshtastic_message).and_return(nil)
+
+      with_db do |db|
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 910_002,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "text" => decrypted_text,
+          },
+        )
+
+        PotatoMesh::Application.insert_message(
+          db,
+          {
+            "packet_id" => 910_002,
+            "rx_time" => reference_time.to_i,
+            "rx_iso" => reference_time.utc.iso8601,
+            "from_id" => "!7c5b0920",
+            "encrypted" => encrypted_payload,
+          },
+        )
+      end
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT text, encrypted FROM messages WHERE id = ?",
+          [910_002],
+        )
+
+        expect(row["text"]).to eq(decrypted_text)
+        expect(row["encrypted"]).to be_nil
+      end
     end
 
     it "updates node last_heard for plaintext messages" do
@@ -4289,6 +5662,47 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(payload["node_id"]).to eq("!blank")
       expect(payload).not_to have_key("short_name")
       expect(payload).not_to have_key("hw_model")
+    end
+  end
+
+  describe "GET /api/stats" do
+    it "returns exact SQL-backed activity counts without list-endpoint sampling" do
+      clear_database
+      now = reference_time.to_i
+      allow(Time).to receive(:now).and_return(reference_time)
+
+      with_db do |db|
+        db.transaction
+        1005.times do |index|
+          heard = now - (index % 1800)
+          node_id = format("!%08x", index + 1)
+          db.execute(
+            INSERT_NODE_WITH_METADATA_SQL,
+            [node_id, index + 1, "n#{index}", "Node #{index}", "TBEAM", "CLIENT", heard, heard],
+          )
+        end
+        db.execute(
+          INSERT_NODE_WITH_METADATA_SQL,
+          ["!week0001", 200_001, "week", "Week Node", "TBEAM", "CLIENT", now - (2 * 86_400), now - (2 * 86_400)],
+        )
+        db.execute(
+          INSERT_NODE_WITH_METADATA_SQL,
+          ["!month001", 200_002, "month", "Month Node", "TBEAM", "CLIENT", now - (20 * 86_400), now - (20 * 86_400)],
+        )
+        db.commit
+      end
+
+      get "/api/stats"
+
+      expect(last_response).to be_ok
+      payload = JSON.parse(last_response.body)
+      expect(payload["sampled"]).to eq(false)
+      expect(payload["active_nodes"]).to include(
+        "hour" => 1005,
+        "day" => 1005,
+        "week" => 1006,
+        "month" => 1007,
+      )
     end
   end
 

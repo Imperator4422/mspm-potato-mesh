@@ -127,6 +127,43 @@ module PotatoMesh
         [threshold, floor].max
       end
 
+      # Return exact active-node counts across common activity windows.
+      #
+      # Counts are resolved directly in SQL with COUNT(*) thresholds against
+      # +nodes.last_heard+ to avoid sampling bias from list endpoint limits.
+      #
+      # @param now [Integer] reference unix timestamp in seconds.
+      # @param db [SQLite3::Database, nil] optional open database handle to reuse.
+      # @return [Hash{String => Integer}] counts keyed by hour/day/week/month.
+      def query_active_node_stats(now: Time.now.to_i, db: nil)
+        handle = db || open_database(readonly: true)
+        handle.results_as_hash = true
+        reference_now = coerce_integer(now) || Time.now.to_i
+        hour_cutoff = reference_now - 3600
+        day_cutoff = reference_now - 86_400
+        week_cutoff = reference_now - PotatoMesh::Config.week_seconds
+        month_cutoff = reference_now - (30 * 24 * 60 * 60)
+        private_filter = private_mode? ? " AND (role IS NULL OR role <> 'CLIENT_HIDDEN')" : ""
+        sql = <<~SQL
+          SELECT
+            (SELECT COUNT(*) FROM nodes WHERE last_heard >= ?#{private_filter}) AS hour_count,
+            (SELECT COUNT(*) FROM nodes WHERE last_heard >= ?#{private_filter}) AS day_count,
+            (SELECT COUNT(*) FROM nodes WHERE last_heard >= ?#{private_filter}) AS week_count,
+            (SELECT COUNT(*) FROM nodes WHERE last_heard >= ?#{private_filter}) AS month_count
+        SQL
+        row = with_busy_retry do
+          handle.get_first_row(sql, [hour_cutoff, day_cutoff, week_cutoff, month_cutoff])
+        end || {}
+        {
+          "hour" => row["hour_count"].to_i,
+          "day" => row["day_count"].to_i,
+          "week" => row["week_count"].to_i,
+          "month" => row["month_count"].to_i,
+        }
+      ensure
+        handle&.close unless db
+      end
+
       def node_reference_tokens(node_ref)
         parts = canonical_node_parts(node_ref)
         canonical_id, numeric_id = parts ? parts[0, 2] : [nil, nil]
@@ -357,7 +394,7 @@ module PotatoMesh
           SELECT m.id, m.rx_time, m.rx_iso, m.from_id, m.to_id, m.channel,
                  m.portnum, m.text, m.encrypted, m.rssi, m.hop_limit,
                  m.lora_freq, m.modem_preset, m.channel_name, m.snr,
-                 m.reply_id, m.emoji
+                 m.reply_id, m.emoji, m.ingestor
           FROM messages m
         SQL
         sql += "    WHERE #{where_clauses.join(" AND ")}\n"
@@ -371,6 +408,9 @@ module PotatoMesh
           r.delete_if { |key, _| key.is_a?(Integer) }
           r["reply_id"] = coerce_integer(r["reply_id"]) if r.key?("reply_id")
           r["emoji"] = string_or_nil(r["emoji"]) if r.key?("emoji")
+          if string_or_nil(r["encrypted"])
+            r.delete("portnum")
+          end
           if PotatoMesh::Config.debug? && (r["from_id"].nil? || r["from_id"].to_s.strip.empty?)
             raw = db.execute("SELECT * FROM messages WHERE id = ?", [r["id"]]).first
             debug_log(

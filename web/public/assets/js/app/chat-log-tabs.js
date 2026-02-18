@@ -20,7 +20,7 @@ import { extractModemMetadata } from './node-modem-metadata.js';
  * Highest channel index that should be represented within the tab view.
  * @type {number}
  */
-export const MAX_CHANNEL_INDEX = 9;
+export const MAX_CHANNEL_INDEX = 255;
 
 /**
  * Discrete event types that can appear in the chat activity log.
@@ -103,11 +103,29 @@ export function buildChatTabModel({
   const logEntries = [];
   const channelBuckets = new Map();
   const primaryChannelEnvLabel = normalisePrimaryChannelEnvLabel(primaryChannelFallbackLabel);
+  const nodeById = new Map();
+  const nodeByNum = new Map();
+  const nodeInfoKeys = new Set();
+
+  const buildNodeInfoKey = (nodeId, nodeNum, ts) => `${nodeId ?? ''}:${nodeNum ?? ''}:${ts ?? ''}`;
+  const recordNodeInfoEntry = (ts, nodeId, nodeNum) => {
+    if (ts == null) return;
+    const key = buildNodeInfoKey(nodeId, nodeNum, ts);
+    if (nodeInfoKeys.has(key)) return;
+    const node = nodeId && nodeById.has(nodeId)
+      ? nodeById.get(nodeId)
+      : (nodeNum != null && nodeByNum.has(nodeNum) ? nodeByNum.get(nodeNum) : null);
+    if (!node) return;
+    nodeInfoKeys.add(key);
+    logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.NODE_INFO, node, nodeId, nodeNum });
+  };
 
   for (const node of nodes || []) {
     if (!node) continue;
     const nodeId = normaliseNodeId(node);
     const nodeNum = normaliseNodeNum(node);
+    if (nodeId) nodeById.set(nodeId, node);
+    if (nodeNum != null) nodeByNum.set(nodeNum, node);
     const firstTs = resolveTimestampSeconds(node.first_heard ?? node.firstHeard, node.first_heard_iso ?? node.firstHeardIso);
     if (firstTs != null && firstTs >= cutoff) {
       logEntries.push({ ts: firstTs, type: CHAT_LOG_ENTRY_TYPES.NODE_NEW, node, nodeId, nodeNum });
@@ -115,6 +133,7 @@ export function buildChatTabModel({
     const lastTs = resolveTimestampSeconds(node.last_heard ?? node.lastHeard, node.last_seen_iso ?? node.lastSeenIso);
     if (lastTs != null && lastTs >= cutoff) {
       logEntries.push({ ts: lastTs, type: CHAT_LOG_ENTRY_TYPES.NODE_INFO, node, nodeId, nodeNum });
+      nodeInfoKeys.add(buildNodeInfoKey(nodeId, nodeNum, lastTs));
     }
   }
 
@@ -130,6 +149,7 @@ export function buildChatTabModel({
       const nodeId = normaliseNodeId(snapshot);
       const nodeNum = normaliseNodeNum(snapshot);
       logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.TELEMETRY, telemetry: snapshot, nodeId, nodeNum });
+      recordNodeInfoEntry(ts, nodeId, nodeNum);
     }
   }
 
@@ -145,6 +165,7 @@ export function buildChatTabModel({
       const nodeId = normaliseNodeId(snapshot);
       const nodeNum = normaliseNodeNum(snapshot);
       logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.POSITION, position: snapshot, nodeId, nodeNum });
+      recordNodeInfoEntry(ts, nodeId, nodeNum);
     }
   }
 
@@ -158,6 +179,7 @@ export function buildChatTabModel({
       const nodeNum = normaliseNodeNum(snapshot);
       const neighborId = normaliseNeighborId(snapshot);
       logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.NEIGHBOR, neighbor: snapshot, nodeId, nodeNum, neighborId });
+      recordNodeInfoEntry(ts, nodeId, nodeNum);
     }
   }
 
@@ -187,6 +209,7 @@ export function buildChatTabModel({
       nodeId: firstHop.id ?? null,
       nodeNum: firstHop.num ?? null
     });
+    recordNodeInfoEntry(ts, firstHop.id ?? null, firstHop.num ?? null);
   }
 
   const encryptedLogEntries = [];
@@ -222,27 +245,11 @@ export function buildChatTabModel({
       modemPreset,
       envFallbackLabel: primaryChannelEnvLabel
     });
-    const nameBucketKey = safeIndex > 0 ? buildSecondaryNameBucketKey(labelInfo) : null;
+    const nameBucketKey = safeIndex > 0 ? buildSecondaryNameBucketKey(safeIndex, labelInfo) : null;
     const primaryBucketKey = safeIndex === 0 && labelInfo.label !== '0' ? buildPrimaryBucketKey(labelInfo.label) : '0';
 
-    let bucketKey = safeIndex === 0 ? primaryBucketKey : nameBucketKey ?? String(safeIndex);
+    const bucketKey = safeIndex === 0 ? primaryBucketKey : nameBucketKey ?? String(safeIndex);
     let bucket = channelBuckets.get(bucketKey);
-
-    if (!bucket && safeIndex > 0) {
-      const existingBucketKey = findExistingBucketKeyByIndex(channelBuckets, safeIndex);
-      if (existingBucketKey) {
-        bucketKey = existingBucketKey;
-        bucket = channelBuckets.get(existingBucketKey);
-      }
-    }
-
-    if (bucket && nameBucketKey && bucket.key !== nameBucketKey) {
-      channelBuckets.delete(bucket.key);
-      bucket.key = nameBucketKey;
-      bucket.id = buildChannelTabId(nameBucketKey);
-      channelBuckets.set(nameBucketKey, bucket);
-      bucketKey = nameBucketKey;
-    }
 
     if (!bucket) {
       bucket = {
@@ -546,42 +553,41 @@ function buildPrimaryBucketKey(primaryChannelLabel) {
   return '0';
 }
 
-function buildSecondaryNameBucketKey(labelInfo) {
+function buildSecondaryNameBucketKey(index, labelInfo) {
   const label = labelInfo?.label ?? null;
   const priority = labelInfo?.priority ?? CHANNEL_LABEL_PRIORITY.INDEX;
-  if (priority !== CHANNEL_LABEL_PRIORITY.NAME || !label) {
+  if (!Number.isFinite(index) || index <= 0 || priority !== CHANNEL_LABEL_PRIORITY.NAME || !label) {
     return null;
   }
   const trimmedLabel = label.trim().toLowerCase();
   if (!trimmedLabel.length) {
     return null;
   }
-  return `secondary::${trimmedLabel}`;
-}
-
-function findExistingBucketKeyByIndex(channelBuckets, targetIndex) {
-  if (!channelBuckets || !Number.isFinite(targetIndex) || targetIndex <= 0) {
-    return null;
-  }
-  const normalizedTarget = Math.trunc(targetIndex);
-  for (const [key, bucket] of channelBuckets.entries()) {
-    if (!bucket || !Number.isFinite(bucket.index)) {
-      continue;
-    }
-    if (Math.trunc(bucket.index) !== normalizedTarget) {
-      continue;
-    }
-    if (bucket.index === 0) {
-      continue;
-    }
-    return key;
-  }
-  return null;
+  return `secondary-name::${trimmedLabel}`;
 }
 
 function buildChannelTabId(bucketKey) {
   if (bucketKey === '0') {
     return 'channel-0';
+  }
+  const secondaryNameParts = /^secondary-name::(.+)$/.exec(String(bucketKey));
+  if (secondaryNameParts) {
+    const secondaryLabelSlug = slugify(secondaryNameParts[1]);
+    const secondaryHash = hashChannelKey(bucketKey);
+    if (secondaryLabelSlug) {
+      return `channel-secondary-name-${secondaryLabelSlug}-${secondaryHash}`;
+    }
+    return `channel-secondary-name-${secondaryHash}`;
+  }
+  const secondaryParts = /^secondary::(\d+)::(.+)$/.exec(String(bucketKey));
+  if (secondaryParts) {
+    const secondaryIndex = secondaryParts[1];
+    const secondaryLabelSlug = slugify(secondaryParts[2]);
+    const secondaryHash = hashChannelKey(bucketKey);
+    if (secondaryLabelSlug) {
+      return `channel-secondary-${secondaryIndex}-${secondaryLabelSlug}-${secondaryHash}`;
+    }
+    return `channel-secondary-${secondaryIndex}-${secondaryHash}`;
   }
   const slug = slugify(bucketKey);
   if (slug) {

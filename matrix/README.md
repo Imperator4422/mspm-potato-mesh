@@ -56,9 +56,17 @@ This is **not** a full appservice framework; it just speaks the minimal HTTP nee
 
 ## Configuration
 
-All configuration is in `Config.toml` in the project root.
+Configuration can come from a TOML file, CLI flags, environment variables, or secret files. The bridge merges inputs in this order (highest to lowest):
 
-Example:
+1. CLI flags
+2. Environment variables
+3. Secret files (`*_FILE` paths or container defaults)
+4. TOML config file
+5. Container defaults (paths + poll interval)
+
+If no TOML file is provided, required values must be supplied via CLI/env/secret inputs.
+
+Example TOML:
 
 ```toml
 [potatomesh]
@@ -85,6 +93,90 @@ state_file = "bridge_state.json"
 ````
 
 The `hs_token` is used to validate inbound appservice transactions. Keep it identical in `Config.toml` and your Matrix appservice registration file.
+
+### CLI Flags
+
+Run `potatomesh-matrix-bridge --help` for the full list. Common flags:
+
+* `--config PATH`
+* `--state-file PATH`
+* `--potatomesh-base-url URL`
+* `--potatomesh-poll-interval-secs SECS`
+* `--matrix-homeserver URL`
+* `--matrix-as-token TOKEN`
+* `--matrix-as-token-file PATH`
+* `--matrix-hs-token TOKEN`
+* `--matrix-hs-token-file PATH`
+* `--matrix-server-name NAME`
+* `--matrix-room-id ROOM`
+* `--container` / `--no-container`
+* `--secrets-dir PATH`
+
+### Environment Variables
+
+* `POTATOMESH_CONFIG`
+* `POTATOMESH_BASE_URL`
+* `POTATOMESH_POLL_INTERVAL_SECS`
+* `MATRIX_HOMESERVER`
+* `MATRIX_AS_TOKEN`
+* `MATRIX_AS_TOKEN_FILE`
+* `MATRIX_HS_TOKEN`
+* `MATRIX_HS_TOKEN_FILE`
+* `MATRIX_SERVER_NAME`
+* `MATRIX_ROOM_ID`
+* `STATE_FILE`
+* `POTATOMESH_CONTAINER`
+* `POTATOMESH_SECRETS_DIR`
+
+### Secret Files
+
+If you supply `*_FILE` values, the bridge reads the secret contents and trims whitespace. When running inside a container, the bridge also checks the default secrets directory (default: `/run/secrets`) for:
+
+* `matrix_as_token`
+* `matrix_hs_token`
+
+### Container Defaults
+
+Container detection checks `POTATOMESH_CONTAINER`, `CONTAINER`, and `/proc/1/cgroup`. When detected (or forced with `--container`), defaults shift to:
+
+* Config path: `/app/Config.toml`
+* State file: `/app/bridge_state.json`
+* Secrets dir: `/run/secrets`
+* Poll interval: 15 seconds (if not otherwise configured)
+
+Set `POTATOMESH_CONTAINER=0` or `--no-container` to opt out of container defaults.
+
+### Docker Compose First Run
+
+Before starting Compose, complete this preflight checklist:
+
+1. Ensure `matrix/Config.toml` exists as a regular file on the host (not a directory).
+2. Fill required Matrix values in `matrix/Config.toml`:
+   - `matrix.as_token`
+   - `matrix.hs_token`
+   - `matrix.server_name`
+   - `matrix.room_id`
+   - `matrix.homeserver`
+
+This is required because the shared Compose anchor `x-matrix-bridge-base` mounts `./matrix/Config.toml` to `/app/Config.toml`.
+Then follow the token and namespace requirements in [Matrix Appservice Setup (Synapse example)](#matrix-appservice-setup-synapse-example).
+
+#### Troubleshooting
+
+| Symptom | Likely cause | What to check |
+| --- | --- | --- |
+| `Is a directory (os error 21)` | Host mount source became a directory | `matrix/Config.toml` was missing at mount time and got created as a directory on host. |
+| `M_UNKNOWN_TOKEN` / `401 Unauthorized` | Matrix appservice token mismatch | Verify `matrix.as_token` matches your appservice registration and setup in [Matrix Appservice Setup (Synapse example)](#matrix-appservice-setup-synapse-example). |
+
+#### Recovery from accidental `Config.toml` directory creation
+
+```bash
+# from repo root
+rm -rf matrix/Config.toml
+touch matrix/Config.toml
+# then edit matrix/Config.toml and set valid matrix.as_token, matrix.hs_token,
+# matrix.server_name, matrix.room_id, and matrix.homeserver before starting compose
+```
 
 ### PotatoMesh API
 
@@ -186,7 +278,7 @@ Build the container from the repo root with the included `matrix/Dockerfile`:
 docker build -f matrix/Dockerfile -t potatomesh-matrix-bridge .
 ```
 
-Provide your config at `/app/Config.toml` and persist the bridge state file by mounting volumes. Minimal example:
+Provide your config at `/app/Config.toml` (or use CLI/env/secret overrides) and persist the bridge state file by mounting volumes. Minimal example:
 
 ```bash
 docker run --rm \
@@ -206,7 +298,7 @@ docker run --rm \
   potatomesh-matrix-bridge
 ```
 
-The image ships `Config.example.toml` for reference, but the bridge will exit if `/app/Config.toml` is not provided.
+The image ships `Config.example.toml` for reference. If `/app/Config.toml` is absent, set the required values via environment variables, CLI flags, or secrets instead.
 
 ---
 
@@ -244,7 +336,7 @@ Delete `bridge_state.json` if you want it to replay all currently available mess
 
 ## Development
 
-Run tests (currently mostly compile checks, no real tests yet):
+Run tests:
 
 ```bash
 cargo test
