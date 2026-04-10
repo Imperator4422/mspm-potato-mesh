@@ -34,6 +34,7 @@ x-web-base: &web-base
     - potatomesh_data:/app/.local/share/potato-mesh
     - potatomesh_config:/app/.config/potato-mesh
     - potatomesh_logs:/app/logs
+    - potatomesh_pages:/app/pages
   restart: unless-stopped
   deploy:
     resources:
@@ -52,9 +53,10 @@ x-ingestor-base: &ingestor-base
     ALLOWED_CHANNELS: ${ALLOWED_CHANNELS:-""}
     HIDDEN_CHANNELS: ${HIDDEN_CHANNELS:-""}
     API_TOKEN: ${API_TOKEN}
-    INSTANCE_DOMAIN: ${INSTANCE_DOMAIN}
-    POTATOMESH_INSTANCE: ${POTATOMESH_INSTANCE:-http://web:41447}
+    INSTANCE_DOMAIN: ${INSTANCE_DOMAIN:-http://web:41447}
     DEBUG: ${DEBUG:-0}
+    PROTOCOL: ${PROTOCOL:-meshtastic}
+    ENERGY_SAVING: ${ENERGY_SAVING:-0}
     FEDERATION: ${FEDERATION:-1}
     PRIVATE: ${PRIVATE:-0}
   volumes:
@@ -158,6 +160,8 @@ volumes:
   potatomesh_config:
     driver: local
   potatomesh_logs:
+    driver: local
+  potatomesh_pages:
     driver: local
   potatomesh_matrix_bridge_state:
     driver: local

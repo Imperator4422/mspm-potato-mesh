@@ -41,7 +41,8 @@ export function extractChatMessageMetadata(message) {
   );
 
   const modemPreset = normalizePresetString(resolveModemPresetCandidate(message));
-  const presetCode = modemPreset ? abbreviatePreset(modemPreset) : null;
+  const numericFreq = frequency != null ? Number(frequency) : null;
+  const presetCode = modemPreset ? abbreviatePreset(modemPreset, numericFreq) : null;
 
   return { frequency, channelName, presetCode };
 }
@@ -129,18 +130,31 @@ function normalizeFrequencySlot(value) {
 
 /**
  * HTML entity sequence inserted when a frequency is unavailable.
+ *
+ * Three non-breaking spaces are used rather than a dash or empty string so
+ * the bracket slot keeps its fixed width in monospaced log displays.  This
+ * value is inserted directly into HTML; it must never be HTML-escaped again.
  * @type {string}
  */
 const FREQUENCY_PLACEHOLDER = '&nbsp;&nbsp;&nbsp;';
 
 /**
  * HTML placeholder for missing preset abbreviations.
+ *
+ * Two non-breaking spaces preserve the two-character column width expected
+ * by operators reading the chat log.  Like FREQUENCY_PLACEHOLDER, this value
+ * is already an HTML entity string and must not be escaped a second time.
  * @type {string}
  */
 const PRESET_PLACEHOLDER = '&nbsp;&nbsp;';
 
 /**
  * Canonical preset abbreviations keyed by a normalized preset token.
+ *
+ * Keys are lowercased, non-alphabetic characters stripped so the lookup is
+ * insensitive to casing and delimiter differences (e.g. ``"LONG_FAST"``
+ * and ``"LongFast"`` both resolve to ``"LF"``).  Unmapped presets fall
+ * back to {@link derivePresetInitials}.
  * @type {Record<string, string>}
  */
 const PRESET_ABBREVIATIONS = {
@@ -170,24 +184,10 @@ function firstNonNull(...candidates) {
   return null;
 }
 
-/**
- * Normalise potential channel name values to trimmed strings.
- *
- * @param {*} value Raw value.
- * @returns {string|null} Sanitised channel name.
- */
-function normalizeString(value) {
-  if (value == null) return null;
-  if (typeof value === 'string') {
-    const trimmed = value.trim();
-    return trimmed.length > 0 ? trimmed : null;
-  }
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) return null;
-    return String(value);
-  }
-  return null;
-}
+// normalizeString is the canonical implementation in utils.js; imported here
+// so callers of chat-format.js that use it directly continue to work.
+import { normalizeString } from './utils.js';
+import { resolveMeshcorePresetDisplay } from './node-modem-metadata.js';
 
 /**
  * Convert various frequency representations into clean strings.
@@ -275,12 +275,23 @@ function normalizePresetString(value) {
 /**
  * Produce a two-character abbreviation for a modem preset.
  *
+ * SF/BW/CR preset strings (MeshCore) are resolved via
+ * {@link resolveMeshcorePresetDisplay} so they bypass the Meshtastic
+ * initials-derivation path entirely.  Meshtastic named presets (e.g.
+ * ``"MediumFast"``) are unaffected.
+ *
  * @param {string} preset Normalized preset string.
+ * @param {number|null} [freqMHz] Frequency in MHz, used for frequency-gated lookups.
  * @returns {string|null} Uppercase abbreviation or ``null``.
  */
-function abbreviatePreset(preset) {
+function abbreviatePreset(preset, freqMHz = null) {
   if (!preset) {
     return null;
+  }
+  // MeshCore SF/BW/CR presets take priority over the Meshtastic lookup table.
+  const resolved = resolveMeshcorePresetDisplay(preset, freqMHz);
+  if (resolved !== null) {
+    return resolved.shortCode;
   }
   const token = preset.replace(/[^A-Za-z]/g, '').toLowerCase();
   if (token && PRESET_ABBREVIATIONS[token]) {

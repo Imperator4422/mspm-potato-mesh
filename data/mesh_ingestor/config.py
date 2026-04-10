@@ -17,9 +17,7 @@
 from __future__ import annotations
 
 import os
-import sys
 from datetime import datetime, timezone
-from types import ModuleType
 from typing import Any
 
 DEFAULT_SNAPSHOT_SECS = 60
@@ -49,12 +47,14 @@ DEFAULT_ENERGY_SLEEP_SECS = float(6 * 60 * 60)
 DEFAULT_INGESTOR_HEARTBEAT_SECS = float(60 * 60)
 """Interval between ingestor heartbeat announcements."""
 
-CONNECTION = os.environ.get("CONNECTION") or os.environ.get("MESH_SERIAL")
+DEFAULT_SELF_NODE_REPORT_INTERVAL_SECS = float(60 * 60)
+"""Interval between periodic forced self-node re-reports from the daemon."""
+
+CONNECTION = os.environ.get("CONNECTION")
 """Optional connection target for the mesh interface.
 
 When unset, platform-specific defaults will be inferred by the interface
-implementations. The legacy :envvar:`MESH_SERIAL` environment variable is still
-accepted for backwards compatibility.
+implementations.
 """
 
 SNAPSHOT_SECS = DEFAULT_SNAPSHOT_SECS
@@ -64,6 +64,21 @@ CHANNEL_INDEX = int(os.environ.get("CHANNEL_INDEX", str(DEFAULT_CHANNEL_INDEX)))
 """Index of the LoRa channel to select when connecting."""
 
 DEBUG = os.environ.get("DEBUG") == "1"
+
+_KNOWN_PROTOCOLS = ("meshtastic", "meshcore")
+
+_raw_protocol = os.environ.get("PROTOCOL", "meshtastic").strip().lower()
+if _raw_protocol not in _KNOWN_PROTOCOLS:
+    raise ValueError(
+        f"Unknown PROTOCOL={_raw_protocol!r}. "
+        f"Valid options: {', '.join(_KNOWN_PROTOCOLS)}"
+    )
+
+PROTOCOL = _raw_protocol
+"""Active ingestion protocol, selected via the :envvar:`PROTOCOL` environment variable.
+
+Accepted values are ``meshtastic`` (default) and ``meshcore``.
+"""
 
 
 def _parse_channel_names(raw_value: str | None) -> tuple[str, ...]:
@@ -112,16 +127,16 @@ ALLOWED_CHANNELS = _parse_channel_names(os.environ.get("ALLOWED_CHANNELS"))
 def _resolve_instance_domain() -> str:
     """Resolve the configured instance domain from the environment.
 
-    The ingestor prefers the :envvar:`INSTANCE_DOMAIN` variable for clarity and
-    compatibility with the web application. For deployments that still
-    configure the legacy :envvar:`POTATOMESH_INSTANCE` variable, the resolver
-    falls back to that value when no primary domain is set.
+    Reads the :envvar:`INSTANCE_DOMAIN` variable. When the value does not
+    contain a scheme, ``https://`` is prepended automatically.
+
+    .. note::
+
+        Kept for backward compatibility with existing tests and callers.
+        New code should use :func:`_resolve_instance_domains` instead.
     """
 
-    instance_domain = os.environ.get("INSTANCE_DOMAIN", "")
-    legacy_instance = os.environ.get("POTATOMESH_INSTANCE", "")
-
-    configured_instance = (instance_domain or legacy_instance).rstrip("/")
+    configured_instance = os.environ.get("INSTANCE_DOMAIN", "").rstrip("/")
 
     if configured_instance and "://" not in configured_instance:
         return f"https://{configured_instance}"
@@ -129,8 +144,80 @@ def _resolve_instance_domain() -> str:
     return configured_instance
 
 
-INSTANCE = _resolve_instance_domain()
-API_TOKEN = os.environ.get("API_TOKEN", "")
+def _normalise_domain(raw: str) -> str:
+    """Strip whitespace and trailing slashes, prepend ``https://`` when needed.
+
+    Parameters:
+        raw: Single domain string to normalise.
+
+    Returns:
+        A URL string with a scheme prefix.
+    """
+
+    domain = raw.strip().rstrip("/")
+    if domain and "://" not in domain:
+        return f"https://{domain}"
+    return domain
+
+
+def _resolve_instance_domains() -> tuple[tuple[str, str], ...]:
+    """Parse :envvar:`INSTANCE_DOMAIN` and :envvar:`API_TOKEN` into paired tuples.
+
+    When ``INSTANCE_DOMAIN`` contains comma-separated values, each entry is
+    treated as an independent target.  ``API_TOKEN`` is either broadcast to
+    every target (single value) or positionally paired (comma-separated with
+    a matching count).
+
+    Returns:
+        A tuple of ``(instance_url, api_token)`` pairs, deduplicated by URL.
+
+    Raises:
+        ValueError: When the number of comma-separated tokens exceeds the
+            number of domains.
+    """
+
+    raw_domain = os.environ.get("INSTANCE_DOMAIN", "")
+    raw_token = os.environ.get("API_TOKEN", "")
+
+    domains: list[str] = []
+    seen: set[str] = set()
+    for part in raw_domain.split(","):
+        normalised = _normalise_domain(part)
+        if not normalised:
+            continue
+        key = normalised.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        domains.append(normalised)
+
+    if not domains:
+        return ()
+
+    tokens = [t.strip() for t in raw_token.split(",")]
+    # A single token (including empty string) is broadcast to all domains.
+    if len(tokens) == 1:
+        token = tokens[0]
+        return tuple((d, token) for d in domains)
+
+    if len(tokens) != len(domains):
+        raise ValueError(
+            f"API_TOKEN has {len(tokens)} comma-separated values but "
+            f"INSTANCE_DOMAIN has {len(domains)}; counts must match or "
+            f"API_TOKEN must be a single value"
+        )
+
+    return tuple(zip(domains, tokens))
+
+
+INSTANCES: tuple[tuple[str, str], ...] = _resolve_instance_domains()
+"""Paired ``(instance_url, api_token)`` tuples derived from the environment."""
+
+INSTANCE = INSTANCES[0][0] if INSTANCES else _resolve_instance_domain()
+"""First configured instance URL, kept for backward compatibility."""
+
+API_TOKEN = INSTANCES[0][1] if INSTANCES else os.environ.get("API_TOKEN", "")
+"""API token for the first configured instance, kept for backward compatibility."""
 ENERGY_SAVING = os.environ.get("ENERGY_SAVING") == "1"
 """When ``True``, enables the ingestor's energy saving mode."""
 
@@ -147,9 +234,7 @@ _INACTIVITY_RECONNECT_SECS = DEFAULT_INACTIVITY_RECONNECT_SECS
 _ENERGY_ONLINE_DURATION_SECS = DEFAULT_ENERGY_ONLINE_DURATION_SECS
 _ENERGY_SLEEP_SECS = DEFAULT_ENERGY_SLEEP_SECS
 _INGESTOR_HEARTBEAT_SECS = DEFAULT_INGESTOR_HEARTBEAT_SECS
-
-# Backwards compatibility shim for legacy imports.
-PORT = CONNECTION
+_SELF_NODE_REPORT_INTERVAL_SECS = DEFAULT_SELF_NODE_REPORT_INTERVAL_SECS
 
 
 def _debug_log(
@@ -194,6 +279,7 @@ __all__ = [
     "HIDDEN_CHANNELS",
     "ALLOWED_CHANNELS",
     "INSTANCE",
+    "INSTANCES",
     "API_TOKEN",
     "ENERGY_SAVING",
     "LORA_FREQ",
@@ -205,21 +291,6 @@ __all__ = [
     "_ENERGY_ONLINE_DURATION_SECS",
     "_ENERGY_SLEEP_SECS",
     "_INGESTOR_HEARTBEAT_SECS",
+    "_SELF_NODE_REPORT_INTERVAL_SECS",
     "_debug_log",
 ]
-
-
-class _ConfigModule(ModuleType):
-    """Module proxy that keeps connection aliases synchronised."""
-
-    def __setattr__(self, name: str, value: Any) -> None:  # type: ignore[override]
-        """Propagate CONNECTION/PORT assignments to both attributes."""
-
-        if name in {"CONNECTION", "PORT"}:
-            super().__setattr__("CONNECTION", value)
-            super().__setattr__("PORT", value)
-            return
-        super().__setattr__(name, value)
-
-
-sys.modules[__name__].__class__ = _ConfigModule

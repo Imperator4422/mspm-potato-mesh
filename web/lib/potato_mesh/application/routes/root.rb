@@ -19,23 +19,12 @@ module PotatoMesh
     module Routes
       module Root
         module Helpers
-          # Determine the initial theme from the request cookie and persist
-          # sanitised values back to the client to avoid invalid states.
+          # Return the fixed dark theme identifier. Light mode is no longer
+          # supported; theme selection and cookie persistence have been removed.
           #
-          # @return [String] normalised theme value ('dark' or 'light').
+          # @return [String] always 'dark'.
           def resolve_initial_theme
-            raw_theme = request.cookies["theme"]
-            theme = %w[dark light].include?(raw_theme) ? raw_theme : "dark"
-            if raw_theme != theme
-              response.set_cookie(
-                "theme",
-                value: theme,
-                path: "/",
-                max_age: 60 * 60 * 24 * 7,
-                same_site: :lax,
-              )
-            end
-            theme
+            "dark"
           end
 
           # Render a dashboard-oriented ERB template within the shared layout.
@@ -70,6 +59,7 @@ module PotatoMesh
               initial_theme: theme,
               current_view_mode: view_mode_sym,
               map_zoom: PotatoMesh::Config.map_zoom,
+              static_pages: PotatoMesh::App::Pages.static_pages,
             }
             sanitized_locals = extra_locals.is_a?(Hash) ? extra_locals : {}
             merged_locals = base_locals.merge(sanitized_locals)
@@ -189,6 +179,26 @@ module PotatoMesh
           app.get %r{/federation/?} do
             halt 404 unless federation_enabled?
             render_root_view(:federation, view_mode: :federation)
+          end
+
+          app.get "/pages/:slug" do
+            slug = params.fetch("slug", "")
+            halt 400, "Bad Request" unless slug.match?(PotatoMesh::App::Pages::SLUG_PATTERN)
+
+            page = PotatoMesh::App::Pages.find_page_by_slug(slug)
+            halt 404, "Not Found" unless page
+
+            page_html = PotatoMesh::App::Pages.render_page_content(page)
+            halt 500, "Internal Server Error" unless page_html
+
+            render_root_view(
+              :page,
+              view_mode: :"page_#{slug}",
+              extra_locals: {
+                page_title: page.title,
+                page_content_html: page_html,
+              },
+            )
           end
 
           app.get "/nodes/:id" do

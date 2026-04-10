@@ -226,6 +226,21 @@ RSpec.describe "Potato Mesh Sinatra app" do
     end
   end
 
+  # Fetch the stored telemetry_type for a given row id and assert it equals
+  # +expected+.  Avoids repeating the with_db / SELECT / expect triple across
+  # multiple telemetry_type inference tests.
+  #
+  # @param id [Integer] telemetry row id to look up.
+  # @param expected [String] expected telemetry_type value.
+  # @return [void]
+  def expect_stored_telemetry_type(id, expected)
+    with_db(readonly: true) do |db|
+      db.results_as_hash = true
+      row = db.get_first_row("SELECT telemetry_type FROM telemetry WHERE id = ?", [id])
+      expect(row["telemetry_type"]).to eq(expected)
+    end
+  end
+
   # Assert that an API response either omits blank values or matches the
   # expected non-blank value.
   #
@@ -1296,6 +1311,13 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('class="footer-content"')
     end
 
+    it "renders the site title as a link to the dashboard" do
+      get "/"
+
+      expect(last_response.body).to include('class="site-title__link"')
+      expect(last_response.body).to match(%r{<a href="/" class="site-title__link">})
+    end
+
     it "renders the federation instance selector when federation is enabled" do
       get "/"
 
@@ -1336,13 +1358,12 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('<meta name="twitter:image" content="http://example.org/potatomesh-logo.svg" />')
     end
 
-    it "disables the auto-fit toggle when a map zoom override is configured" do
+    it "does not include the removed auto-fit checkbox regardless of map zoom override" do
       allow(PotatoMesh::Config).to receive(:map_zoom).and_return(11.0)
 
       get "/"
 
-      expect(last_response.body).to include('id="fitBounds" disabled="disabled"')
-      expect(last_response.body).not_to include('id="fitBounds" checked="checked"')
+      expect(last_response.body).not_to include('id="fitBounds"')
     end
   end
 
@@ -1354,20 +1375,11 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('class="map-panel map-panel--full"')
       expect(last_response.body).to include('id="map"')
       expect(last_response.body).to include('id="filterInput"')
-      expect(last_response.body).to include('id="autoRefresh"')
+      expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).to include('id="refreshBtn"')
       expect(last_response.body).to include('id="status"')
-      expect(last_response.body).to include('id="fitBounds"')
+      expect(last_response.body).not_to include('id="fitBounds"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
-    end
-
-    it "disables the auto-fit toggle when a map zoom override is configured" do
-      allow(PotatoMesh::Config).to receive(:map_zoom).and_return(9.5)
-
-      get "/map"
-
-      expect(last_response.body).to include('id="fitBounds" disabled="disabled"')
-      expect(last_response.body).not_to include('id="fitBounds" checked="checked"')
     end
   end
 
@@ -1386,11 +1398,11 @@ RSpec.describe "Potato Mesh Sinatra app" do
       get "/federation"
 
       expect(last_response).to be_ok
-      expect(last_response.body).to include('class="federation-page federation-page--full-width"')
+      expect(last_response.body).to include('class="federation-page"')
       expect(last_response.body).to include("initializeFederationPage")
     end
 
-    it "hides dashboard-only refresh controls while keeping manual refresh and theme toggle" do
+    it "hides the meta-controls row entirely on the federation page" do
       allow(PotatoMesh::Config).to receive(:federation_enabled?).and_return(true)
 
       get "/federation"
@@ -1398,8 +1410,18 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).not_to include('id="filterInput"')
-      expect(last_response.body).to include('id="refreshBtn"')
-      expect(last_response.body).to include('id="themeToggle"')
+      expect(last_response.body).not_to include('id="refreshBtn"')
+      expect(last_response.body).not_to include('id="themeToggle"')
+      expect(last_response.body).not_to include('id="metaRow"')
+    end
+
+    it "renders the slim footer on the federation page" do
+      allow(PotatoMesh::Config).to receive(:federation_enabled?).and_return(true)
+
+      get "/federation"
+
+      expect(last_response).to be_ok
+      expect(last_response.body).to include('class="app-footer app-footer--slim"')
     end
   end
 
@@ -1410,7 +1432,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       expect(last_response.body).to include('class="chat-panel chat-panel--full"')
       expect(last_response.body).to include('id="filterInput"')
-      expect(last_response.body).to include('id="autoRefresh"')
+      expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).to include('id="refreshBtn"')
       expect(last_response.body).to include('id="status"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
@@ -1434,10 +1456,22 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('class="nodes-table-wrapper"')
       expect(last_response.body).to include('id="nodes"')
       expect(last_response.body).to include('id="filterInput"')
-      expect(last_response.body).to include('id="autoRefresh"')
+      expect(last_response.body).not_to include('id="autoRefresh"')
       expect(last_response.body).to include('id="refreshBtn"')
       expect(last_response.body).to include('id="status"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
+    end
+  end
+
+  describe "GET /charts" do
+    it "renders the charts page with the slim footer but without meta-controls" do
+      get "/charts"
+
+      expect(last_response).to be_ok
+      expect(last_response.body).to include("initializeChartsPage")
+      expect(last_response.body).not_to include('id="metaRow"')
+      expect(last_response.body).not_to include('id="filterInput"')
+      expect(last_response.body).to include('class="app-footer app-footer--slim"')
     end
   end
 
@@ -2781,6 +2815,42 @@ RSpec.describe "Potato Mesh Sinatra app" do
       end
     end
 
+    it "preserves existing coordinates when a subsequent upsert has no position data" do
+      node_id = "!f7e74be6"
+      first_heard = reference_time.to_i - 3600
+
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, last_heard, first_heard, latitude, longitude, altitude, position_time) VALUES (?,?,?,?,?,?,?)",
+          [node_id, first_heard, first_heard, 53.8673152, 27.5283968, 271, first_heard],
+        )
+      end
+
+      nodeinfo_payload = {
+        node_id => {
+          "user" => { "shortName" => "MUTE", "longName" => "ClientMute", "hwModel" => "HELTEC_MESH_POCKET", "role" => "CLIENT_MUTE" },
+          "lastHeard" => reference_time.to_i,
+        },
+      }
+
+      post "/api/nodes", nodeinfo_payload.to_json, auth_headers
+
+      expect(last_response).to be_ok
+
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT latitude, longitude, altitude, position_time FROM nodes WHERE node_id = ?",
+          [node_id],
+        )
+
+        expect(row["latitude"]).to be_within(1e-6).of(53.8673152)
+        expect(row["longitude"]).to be_within(1e-6).of(27.5283968)
+        expect(row["altitude"]).to be_within(0.01).of(271)
+        expect(row["position_time"]).to eq(first_heard)
+      end
+    end
+
     it "returns 400 when more than 10000 nodes are provided" do
       payload = (0..10000).each_with_object({}) do |i, acc|
         acc["node-#{i}"] = {}
@@ -2870,6 +2940,72 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         last_heard = db.get_first_value(SELECT_NODE_LAST_HEARD_SQL, [node["node_id"]])
         expect(last_heard).to eq(expected_last_heard(node))
+      end
+    end
+
+    describe "generic fallback long name protection" do
+      # node_id !deadbeef → short_id BEEF; generic names are "<Label> BEEF"
+      let(:node_id) { "!deadbeef" }
+
+      def seed_node(long_name: nil)
+        with_db do |db|
+          if long_name
+            db.execute(
+              "INSERT INTO nodes(node_id, long_name, last_heard) VALUES (?,?,?)",
+              [node_id, long_name, reference_time.to_i - 3600],
+            )
+          else
+            db.execute(
+              "INSERT INTO nodes(node_id, last_heard) VALUES (?,?)",
+              [node_id, reference_time.to_i - 3600],
+            )
+          end
+        end
+      end
+
+      def post_long_name(long_name, ingestor: nil)
+        payload = { node_id => { "user" => { "longName" => long_name }, "lastHeard" => reference_time.to_i } }
+        payload["ingestor"] = ingestor if ingestor
+        post "/api/nodes", payload.to_json, auth_headers
+      end
+
+      def stored_long_name
+        with_db(readonly: true) do |db|
+          return db.get_first_value("SELECT long_name FROM nodes WHERE node_id = ?", [node_id])
+        end
+      end
+
+      it "does not overwrite a real name with a meshtastic generic fallback" do
+        seed_node(long_name: "Peter's Node")
+        post_long_name("Meshtastic BEEF")
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Peter's Node")
+      end
+
+      it "writes a generic fallback when no name is on record" do
+        seed_node
+        post_long_name("Meshtastic BEEF")
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Meshtastic BEEF")
+      end
+
+      it "overwrites a generic fallback with a real name" do
+        seed_node(long_name: "Meshtastic BEEF")
+        post_long_name("Peter's Node")
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Peter's Node")
+      end
+
+      it "does not overwrite a real name with a meshcore generic fallback" do
+        ingestor_id = "!aabbccdd"
+        post "/api/ingestors",
+             { node_id: ingestor_id, start_time: reference_time.to_i - 60,
+               last_seen_time: reference_time.to_i, version: "1.0.0", protocol: "meshcore" }.to_json,
+             auth_headers
+        seed_node(long_name: "Peter's Node")
+        post_long_name("Meshcore BEEF", ingestor: ingestor_id)
+        expect(last_response).to be_ok
+        expect(stored_long_name).to eq("Peter's Node")
       end
     end
   end
@@ -3924,6 +4060,113 @@ RSpec.describe "Potato Mesh Sinatra app" do
           expect_same_value(row["battery_level"], 80.0)
           expect(row["ingestor"]).to eq("!1111bbbb")
         end
+      end
+
+      it "infers telemetry_type='device' from device_metrics in the payload" do
+        payload = [
+          {
+            "id" => 24_001,
+            "node_id" => "!teltype01",
+            "rx_time" => reference_time.to_i - 10,
+            "device_metrics" => { "battery_level" => 85, "voltage" => 4.1 },
+          },
+        ]
+
+        post "/api/telemetry", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect_stored_telemetry_type(24_001, "device")
+      end
+
+      it "infers telemetry_type='environment' from environment_metrics in the payload" do
+        payload = [
+          {
+            "id" => 24_002,
+            "node_id" => "!teltype02",
+            "rx_time" => reference_time.to_i - 20,
+            "environment_metrics" => { "temperature" => 22.5, "relativeHumidity" => 50 },
+          },
+        ]
+
+        post "/api/telemetry", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect_stored_telemetry_type(24_002, "environment")
+      end
+
+      it "accepts an explicit telemetry_type from the payload" do
+        payload = [
+          {
+            "id" => 24_003,
+            "node_id" => "!teltype03",
+            "rx_time" => reference_time.to_i - 30,
+            "telemetry_type" => "power",
+            "voltage" => 5.0,
+            "current" => 0.48,
+          },
+        ]
+
+        post "/api/telemetry", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect_stored_telemetry_type(24_003, "power")
+      end
+
+      it "includes telemetry_type in GET /api/telemetry/:id response" do
+        payload = [
+          {
+            "id" => 24_004,
+            "node_id" => "!teltype04",
+            "rx_time" => reference_time.to_i - 5,
+            "device_metrics" => { "battery_level" => 70, "channelUtilization" => 30 },
+          },
+        ]
+
+        post "/api/telemetry", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+
+        get "/api/telemetry/!teltype04", {}, auth_headers
+
+        expect(last_response).to be_ok
+        entries = JSON.parse(last_response.body)
+        entry = entries.find { |e| e["id"] == 24_004 }
+        expect(entry).not_to be_nil
+        expect(entry["telemetry_type"]).to eq("device")
+      end
+
+      it "infers telemetry_type='air_quality' from air_quality_metrics in the payload" do
+        payload = [
+          {
+            "id" => 24_005,
+            "node_id" => "!teltype05",
+            "rx_time" => reference_time.to_i - 40,
+            "air_quality_metrics" => { "iaq" => 72, "pm25" => 8 },
+          },
+        ]
+
+        post "/api/telemetry", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        expect_stored_telemetry_type(24_005, "air_quality")
+      end
+
+      it "rejects an invalid telemetry_type and falls back to metric inference" do
+        payload = [
+          {
+            "id" => 24_006,
+            "node_id" => "!teltype06",
+            "rx_time" => reference_time.to_i - 50,
+            "telemetry_type" => "bogus_value",
+            "device_metrics" => { "battery_level" => 55, "channel_utilization" => 20 },
+          },
+        ]
+
+        post "/api/telemetry", payload.to_json, auth_headers
+
+        expect(last_response).to be_ok
+        # Invalid explicit type must be discarded; device_metrics inference takes over.
+        expect_stored_telemetry_type(24_006, "device")
       end
 
       it "returns 400 when more than 10000 telemetry packets are provided" do
@@ -6742,6 +6985,14 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       expect(last_response.body).to include("data-node-reference=")
       expect(last_response.body).to include(node["node_id"])
+    end
+
+    it "does not render the meta row on the node detail page" do
+      node = nodes_fixture.first
+      get "/nodes/#{node["node_id"]}"
+      expect(last_response).to be_ok
+      expect(last_response.body).not_to include('id="metaRow"')
+      expect(last_response.body).not_to include('id="refreshBtn"')
     end
 
     it "returns 404 when the node cannot be located" do

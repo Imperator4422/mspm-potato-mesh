@@ -1,3 +1,6 @@
+<!-- Copyright © 2025-26 l5yth & contributors -->
+<!-- Licensed under the Apache License, Version 2.0 (see LICENSE) -->
+
 # PotatoMesh Docker Guide
 
 PotatoMesh publishes ready-to-run container images to the GitHub Packages container
@@ -13,16 +16,16 @@ will pull the latest release images for you.
 
 ## Images on GHCR
 
-| Service  | Image                                                                                                         |
-|----------|---------------------------------------------------------------------------------------------------------------|
-| Web UI   | `ghcr.io/l5yth/potato-mesh-web-linux-amd64:<tag>` (e.g. `latest`, `3.0`, `v3.0`, or `3.1.0-rc1`)              |
-| Ingestor | `ghcr.io/l5yth/potato-mesh-ingestor-linux-amd64:<tag>` (e.g. `latest`, `3.0`, `v3.0`, or `3.1.0-rc1`)         |
+| Service  | Image                                                                                                          |
+|----------|----------------------------------------------------------------------------------------------------------------|
+| Web UI   | `ghcr.io/l5yth/potato-mesh-web-linux-amd64:<tag>` (e.g. `latest`, `0.6.0`, `v0.6.0`, or `0.7.0-rc1`)         |
+| Ingestor | `ghcr.io/l5yth/potato-mesh-ingestor-linux-amd64:<tag>` (e.g. `latest`, `0.6.0`, `v0.6.0`, or `0.7.0-rc1`)    |
 
 Images are published for every tagged release. Stable builds receive both
-semantic version tags (for example `3.0`) and a matching `v`-prefixed tag (for
-example `v3.0`), plus a `latest` tag that tracks the newest stable release.
+semantic version tags (for example `0.6.0`) and a matching `v`-prefixed tag (for
+example `v0.6.0`), plus a `latest` tag that tracks the newest stable release.
 Pre-release tags (for example `-rc`, `-beta`, `-alpha`, or `-dev` suffixes) are
-published only with their explicit version strings (`3.1.0-rc1` and `v3.1.0-rc1`
+published only with their explicit version strings (`0.7.0-rc1` and `v0.7.0-rc1`
 in this example) and do **not** advance `latest`. Pin the versioned tags when
 you need a specific build.
 
@@ -60,9 +63,8 @@ Additional environment variables are optional:
 | `CONNECTION` | `/dev/ttyACM0` | Serial device, TCP endpoint, or Bluetooth target used by the ingestor to reach the radio. |
 
 The ingestor posts to the URL configured via `INSTANCE_DOMAIN` (defaulting to
-`http://web:41447` in the provided compose file) and still accepts
-`POTATOMESH_INSTANCE` as a legacy alias when the primary variable is unset. Use
-`CHANNEL_INDEX` to select a LoRa channel on serial or Bluetooth connections.
+`http://web:41447` in the provided compose file). Use `CHANNEL_INDEX` to select
+a LoRa channel on serial or Bluetooth connections.
 
 ## Docker Compose file
 
@@ -78,6 +80,18 @@ the container. This path stores the instance private key and staged
 `/.well-known/potato-mesh` documents. Because the volume persists independently
 of container lifecycle events, generated credentials are not replaced on reboot
 or re-deploy.
+
+The `potatomesh_pages` volume mounts to `/app/pages` and holds operator-managed
+Markdown files that are rendered as static content pages in the web UI. On first
+start the default `1-about.md` page is copied from the image into the volume.
+You can add, edit, or remove `.md` files in this volume to customise your
+instance's navigation. To use a host directory instead of a named volume, replace
+the volume entry with a bind mount:
+
+```yaml
+volumes:
+  - ./my-pages:/app/pages
+```
 
 ## Start the stack
 

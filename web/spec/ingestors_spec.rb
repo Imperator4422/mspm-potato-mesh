@@ -61,7 +61,7 @@ RSpec.describe "Ingestor endpoints" do
       node_id: "!abc12345",
       start_time: now - 120,
       last_seen_time: now - 60,
-      version: "0.5.10",
+      version: "0.5.12",
       lora_freq: 915,
       modem_preset: "LongFast",
     }.merge(overrides)
@@ -133,7 +133,7 @@ RSpec.describe "Ingestor endpoints" do
       with_db do |db|
         db.execute(
           "INSERT INTO ingestors(node_id, start_time, last_seen_time, version) VALUES(?,?,?,?)",
-          ["!fresh000", now - 100, now - 10, "0.5.10"],
+          ["!fresh000", now - 100, now - 10, "0.5.12"],
         )
         db.execute(
           "INSERT INTO ingestors(node_id, start_time, last_seen_time, version) VALUES(?,?,?,?)",
@@ -141,7 +141,7 @@ RSpec.describe "Ingestor endpoints" do
         )
         db.execute(
           "INSERT INTO ingestors(node_id, start_time, last_seen_time, version, lora_freq, modem_preset) VALUES(?,?,?,?,?,?)",
-          ["!rich000", now - 200, now - 100, "0.5.10", 915, "MediumFast"],
+          ["!rich000", now - 200, now - 100, "0.5.12", 915, "MediumFast"],
         )
       end
 
@@ -173,7 +173,7 @@ RSpec.describe "Ingestor endpoints" do
         )
         db.execute(
           "INSERT INTO ingestors(node_id, start_time, last_seen_time, version) VALUES(?,?,?,?)",
-          ["!new-ingestor", now - 60, now - 30, "0.5.10"],
+          ["!new-ingestor", now - 60, now - 30, "0.5.12"],
         )
       end
 
@@ -182,6 +182,58 @@ RSpec.describe "Ingestor endpoints" do
       expect(last_response).to be_ok
       payload = JSON.parse(last_response.body)
       expect(payload.map { |entry| entry["node_id"] }).to eq(["!new-ingestor"])
+    end
+  end
+
+  describe "POST /api/ingestors additional error branches" do
+    it "accepts a payload where start_time is missing (server falls back to now)" do
+      # upsert_ingestor falls back to Time.now.to_i when start_time is nil,
+      # so the request succeeds rather than returning 400.
+      post "/api/ingestors", ingestor_payload(start_time: nil).to_json, auth_headers
+
+      expect(last_response.status).to eq(200)
+    end
+
+    it "accepts a payload where last_seen_time is missing (falls back to start_time)" do
+      post "/api/ingestors", ingestor_payload(last_seen_time: nil).to_json, auth_headers
+
+      expect(last_response.status).to eq(200)
+    end
+
+    it "rejects a payload where node_id is missing" do
+      post "/api/ingestors", ingestor_payload(node_id: nil).to_json, auth_headers
+
+      expect(last_response.status).to eq(400)
+    end
+
+    it "accepts a payload where lora_freq is a non-numeric string (coerced to nil)" do
+      # coerce_integer returns nil for non-numeric strings; the route still
+      # succeeds and stores lora_freq as NULL.
+      post "/api/ingestors", ingestor_payload(lora_freq: "not-a-number").to_json, auth_headers
+
+      expect(last_response.status).to eq(200)
+    end
+
+    it "returns 200 when optional lora_freq is absent entirely" do
+      payload = ingestor_payload
+      payload.delete(:lora_freq)
+      post "/api/ingestors", payload.to_json, auth_headers
+
+      expect(last_response.status).to eq(200)
+    end
+
+    it "returns 403 with the wrong bearer token" do
+      post "/api/ingestors", ingestor_payload.to_json,
+           "CONTENT_TYPE" => "application/json",
+           "HTTP_AUTHORIZATION" => "Bearer wrong-token"
+
+      expect(last_response.status).to eq(403)
+    end
+
+    it "returns 403 without any Authorization header" do
+      post "/api/ingestors", ingestor_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+      expect(last_response.status).to eq(403)
     end
   end
 

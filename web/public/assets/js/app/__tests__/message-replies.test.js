@@ -21,6 +21,7 @@ import {
   buildMessageBody,
   buildMessageIndex,
   normaliseMessageId,
+  renderLiteralWithLinks,
   resolveReplyPrefix
 } from '../message-replies.js';
 
@@ -150,4 +151,215 @@ test('buildMessageBody appends reaction counts for REACTION_APP packets without 
   });
 
   assert.equal(body, 'EMOJI(🌶) ESC(×2)');
+});
+
+// ---------------------------------------------------------------------------
+// buildMessageBody — renderMentionHtml callback
+// ---------------------------------------------------------------------------
+
+// Shared mock helpers reused across the mention-callback tests below.
+const esc = v => `ESC(${v})`;
+const emoji = v => `EMOJI(${v})`;
+const badge = name => `BADGE(${name})`;
+
+test('buildMessageBody throws TypeError when renderMentionHtml is not a function', () => {
+  assert.throws(
+    () => buildMessageBody({
+      message: { text: 'hello' },
+      escapeHtml: v => v,
+      renderEmojiHtml: v => v,
+      renderMentionHtml: 42,
+    }),
+    { name: 'TypeError', message: 'renderMentionHtml must be a function when provided' }
+  );
+});
+
+test('buildMessageBody without renderMentionHtml escapes @[Name] literally', () => {
+  const body = buildMessageBody({
+    message: { text: 'hello @[Alice]' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+  });
+  assert.equal(body, 'ESC(hello @[Alice])');
+});
+
+test('buildMessageBody with renderMentionHtml replaces single @[Name] mention', () => {
+  const body = buildMessageBody({
+    message: { text: 'hi @[Alice] there' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: badge,
+  });
+  assert.equal(body, 'ESC(hi )BADGE(Alice)ESC( there)');
+});
+
+test('buildMessageBody with renderMentionHtml handles multiple mentions', () => {
+  const calls = [];
+  const body = buildMessageBody({
+    message: { text: '@[A] and @[B]' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: (name) => { calls.push(name); return `BADGE(${name})`; },
+  });
+  assert.deepEqual(calls, ['A', 'B']);
+  assert.equal(body, 'BADGE(A)ESC( and )BADGE(B)');
+});
+
+test('buildMessageBody with renderMentionHtml escapes literal segments', () => {
+  const body = buildMessageBody({
+    message: { text: '<b> @[Alice]' },
+    escapeHtml: v => v.replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+    renderEmojiHtml: emoji,
+    renderMentionHtml: badge,
+  });
+  assert.equal(body, '&lt;b&gt; BADGE(Alice)');
+});
+
+test('buildMessageBody with renderMentionHtml at start of text', () => {
+  const body = buildMessageBody({
+    message: { text: '@[Alice] hello' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: badge,
+  });
+  assert.equal(body, 'BADGE(Alice)ESC( hello)');
+});
+
+test('buildMessageBody with renderMentionHtml at end of text', () => {
+  const body = buildMessageBody({
+    message: { text: 'hello @[Alice]' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: badge,
+  });
+  assert.equal(body, 'ESC(hello )BADGE(Alice)');
+});
+
+test('buildMessageBody with renderMentionHtml: no mentions, callback not invoked', () => {
+  let called = false;
+  const body = buildMessageBody({
+    message: { text: 'plain text' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: () => { called = true; return 'BADGE'; },
+  });
+  assert.equal(called, false);
+  assert.equal(body, 'ESC(plain text)');
+});
+
+test('buildMessageBody with renderMentionHtml: null renderMentionHtml behaves like no callback', () => {
+  const body = buildMessageBody({
+    message: { text: 'hi @[Alice]' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: null,
+  });
+  assert.equal(body, 'ESC(hi @[Alice])');
+});
+
+test('buildMessageBody reaction path unaffected by renderMentionHtml', () => {
+  const reaction = { text: '1', emoji: '👍', portnum: 'REACTION_APP' };
+  let called = false;
+  const body = buildMessageBody({
+    message: reaction,
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: () => { called = true; return 'BADGE'; },
+  });
+  assert.equal(called, false);
+  assert.equal(body, 'EMOJI(👍)');
+});
+
+test('buildMessageBody with renderMentionHtml: unclosed @[ treated as literal', () => {
+  const body = buildMessageBody({
+    message: { text: 'hello @[unclosed' },
+    escapeHtml: esc,
+    renderEmojiHtml: emoji,
+    renderMentionHtml: () => 'BADGE',
+  });
+  // @[ without closing ] does not match the pattern — treated as literal
+  assert.equal(body, 'ESC(hello @[unclosed)');
+});
+
+// ---------------------------------------------------------------------------
+// renderLiteralWithLinks — URL detection
+// ---------------------------------------------------------------------------
+
+const e = v => `E(${v})`;
+
+test('renderLiteralWithLinks passes plain text through escapeHtml', () => {
+  assert.equal(renderLiteralWithLinks('hello world', e), 'E(hello world)');
+});
+
+test('renderLiteralWithLinks wraps http:// URL in an anchor element', () => {
+  const result = renderLiteralWithLinks('check http://example.com out', e);
+  assert.equal(result, 'E(check )<a href="E(http://example.com)" target="_blank" rel="noopener noreferrer">E(http://example.com)</a>E( out)');
+});
+
+test('renderLiteralWithLinks wraps https:// URL in an anchor element', () => {
+  const result = renderLiteralWithLinks('see https://example.com/path?q=1', e);
+  assert.ok(result.includes('<a href='), 'should produce an anchor');
+  assert.ok(result.includes('target="_blank"'), 'should open in new tab');
+  assert.ok(result.includes('rel="noopener noreferrer"'), 'should include noopener rel');
+});
+
+test('renderLiteralWithLinks strips trailing period from URL', () => {
+  const result = renderLiteralWithLinks('visit https://example.com.', e);
+  assert.ok(result.includes('href="E(https://example.com)"'), 'period should not be in href');
+  assert.ok(result.includes('>E(https://example.com)<'), 'period should not be in link text');
+  assert.ok(result.endsWith('E(.)'), 'trailing period should appear as escaped text after the link');
+});
+
+test('renderLiteralWithLinks strips trailing comma from URL', () => {
+  const result = renderLiteralWithLinks('go to https://example.com, then stop', e);
+  assert.ok(result.includes('href="E(https://example.com)"'), 'comma must not be in href');
+});
+
+test('renderLiteralWithLinks handles URL at the start of text', () => {
+  const result = renderLiteralWithLinks('https://example.com is great', e);
+  assert.ok(result.startsWith('<a href='), 'anchor should be at start');
+  assert.ok(result.endsWith('E( is great)'), 'text after URL should be escaped');
+});
+
+test('renderLiteralWithLinks handles URL at the end of text', () => {
+  const result = renderLiteralWithLinks('see https://example.com', e);
+  assert.ok(result.startsWith('E(see )'), 'text before URL should be escaped');
+  assert.ok(result.includes('<a href='), 'URL should be linked');
+});
+
+test('renderLiteralWithLinks handles multiple URLs in text', () => {
+  const result = renderLiteralWithLinks('a https://foo.com b https://bar.com c', e);
+  const matches = result.match(/<a href=/g) || [];
+  assert.equal(matches.length, 2, 'should produce two anchors');
+});
+
+test('renderLiteralWithLinks does not linkify non-http schemes', () => {
+  const result = renderLiteralWithLinks('ftp://example.com', e);
+  assert.ok(!result.includes('<a href='), 'ftp:// should not be linkified');
+  assert.equal(result, 'E(ftp://example.com)');
+});
+
+test('renderLiteralWithLinks returns empty string for empty input', () => {
+  assert.equal(renderLiteralWithLinks('', e), '');
+});
+
+test('buildMessageBody linkifies URLs in message text without renderMentionHtml', () => {
+  const body = buildMessageBody({
+    message: { text: 'visit https://example.com now' },
+    escapeHtml: e,
+    renderEmojiHtml: v => `EMOJI(${v})`,
+  });
+  assert.ok(body.includes('<a href='), 'URL should be linkified');
+  assert.ok(body.includes('target="_blank"'), 'should open in new tab');
+});
+
+test('buildMessageBody linkifies URLs alongside @[Name] mentions', () => {
+  const body = buildMessageBody({
+    message: { text: '@[Alice] see https://example.com' },
+    escapeHtml: e,
+    renderEmojiHtml: v => `EMOJI(${v})`,
+    renderMentionHtml: name => `BADGE(${name})`,
+  });
+  assert.ok(body.startsWith('BADGE(Alice)'), 'mention should be rendered as badge');
+  assert.ok(body.includes('<a href='), 'URL should be linkified');
 });

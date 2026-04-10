@@ -57,6 +57,7 @@ require_relative "application/meshtastic/cipher"
 require_relative "application/meshtastic/payload_decoder"
 require_relative "application/data_processing"
 require_relative "application/filesystem"
+require_relative "application/pages"
 require_relative "application/instances"
 require_relative "application/routes/api"
 require_relative "application/routes/ingest"
@@ -74,6 +75,7 @@ module PotatoMesh
     extend App::Queries
     extend App::DataProcessing
     extend App::Filesystem
+    extend App::Pages
 
     helpers App::Helpers
     include App::Database
@@ -85,6 +87,7 @@ module PotatoMesh
     include App::Queries
     include App::DataProcessing
     include App::Filesystem
+    include App::Pages
 
     register App::Routes::Api
     register App::Routes::Ingest
@@ -157,8 +160,8 @@ module PotatoMesh
 
       perform_initial_filesystem_setup!
       cleanup_legacy_well_known_artifacts
-      init_db unless db_schema_present?
       ensure_schema_upgrades
+      init_db unless db_schema_present?
 
       log_instance_domain_resolution
       log_instance_public_key
@@ -210,6 +213,7 @@ SELF_INSTANCE_ID = PotatoMesh::Application::SELF_INSTANCE_ID unless defined?(SEL
   PotatoMesh::App::Prometheus,
   PotatoMesh::App::Queries,
   PotatoMesh::App::DataProcessing,
+  PotatoMesh::App::Pages,
 ].each do |mod|
   Object.include(mod) unless Object < mod
 end

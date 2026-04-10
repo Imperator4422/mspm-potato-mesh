@@ -14,17 +14,49 @@
  * limitations under the License.
  */
 
+// Import from submodules — functions remain locally usable inside this file
+// and are also re-exported so existing callers of './main.js' keep working.
+import {
+  computeLocalActiveNodeStats,
+  normaliseActiveNodeStatsPayload,
+  fetchActiveNodeStats,
+  formatActiveNodeStatsText,
+} from './stats.js';
+export {
+  computeLocalActiveNodeStats,
+  normaliseActiveNodeStatsPayload,
+  fetchActiveNodeStats,
+  formatActiveNodeStatsText,
+};
+
+import {
+  normalizeNodeNameValue,
+  buildNodeDetailHref,
+  canonicalNodeIdentifier,
+  renderNodeLongNameLink,
+} from './node-rendering.js';
+export {
+  normalizeNodeNameValue,
+  buildNodeDetailHref,
+  canonicalNodeIdentifier,
+  renderNodeLongNameLink,
+};
+
+import { escapeHtml } from './utils.js';
+export { escapeHtml };
+
 import { computeBoundingBox, computeBoundsForPoints, haversineDistanceKm } from './map-bounds.js';
 import { createMapAutoFitController } from './map-auto-fit-controller.js';
 import { resolveAutoFitBoundsConfig } from './map-auto-fit-settings.js';
 import { attachNodeInfoRefreshToMarker, overlayToPopupNode } from './map-marker-node-info.js';
 import { resolveLegendVisibility } from './map-legend-visibility.js';
 import { createMapFocusHandler, DEFAULT_NODE_FOCUS_ZOOM } from './nodes-map-focus.js';
+import { createMapCenterResetHandler } from './map-center-reset.js';
 import { enhanceCoordinateCell } from './nodes-coordinate-links.js';
 import { createShortInfoOverlayStack } from './short-info-overlay-manager.js';
 import { createNodeDetailOverlayManager } from './node-detail-overlay.js';
 import { refreshNodeInformation } from './node-details.js';
-import { extractModemMetadata, formatLoraFrequencyMHz, formatModemDisplay } from './node-modem-metadata.js';
+import { extractModemMetadata, formatLoraFrequencyMHz, formatModemDisplay, formatPresetDisplay } from './node-modem-metadata.js';
 import {
   TELEMETRY_FIELDS,
   buildTelemetryDisplayEntries,
@@ -51,6 +83,7 @@ import { renderChatTabs } from './chat-tabs.js';
 import { formatPositionHighlights, formatTelemetryHighlights } from './chat-log-highlights.js';
 import { filterChatModel, normaliseChatFilterQuery } from './chat-search.js';
 import { buildMessageBody, buildMessageIndex, resolveReplyPrefix } from './message-replies.js';
+import { parseMeshcoreSenderPrefix, findNodeByLongName } from './meshcore-chat-helpers.js';
 import {
   SNAPSHOT_WINDOW,
   aggregateNeighborSnapshots,
@@ -64,148 +97,19 @@ import {
   getRoleColor,
   getRoleKey,
   getRoleRenderPriority,
+  getRoleTextColor,
+  meshcoreRoleColors,
   normalizeRole,
   roleColors,
-  roleRenderOrder,
 } from './role-helpers.js';
-
-/**
- * Compute active-node counts from a local node array.
- *
- * @param {Array<Object>} nodes Node payloads.
- * @param {number} nowSeconds Reference timestamp.
- * @returns {{hour: number, day: number, week: number, month: number, sampled: boolean}} Local count snapshot.
- */
-export function computeLocalActiveNodeStats(nodes, nowSeconds) {
-  const safeNodes = Array.isArray(nodes) ? nodes : [];
-  const referenceNow = Number.isFinite(nowSeconds) ? nowSeconds : Date.now() / 1000;
-  const windows = [
-    { key: 'hour', secs: 3600 },
-    { key: 'day', secs: 86_400 },
-    { key: 'week', secs: 7 * 86_400 },
-    { key: 'month', secs: 30 * 86_400 }
-  ];
-  const counts = { sampled: true };
-  for (const window of windows) {
-    counts[window.key] = safeNodes.filter(node => {
-      const lastHeard = Number(node?.last_heard);
-      return Number.isFinite(lastHeard) && referenceNow - lastHeard <= window.secs;
-    }).length;
-  }
-  return counts;
-}
-
-/**
- * Parse and validate the `/api/stats` payload.
- *
- * @param {*} payload Candidate JSON object from the stats endpoint.
- * @returns {{hour: number, day: number, week: number, month: number, sampled: boolean}|null} Normalized stats or null.
- */
-export function normaliseActiveNodeStatsPayload(payload) {
-  const activeNodes = payload && typeof payload === 'object' ? payload.active_nodes : null;
-  if (!activeNodes || typeof activeNodes !== 'object') {
-    return null;
-  }
-  const hour = Number(activeNodes.hour);
-  const day = Number(activeNodes.day);
-  const week = Number(activeNodes.week);
-  const month = Number(activeNodes.month);
-  if (![hour, day, week, month].every(Number.isFinite)) {
-    return null;
-  }
-  return {
-    hour: Math.max(0, Math.trunc(hour)),
-    day: Math.max(0, Math.trunc(day)),
-    week: Math.max(0, Math.trunc(week)),
-    month: Math.max(0, Math.trunc(month)),
-    sampled: Boolean(payload.sampled)
-  };
-}
-
-const ACTIVE_NODE_STATS_CACHE_TTL_MS = 30_000;
-let activeNodeStatsCache = null;
-let activeNodeStatsFetchPromise = null;
-let activeNodeStatsFetchImpl = null;
-
-/**
- * Fetch active-node stats from the dedicated API endpoint with short-lived caching.
- *
- * @param {Function} fetchImpl Fetch implementation.
- * @returns {Promise<{hour: number, day: number, week: number, month: number, sampled: boolean} | null>} Normalized stats or null.
- */
-async function fetchRemoteActiveNodeStats(fetchImpl) {
-  const nowMs = Date.now();
-  if (activeNodeStatsCache?.fetchImpl === fetchImpl && activeNodeStatsCache.expiresAt > nowMs) {
-    return activeNodeStatsCache.stats;
-  }
-  if (activeNodeStatsFetchPromise && activeNodeStatsFetchImpl === fetchImpl) {
-    return activeNodeStatsFetchPromise;
-  }
-
-  activeNodeStatsFetchImpl = fetchImpl;
-  activeNodeStatsFetchPromise = (async () => {
-    const response = await fetchImpl('/api/stats', { cache: 'no-store' });
-    if (!response?.ok) {
-      throw new Error(`stats HTTP ${response?.status ?? 'unknown'}`);
-    }
-    const payload = await response.json();
-    const normalized = normaliseActiveNodeStatsPayload(payload);
-    if (!normalized) {
-      throw new Error('invalid stats payload');
-    }
-    activeNodeStatsCache = {
-      fetchImpl,
-      expiresAt: Date.now() + ACTIVE_NODE_STATS_CACHE_TTL_MS,
-      stats: normalized
-    };
-    return normalized;
-  })();
-
-  try {
-    return await activeNodeStatsFetchPromise;
-  } finally {
-    activeNodeStatsFetchPromise = null;
-    activeNodeStatsFetchImpl = null;
-  }
-}
-
-/**
- * Fetch active-node stats from the dedicated API endpoint with local fallback.
- *
- * @param {{
- *   nodes: Array<Object>,
- *   nowSeconds: number,
- *   fetchImpl?: Function
- * }} params Fetch parameters.
- * @returns {Promise<{hour: number, day: number, week: number, month: number, sampled: boolean}>} Stats snapshot.
- */
-export async function fetchActiveNodeStats({ nodes, nowSeconds, fetchImpl = fetch }) {
-  try {
-    const normalized = await fetchRemoteActiveNodeStats(fetchImpl);
-    if (normalized) return normalized;
-    throw new Error('invalid stats payload');
-  } catch (error) {
-    console.debug('Failed to fetch /api/stats; using local active-node counts.', error);
-    return computeLocalActiveNodeStats(nodes, nowSeconds);
-  }
-}
-
-/**
- * Format the dashboard refresh-info sentence for active-node counts.
- *
- * @param {{channel: string, frequency: string, stats: {hour:number,day:number,week:number,month:number,sampled:boolean}}} params Formatting data.
- * @returns {string} User-visible sentence for the dashboard header.
- */
-export function formatActiveNodeStatsText({ channel, frequency, stats }) {
-  const parts = [
-    `${Number(stats?.hour) || 0}/hour`,
-    `${Number(stats?.day) || 0}/day`,
-    `${Number(stats?.week) || 0}/week`,
-    `${Number(stats?.month) || 0}/month`
-  ];
-  const suffix = stats?.sampled ? ' (sampled)' : '';
-  return `${channel} (${frequency}) — active nodes: ${parts.join(', ')}${suffix}.`;
-}
+import {
+  isMeshtasticProtocol,
+  isMeshcoreProtocol,
+  meshtasticIconHtml,
+  MESHTASTIC_ICON_SRC,
+  MESHCORE_ICON_SRC,
+  protocolIconPrefixHtml,
+} from './protocol-helpers.js';
 
 /**
  * Entry point for the interactive dashboard. Wires up event listeners,
@@ -222,34 +126,25 @@ export function formatActiveNodeStatsText({ channel, frequency, stats }) {
  *   maxDistanceKm: number,
  *   tileFilters: { light: string, dark: string }
  * }} config Normalized application configuration.
- * @returns {void}
+ * @returns {{ _testUtils: Object }} Object whose ``_testUtils`` property exposes
+ *   inner closures for unit tests. Production callers may ignore this.
  */
 export function initializeApp(config) {
   const statusEl = document.getElementById('status');
-  const fitBoundsEl = document.getElementById('fitBounds');
-  const autoRefreshEl = document.getElementById('autoRefresh');
+  const footerActiveNodes = document.getElementById('footerActiveNodes');
   const refreshBtn = document.getElementById('refreshBtn');
   const filterInput = document.getElementById('filterInput');
   const filterClearButton = document.getElementById('filterClear');
-  const themeToggle = document.getElementById('themeToggle');
-  const infoBtn = document.getElementById('infoBtn');
-  const infoOverlay = document.getElementById('infoOverlay');
-  const infoClose = document.getElementById('infoClose');
-  const infoDialog = infoOverlay ? infoOverlay.querySelector('.info-dialog') : null;
   const shortInfoTemplate = document.getElementById('shortInfoOverlayTemplate');
   const overlayStack = createShortInfoOverlayStack({ document, window, template: shortInfoTemplate });
   const titleEl = document.querySelector('title');
   const headerEl = document.querySelector('h1');
   const headerTitleTextEl = headerEl ? headerEl.querySelector('.site-title-text') : null;
   const chatEl = document.getElementById('chat');
-  const refreshInfo = document.getElementById('refreshInfo');
   const instanceSelect = document.getElementById('instanceSelect');
   const baseTitle = document.title;
   const nodesTable = document.getElementById('nodes');
   const sortButtons = nodesTable ? Array.from(nodesTable.querySelectorAll('thead .sort-button[data-sort-key]')) : [];
-  const infoOverlayHome = infoOverlay
-    ? { parent: infoOverlay.parentNode, nextSibling: infoOverlay.nextSibling }
-    : null;
   const bodyClassList = document.body ? document.body.classList : null;
   const isPrivateMode = document.body && document.body.dataset
     ? String(document.body.dataset.privateMode).toLowerCase() === 'true'
@@ -340,13 +235,6 @@ export function initializeApp(config) {
   const REFRESH_MS = config.refreshMs;
   const CHAT_ENABLED = Boolean(config.chatEnabled);
   const instanceSelectorEnabled = Boolean(config.instancesFeatureEnabled);
-  if (refreshInfo) {
-    if (isDashboardView) {
-      refreshInfo.textContent = `${config.channel} (${config.frequency}) — active nodes: …`;
-    } else {
-      refreshInfo.textContent = '';
-    }
-  }
 
   if (instanceSelectorEnabled && instanceSelect) {
     void initializeInstanceSelector({
@@ -360,7 +248,7 @@ export function initializeApp(config) {
 
   /** @type {ReturnType<typeof setTimeout>|null} */
   let refreshTimer = null;
-  let refreshInfoRequestId = 0;
+  let activeStatsRequestId = 0;
 
   /**
    * Close any open short-info overlays that do not contain the provided anchor.
@@ -557,19 +445,17 @@ export function initializeApp(config) {
    * @returns {void}
    */
   function restartAutoRefresh() {
+    // Tear down any existing timer so the interval never double-fires when
+    // the config is re-applied.
     if (refreshTimer) {
       clearInterval(refreshTimer);
       refreshTimer = null;
     }
-    if (autoRefreshEl && autoRefreshEl.checked) {
+    // Only arm the timer when a positive interval is configured; a zero or
+    // negative value means auto-refresh is intentionally disabled.
+    if (REFRESH_MS > 0) {
       refreshTimer = setInterval(refresh, REFRESH_MS);
     }
-  }
-
-  if (fitBoundsEl && mapZoomOverride !== null) {
-    fitBoundsEl.checked = false;
-    fitBoundsEl.disabled = true;
-    fitBoundsEl.setAttribute('aria-disabled', 'true');
   }
 
   const MAP_CENTER_COORDS = Object.freeze({ lat: config.mapCenter.lat, lon: config.mapCenter.lon });
@@ -577,6 +463,7 @@ export function initializeApp(config) {
   const mapContainer = document.getElementById('map');
   const mapPanel = document.getElementById('mapPanel');
   const mapFullscreenToggle = document.getElementById('mapFullscreenToggle');
+  const mapCenterResetEl = document.getElementById('mapCenterReset');
   const fullscreenContainer = mapPanel || mapContainer;
   const isFederationView = bodyClassList ? bodyClassList.contains('view-federation') : false;
   const legendDefaultCollapsed = mapPanel ? mapPanel.dataset.legendCollapsed === 'true' : false;
@@ -614,7 +501,7 @@ export function initializeApp(config) {
   ];
 
   const autoFitController = createMapAutoFitController({
-    toggleEl: fitBoundsEl,
+    toggleEl: null,
     windowObject: typeof window !== 'undefined' ? window : undefined,
     defaultPaddingPx: AUTO_FIT_PADDING_PX
   });
@@ -627,6 +514,14 @@ export function initializeApp(config) {
     setMapCenter: value => {
       mapCenterLatLng = value;
     }
+  });
+
+  const centerResetHandler = createMapCenterResetHandler({
+    getMap: () => map,
+    autoFitController,
+    fitMapToBounds,
+    mapCenterCoords: MAP_CENTER_COORDS,
+    mapZoomOverride,
   });
 
   /**
@@ -821,62 +716,6 @@ export function initializeApp(config) {
   });
 
   /**
-   * Append the informational modal overlay to the fullscreen container when active.
-   *
-   * @returns {void}
-   */
-  function attachInfoOverlayToFullscreenHost() {
-    if (!infoOverlay || !fullscreenContainer) return;
-    if (infoOverlay.parentNode !== fullscreenContainer) {
-      fullscreenContainer.appendChild(infoOverlay);
-    }
-    if (infoOverlay.classList) {
-      infoOverlay.classList.add('info-overlay--fullscreen');
-    }
-  }
-
-  /**
-   * Restore the informational overlay to its original DOM position.
-   *
-   * @returns {void}
-   */
-  function restoreInfoOverlayToHome() {
-    if (!infoOverlay || !infoOverlayHome || !infoOverlayHome.parent) return;
-    if (infoOverlay.parentNode === infoOverlayHome.parent) {
-      if (infoOverlay.classList) {
-        infoOverlay.classList.remove('info-overlay--fullscreen');
-      }
-      return;
-    }
-    if (
-      infoOverlayHome.nextSibling &&
-      infoOverlayHome.nextSibling.parentNode === infoOverlayHome.parent &&
-      typeof infoOverlayHome.parent.insertBefore === 'function'
-    ) {
-      infoOverlayHome.parent.insertBefore(infoOverlay, infoOverlayHome.nextSibling);
-    } else if (typeof infoOverlayHome.parent.appendChild === 'function') {
-      infoOverlayHome.parent.appendChild(infoOverlay);
-    }
-    if (infoOverlay.classList) {
-      infoOverlay.classList.remove('info-overlay--fullscreen');
-    }
-  }
-
-  /**
-   * Ensure the informational overlay participates in the active fullscreen subtree.
-   *
-   * @returns {void}
-   */
-  function syncInfoOverlayHost() {
-    if (!infoOverlay) return;
-    if (isMapInFullscreen()) {
-      attachInfoOverlayToFullscreenHost();
-    } else {
-      restoreInfoOverlayToHome();
-    }
-  }
-
-  /**
    * Respond to fullscreen change events originating from the browser.
    *
    * @returns {void}
@@ -906,7 +745,6 @@ export function initializeApp(config) {
         mapContainer.style.minHeight = '';
       }
     }
-    syncInfoOverlayHost();
     updateFullscreenToggleState();
     refreshMapSize();
   }
@@ -927,10 +765,70 @@ export function initializeApp(config) {
     }
   }
 
-  syncInfoOverlayHost();
+  if (mapCenterResetEl) {
+    mapCenterResetEl.addEventListener('click', event => {
+      event.preventDefault();
+      centerResetHandler();
+    });
+  }
 
+  /** @type {Set<string>} Active compound role-filter keys, each ``"<protocol>:<roleKey>"``. */
   const activeRoleFilters = new Set();
+  /** @type {Map<string, HTMLElement>} Compound key → legend button element. */
   const legendRoleButtons = new Map();
+  /** @type {Set<string>} Protocols hidden by the user via legend toggles. */
+  const hiddenProtocols = new Set();
+  const legendProtocolButtons = new Map();
+
+  /**
+   * Wrap a legend button click handler so it always calls
+   * ``preventDefault`` and ``stopPropagation`` before running the body.
+   *
+   * Centralising this prevents the two-line boilerplate from repeating in
+   * every legend button handler, reducing token-level duplication.
+   *
+   * @param {function(Event): void} fn Handler body.
+   * @returns {function(Event): void} Full click listener.
+   */
+  function legendClickHandler(fn) {
+    return (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      fn(event);
+    };
+  }
+
+  /**
+   * Canonical protocol token for use in compound filter keys.
+   *
+   * Collapses null/absent/unknown protocol values to ``'meshtastic'`` so that
+   * pre-protocol legacy records land in the Meshtastic filter bucket.
+   *
+   * @param {string|null|undefined} protocol Raw protocol value.
+   * @returns {'meshtastic'|'meshcore'} Normalised protocol token.
+   */
+  function normalizeFilterProtocol(protocol) {
+    return isMeshcoreProtocol(protocol) ? 'meshcore' : 'meshtastic';
+  }
+
+  /**
+   * Build a compound filter key that encodes both protocol and role.
+   *
+   * Using compound keys avoids collisions between role names that appear in
+   * both Meshtastic and MeshCore (e.g. ``SENSOR``, ``REPEATER``).  The filter
+   * set stores these keys so that clicking the MeshCore SENSOR button only
+   * includes MeshCore SENSOR nodes, not Meshtastic ones.
+   *
+   * @param {*} role Raw role value from the API.
+   * @param {string|null|undefined} protocol Protocol string from the API.
+   * @returns {string} Compound key in the form ``"<protocol>:<roleKey>"``.
+   */
+  function makeRoleFilterKey(role, protocol) {
+    return `${normalizeFilterProtocol(protocol)}:${getRoleKey(role)}`;
+  }
+
+  /** @type {Readonly<Record<string,string>>} Display names for protocol tokens. */
+  const PROTOCOL_DISPLAY_NAMES = Object.freeze({ meshtastic: 'Meshtastic', meshcore: 'MeshCore' });
 
   /**
    * Lazily create the floating map status element used for progress messages.
@@ -1414,6 +1312,8 @@ export function initializeApp(config) {
 
   let legendContainer = null;
   let legendToggleControl = null;
+  let meshcoreCountEl = null;
+  let meshtasticCountEl = null;
   let legendToggleButton = null;
   let legendVisible = true;
 
@@ -1459,11 +1359,48 @@ export function initializeApp(config) {
    *
    * @returns {void}
    */
+  /**
+   * Build a protocol icon ``<img>`` element via DOM APIs.
+   *
+   * Shared implementation used by {@link buildMeshtasticIconImg} and
+   * {@link buildMeshcoreIconImg}.  Mirrors the attribute set produced by
+   * the HTML-string helpers in ``protocol-helpers.js`` so the rendered
+   * output is identical regardless of insertion method.
+   *
+   * @param {string} src Absolute path to the SVG asset.
+   * @param {string} variantClass BEM modifier class, e.g. ``protocol-icon--meshtastic``.
+   * @returns {HTMLImageElement} Icon element ready to append.
+   */
+  function buildProtocolIconImg(src, variantClass) {
+    const img = document.createElement('img');
+    img.setAttribute('src', src);
+    img.setAttribute('alt', '');
+    img.setAttribute('width', '12');
+    img.setAttribute('height', '12');
+    img.setAttribute('aria-hidden', 'true');
+    img.setAttribute('loading', 'lazy');
+    img.setAttribute('decoding', 'async');
+    img.className = `protocol-icon ${variantClass}`;
+    return img;
+  }
+
+  /** @returns {HTMLImageElement} Meshtastic protocol icon element. */
+  function buildMeshtasticIconImg() {
+    return buildProtocolIconImg(MESHTASTIC_ICON_SRC, 'protocol-icon--meshtastic');
+  }
+
+  /** @returns {HTMLImageElement} MeshCore protocol icon element. */
+  function buildMeshcoreIconImg() {
+    return buildProtocolIconImg(MESHCORE_ICON_SRC, 'protocol-icon--meshcore');
+  }
+
   function updateNeighborLinesToggleState() {
     if (!neighborLinesToggleButton) return;
     const label = neighborLinesVisible ? 'Hide neighbor lines' : 'Show neighbor lines';
     neighborLinesToggleButton.textContent = label;
-    neighborLinesToggleButton.setAttribute('aria-pressed', neighborLinesVisible ? 'true' : 'false');
+    // aria-pressed reflects whether the user has *activated* the toggle (i.e. lines are
+    // currently hidden). When lines are visible (default), the button is unpressed.
+    neighborLinesToggleButton.setAttribute('aria-pressed', neighborLinesVisible ? 'false' : 'true');
     neighborLinesToggleButton.setAttribute('aria-label', label);
   }
 
@@ -1495,7 +1432,8 @@ export function initializeApp(config) {
     if (!traceLinesToggleButton) return;
     const label = traceLinesVisible ? 'Hide trace lines' : 'Show trace lines';
     traceLinesToggleButton.textContent = label;
-    traceLinesToggleButton.setAttribute('aria-pressed', traceLinesVisible ? 'true' : 'false');
+    // aria-pressed reflects whether the user has *activated* the toggle (lines hidden).
+    traceLinesToggleButton.setAttribute('aria-pressed', traceLinesVisible ? 'false' : 'true');
     traceLinesToggleButton.setAttribute('aria-label', label);
   }
 
@@ -1525,13 +1463,21 @@ export function initializeApp(config) {
    */
   function updateLegendRoleFiltersUI() {
     const hasFilters = activeRoleFilters.size > 0;
-    legendRoleButtons.forEach((button, role) => {
+    // legendRoleButtons is keyed by compound key ("protocol:roleKey")
+    legendRoleButtons.forEach((button, compoundKey) => {
       if (!button) return;
-      const isActive = activeRoleFilters.has(role);
+      const isActive = activeRoleFilters.has(compoundKey);
       button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
     });
+    legendProtocolButtons.forEach((button, protocol) => {
+      if (!button) return;
+      const isHidden = hiddenProtocols.has(protocol);
+      const displayName = PROTOCOL_DISPLAY_NAMES[protocol] ?? protocol;
+      button.setAttribute('aria-pressed', isHidden ? 'true' : 'false');
+      button.textContent = isHidden ? `Show ${displayName}` : `Hide ${displayName}`;
+    });
     if (legendContainer) {
-      if (hasFilters) {
+      if (hasFilters || hiddenProtocols.size > 0) {
         legendContainer.setAttribute('data-has-active-filters', 'true');
       } else {
         legendContainer.removeAttribute('data-has-active-filters');
@@ -1541,31 +1487,94 @@ export function initializeApp(config) {
   }
 
   /**
-   * Toggle the visibility filter for a given role.
+   * Toggle the visibility filter for a role+protocol combination.
    *
-   * @param {string} role Role identifier.
+   * @param {string} compoundKey Compound key in the form ``"<protocol>:<roleKey>"``.
    * @returns {void}
    */
-  function toggleRoleFilter(role) {
-    if (!role) return;
-    if (activeRoleFilters.has(role)) {
-      activeRoleFilters.delete(role);
+  function toggleRoleFilter(compoundKey) {
+    if (!compoundKey) return;
+    if (activeRoleFilters.has(compoundKey)) {
+      activeRoleFilters.delete(compoundKey);
     } else {
-      activeRoleFilters.add(role);
+      activeRoleFilters.add(compoundKey);
     }
     updateLegendRoleFiltersUI();
     applyFilter();
   }
 
+  /**
+   * Build role filter buttons for a given palette and append them to a column.
+   *
+   * Each button is keyed by a compound ``"<protocol>:<roleKey>"`` string so
+   * that roles sharing a name across protocols (e.g. ``SENSOR``, ``REPEATER``)
+   * produce independent buttons without colliding in {@link legendRoleButtons}.
+   *
+   * @param {HTMLElement} colEl Column container element.
+   * @param {Record<string,string>} palette Role→colour map to render.
+   * @param {'meshtastic'|'meshcore'} protocol Protocol token for this column.
+   * @returns {void}
+   */
+  function buildRoleButtons(colEl, palette, protocol) {
+    for (const [role, color] of Object.entries(palette)) {
+      if (!CHAT_ENABLED && role === 'CLIENT_HIDDEN') continue;
+      const compoundKey = makeRoleFilterKey(role, protocol);
+      const item = document.createElement('button');
+      item.className = 'legend-item';
+      colEl.appendChild(item);
+      item.type = 'button';
+      item.setAttribute('aria-pressed', 'false');
+      item.dataset.role = role;
+      item.dataset.protocol = protocol;
+      const swatch = document.createElement('span');
+      swatch.className = 'legend-swatch';
+      item.appendChild(swatch);
+      swatch.style.background = color;
+      swatch.setAttribute('aria-hidden', 'true');
+      const label = document.createElement('span');
+      label.className = 'legend-label';
+      item.appendChild(label);
+      label.textContent = role;
+      item.addEventListener('click', legendClickHandler(event => {
+        const exclusive = event.metaKey || event.ctrlKey;
+        if (exclusive) {
+          activeRoleFilters.clear();
+          activeRoleFilters.add(compoundKey);
+          updateLegendRoleFiltersUI();
+          applyFilter();
+        } else {
+          toggleRoleFilter(compoundKey);
+        }
+      }));
+      legendRoleButtons.set(compoundKey, item);
+    }
+  }
+
   if (map && hasLeaflet) {
-    const legend = L.control({ position: 'bottomright' });
+    // Single combined control: [toggle button | legend panel] in a flex row.
+    // The toggle sits to the left so it remains accessible when the legend is collapsed.
+    const legendControl = L.control({ position: 'bottomright' });
     /**
-     * Leaflet control factory that renders the legend UI.
+     * Leaflet control factory that renders the toggle button and legend panel
+     * as a single side-by-side control.
      *
-     * @returns {HTMLElement} Legend DOM element.
+     * @returns {HTMLElement} Wrapper element containing both children.
      */
-    legend.onAdd = function () {
-      const div = L.DomUtil.create('div', 'legend');
+    legendControl.onAdd = function () {
+      const wrapper = L.DomUtil.create('div', 'legend-outer');
+
+      // --- Toggle button (left) ---
+      const button = L.DomUtil.create('button', 'legend-toggle-button', wrapper);
+      button.type = 'button';
+      button.setAttribute('aria-pressed', 'true');
+      button.setAttribute('aria-controls', 'mapLegend');
+      button.addEventListener('click', legendClickHandler(() => {
+        setLegendVisibility(!legendVisible);
+      }));
+      legendToggleButton = button;
+
+      // --- Legend panel (right) ---
+      const div = L.DomUtil.create('div', 'legend', wrapper);
       div.id = 'mapLegend';
       div.setAttribute('role', 'region');
       div.setAttribute('aria-label', 'Map legend');
@@ -1575,100 +1584,94 @@ export function initializeApp(config) {
       const title = L.DomUtil.create('span', 'legend-title', header);
       title.textContent = 'Legend';
 
-      const itemsContainer = L.DomUtil.create('div', 'legend-items', div);
-    legendRoleButtons.clear();
-    for (const [role, color] of Object.entries(roleColors)) {
-      if (!CHAT_ENABLED && role === 'CLIENT_HIDDEN') continue;
-      const item = L.DomUtil.create('button', 'legend-item', itemsContainer);
-      item.type = 'button';
-      item.setAttribute('aria-pressed', 'false');
-        item.dataset.role = role;
-        const swatch = L.DomUtil.create('span', 'legend-swatch', item);
-        swatch.style.background = color;
-        swatch.setAttribute('aria-hidden', 'true');
-        const label = L.DomUtil.create('span', 'legend-label', item);
-        label.textContent = role;
-        item.addEventListener('click', event => {
-          event.preventDefault();
-          event.stopPropagation();
-          const exclusive = event.metaKey || event.ctrlKey;
-          if (exclusive) {
-            activeRoleFilters.clear();
-            activeRoleFilters.add(role);
-            updateLegendRoleFiltersUI();
-            applyFilter();
-          } else {
-            toggleRoleFilter(role);
-          }
-        });
-        legendRoleButtons.set(role, item);
-      }
-      updateLegendRoleFiltersUI();
+      const itemsContainer = L.DomUtil.create('div', 'legend-items legend-items--columns', div);
 
-      const toggle = L.DomUtil.create('div', 'legend-toggle', div);
-      neighborLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-neighbors', toggle);
+      // --- MeshCore column (left, bottom-aligned) ---
+      const meshcoreCol = L.DomUtil.create('div', 'legend-column legend-column--bottom', itemsContainer);
+      const meshcoreColHeader = L.DomUtil.create('div', 'legend-column-header', meshcoreCol);
+      meshcoreColHeader.appendChild(buildMeshcoreIconImg());
+      const meshcoreColTitle = document.createElement('span');
+      meshcoreColTitle.textContent = 'MeshCore';
+      meshcoreColHeader.appendChild(meshcoreColTitle);
+      meshcoreCountEl = document.createElement('span');
+      meshcoreCountEl.className = 'legend-protocol-count';
+      meshcoreColHeader.appendChild(meshcoreCountEl);
+
+      // --- Meshtastic column (right) ---
+      const meshtasticCol = L.DomUtil.create('div', 'legend-column', itemsContainer);
+      const meshtasticColHeader = L.DomUtil.create('div', 'legend-column-header', meshtasticCol);
+      meshtasticColHeader.appendChild(buildMeshtasticIconImg());
+      const meshtasticColTitle = document.createElement('span');
+      meshtasticColTitle.textContent = 'Meshtastic';
+      meshtasticColHeader.appendChild(meshtasticColTitle);
+      meshtasticCountEl = document.createElement('span');
+      meshtasticCountEl.className = 'legend-protocol-count';
+      meshtasticColHeader.appendChild(meshtasticCountEl);
+
+      legendRoleButtons.clear();
+      buildRoleButtons(meshcoreCol, meshcoreRoleColors, 'meshcore');
+      buildRoleButtons(meshtasticCol, roleColors, 'meshtastic');
+
+      // --- MeshCore column footer: protocol hide toggle ---
+      legendProtocolButtons.clear();
+      const buildProtocolToggle = (protocol, col) => {
+        const displayName = PROTOCOL_DISPLAY_NAMES[protocol] ?? protocol;
+        const btn = L.DomUtil.create('button', 'legend-item legend-protocol-toggle', col);
+        btn.type = 'button';
+        btn.setAttribute('aria-pressed', 'false');
+        btn.textContent = `Hide ${displayName}`;
+        btn.addEventListener('click', legendClickHandler(() => {
+          if (hiddenProtocols.has(protocol)) {
+            hiddenProtocols.delete(protocol);
+          } else {
+            hiddenProtocols.add(protocol);
+          }
+          updateLegendRoleFiltersUI();
+          applyFilter();
+        }));
+        legendProtocolButtons.set(protocol, btn);
+      };
+      buildProtocolToggle('meshcore', meshcoreCol);
+
+      // --- Meshtastic column: line toggles then protocol hide toggle at bottom ---
+      neighborLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-neighbors', meshtasticCol);
       neighborLinesToggleButton.type = 'button';
-      neighborLinesToggleButton.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
+      neighborLinesToggleButton.addEventListener('click', legendClickHandler(() => {
         setNeighborLinesVisibility(!neighborLinesVisible);
-      });
+      }));
       updateNeighborLinesToggleState();
 
-      traceLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-traces', toggle);
+      traceLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-traces', meshtasticCol);
       traceLinesToggleButton.type = 'button';
-      traceLinesToggleButton.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
+      traceLinesToggleButton.addEventListener('click', legendClickHandler(() => {
         setTraceLinesVisibility(!traceLinesVisible);
-      });
+      }));
       updateTraceLinesToggleState();
 
-      const resetButton = L.DomUtil.create('button', 'legend-item legend-reset', toggle);
+      // Hide Meshtastic toggle at the very bottom of the Meshtastic column.
+      buildProtocolToggle('meshtastic', meshtasticCol);
+
+      updateLegendRoleFiltersUI();
+
+      // --- Clear filters — full-width below the two columns ---
+      const filterToggle = L.DomUtil.create('div', 'legend-toggle', div);
+
+      const resetButton = L.DomUtil.create('button', 'legend-item legend-reset', filterToggle);
       resetButton.type = 'button';
       resetButton.textContent = 'Clear filters';
-      resetButton.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
+      resetButton.addEventListener('click', legendClickHandler(() => {
         activeRoleFilters.clear();
+        hiddenProtocols.clear();
         updateLegendRoleFiltersUI();
         applyFilter();
-      });
+      }));
 
-      L.DomEvent.disableClickPropagation(div);
-      L.DomEvent.disableScrollPropagation(div);
-
-      return div;
-    };
-    legend.addTo(map);
-    legendContainer = legend.getContainer();
-
-    legendToggleControl = L.control({ position: 'bottomright' });
-    /**
-     * Leaflet control factory for the legend visibility toggle.
-     *
-     * @returns {HTMLElement} Toggle button element.
-     */
-    legendToggleControl.onAdd = function () {
-      const container = L.DomUtil.create('div', 'leaflet-control legend-toggle');
-      const button = L.DomUtil.create('button', 'legend-toggle-button', container);
-      button.type = 'button';
-      button.textContent = 'Hide legend (filters)';
-      button.setAttribute('aria-pressed', 'true');
-      button.setAttribute('aria-label', 'Hide map legend');
-      button.setAttribute('aria-controls', 'mapLegend');
-      button.addEventListener('click', event => {
-        event.preventDefault();
-        event.stopPropagation();
-        setLegendVisibility(!legendVisible);
-      });
-      legendToggleButton = button;
       updateLegendToggleState();
-      L.DomEvent.disableClickPropagation(container);
-      L.DomEvent.disableScrollPropagation(container);
-      return container;
+      L.DomEvent.disableClickPropagation(wrapper);
+      L.DomEvent.disableScrollPropagation(wrapper);
+      return wrapper;
     };
-    legendToggleControl.addTo(map);
+    legendControl.addTo(map);
 
     const legendMediaQuery = window.matchMedia('(max-width: 1024px)');
     const initialLegendVisible = resolveLegendVisibility({
@@ -1683,72 +1686,6 @@ export function initializeApp(config) {
     });
   } else if (mapContainer && !hasLeaflet) {
     setLegendVisibility(false);
-  }
-
-    themeToggle.addEventListener('click', () => {
-      const dark = document.body.classList.toggle('dark');
-      const themeValue = dark ? 'dark' : 'light';
-      document.body.setAttribute('data-theme', themeValue);
-      if (document.documentElement) {
-        document.documentElement.setAttribute('data-theme', themeValue);
-      }
-      themeToggle.textContent = dark ? '☀️' : '🌙';
-      if (window.__themeCookie) {
-        if (typeof window.__themeCookie.persistTheme === 'function') {
-          window.__themeCookie.persistTheme(themeValue);
-        } else if (typeof window.__themeCookie.setCookie === 'function') {
-          window.__themeCookie.setCookie('theme', themeValue);
-        }
-      }
-      window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: themeValue } }));
-      if (typeof window.applyFiltersToAllTiles === 'function') window.applyFiltersToAllTiles();
-    });
-
-  let lastFocusBeforeInfo = null;
-
-  /**
-   * Display the modal overlay containing site information.
-   *
-   * @returns {void}
-   */
-  function openInfoOverlay() {
-    if (!infoOverlay || !infoDialog) return;
-    syncInfoOverlayHost();
-    lastFocusBeforeInfo = document.activeElement;
-    infoOverlay.hidden = false;
-    document.body.style.setProperty('overflow', 'hidden');
-    infoDialog.focus();
-  }
-
-  /**
-   * Hide the site information overlay and restore focus.
-   *
-   * @returns {void}
-   */
-  function closeInfoOverlay() {
-    if (!infoOverlay || !infoDialog) return;
-    infoOverlay.hidden = true;
-    document.body.style.removeProperty('overflow');
-    const target = lastFocusBeforeInfo && typeof lastFocusBeforeInfo.focus === 'function' ? lastFocusBeforeInfo : infoBtn;
-    if (target && typeof target.focus === 'function') {
-      target.focus();
-    }
-    lastFocusBeforeInfo = null;
-  }
-
-  if (infoBtn && infoOverlay && infoClose) {
-    infoBtn.addEventListener('click', openInfoOverlay);
-    infoClose.addEventListener('click', closeInfoOverlay);
-    infoOverlay.addEventListener('click', event => {
-      if (event.target === infoOverlay) {
-        closeInfoOverlay();
-      }
-    });
-    document.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && !infoOverlay.hidden) {
-        closeInfoOverlay();
-      }
-    });
   }
 
   const nodeDetailOverlayManager = createNodeDetailOverlayManager({
@@ -1880,21 +1817,6 @@ export function initializeApp(config) {
 
   // --- Helpers ---
   /**
-   * Escape a string for safe HTML insertion.
-   *
-   * @param {string} str Raw string.
-   * @returns {string} Escaped HTML string.
-   */
-  function escapeHtml(str) {
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;');
-  }
-
-  /**
    * Render a short name badge with role-based styling.
    *
    * @param {string} short Short node identifier.
@@ -1931,11 +1853,29 @@ export function initializeApp(config) {
       infoAttr = attrParts.join('');
     }
     if (!short) {
-      return `<span class="short-name" style="background:#ccc"${titleAttr}${infoAttr}>?&nbsp;&nbsp;&nbsp;</span>`;
+      return `<span class="short-name" style="background:#ccc"${titleAttr}${infoAttr}>&nbsp;?&nbsp;</span>`;
     }
-    const padded = escapeHtml(String(short).padStart(4, ' ')).replace(/ /g, '&nbsp;');
-    const color = getRoleColor(roleValue);
-    return `<span class="short-name" style="background:${color}"${titleAttr}${infoAttr}>${padded}</span>`;
+    // Pad the label for the badge.  For plain-ASCII names that are already
+    // 4 characters (meshtastic always stores exactly 4) no padding is added.
+    // Shorter names or names containing emoji/non-ASCII get a single space
+    // on each side — grapheme width varies too much for character-count
+    // centering to work reliably.
+    const raw = String(short);
+    const graphemeCount = typeof Intl !== 'undefined' && Intl.Segmenter
+      ? [...new Intl.Segmenter().segment(raw)].length
+      : raw.length;
+    let centred;
+    if (graphemeCount >= 4) {
+      centred = raw;
+    } else {
+      centred = ` ${raw} `;
+    }
+    const padded = escapeHtml(centred).replace(/ /g, '&nbsp;');
+    const protocol = nodeData?.protocol ?? null;
+    const color = getRoleColor(roleValue, protocol);
+    const textColor = getRoleTextColor(roleValue, protocol);
+    const styleAttr = textColor ? `background:${color};color:${textColor}` : `background:${color}`;
+    return `<span class="short-name" style="${styleAttr}"${titleAttr}${infoAttr}>${padded}</span>`;
   }
 
   const potatoMeshNamespace = globalThis.PotatoMesh || (globalThis.PotatoMesh = {});
@@ -2096,7 +2036,7 @@ export function initializeApp(config) {
    */
   function buildMapPopupHtml(node, nowSec) {
     const lines = [];
-    const longNameLink = renderNodeLongNameLink(node?.long_name, node?.node_id);
+    const longNameLink = renderNodeLongNameLink(node?.long_name, node?.node_id, { protocol: node?.protocol });
     if (longNameLink) {
       lines.push(`<b>${longNameLink}</b>`);
     }
@@ -2273,6 +2213,11 @@ export function initializeApp(config) {
       }
     }
 
+    const protocolRaw = source.protocol;
+    if (protocolRaw != null && typeof protocolRaw === 'string') {
+      normalized.protocol = protocolRaw;
+    }
+
     return normalized;
   }
 
@@ -2310,7 +2255,7 @@ export function initializeApp(config) {
     const heading = normalized.longName || normalized.shortName || normalized.nodeId || '';
     let headingHtml = '';
     if (normalized.longName) {
-      const link = renderNodeLongNameLink(normalized.longName, normalized.nodeId);
+      const link = renderNodeLongNameLink(normalized.longName, normalized.nodeId, { protocol: normalized.protocol });
       if (link) {
         headingHtml = `<strong>${link}</strong><br/>`;
       }
@@ -2335,7 +2280,9 @@ export function initializeApp(config) {
       overlayInfo.role = 'CLIENT';
     }
     const lines = [];
-    const longNameLink = renderNodeLongNameLink(overlayInfo.longName, overlayInfo.nodeId);
+    const longNameLink = renderNodeLongNameLink(overlayInfo.longName, overlayInfo.nodeId, {
+      protocol: overlayInfo.protocol,
+    });
     if (longNameLink) {
       lines.push(`<strong>${longNameLink}</strong>`);
     } else {
@@ -2345,7 +2292,7 @@ export function initializeApp(config) {
       }
     }
     const shortParts = [];
-    const shortHtml = renderShortHtml(overlayInfo.shortName, overlayInfo.role, overlayInfo.longName);
+    const shortHtml = renderShortHtml(overlayInfo.shortName, overlayInfo.role, overlayInfo.longName, overlayInfo);
     if (shortHtml) {
       shortParts.push(shortHtml);
     }
@@ -2470,7 +2417,8 @@ export function initializeApp(config) {
     const fallbackId = nodeIdRaw || 'Unknown node';
     const longNameRaw = pickFirstProperty([node], ['long_name', 'longName']);
     const longNameDisplay = longNameRaw ? String(longNameRaw) : fallbackId;
-    const longNameLink = renderNodeLongNameLink(longNameRaw, nodeIdRaw);
+    const nodeProtocol = pickFirstProperty([node], ['protocol']);
+    const longNameLink = renderNodeLongNameLink(longNameRaw, nodeIdRaw, { protocol: nodeProtocol });
     const announcementName = longNameLink || escapeHtml(longNameDisplay);
     const shortNameRaw = pickFirstProperty([node], ['short_name', 'shortName']);
     const shortNameDisplay = shortNameRaw ? String(shortNameRaw) : (nodeIdRaw ? nodeIdRaw.slice(-4) : null);
@@ -2485,6 +2433,7 @@ export function initializeApp(config) {
       role: roleDisplay,
       metadataSource: node,
       nodeData: node,
+      protocol: nodeProtocol,
       messageHtml: `${renderEmojiHtml('☀️')} ${renderAnnouncementCopy('New node:', ` ${announcementName}`)}`
     });
   }
@@ -2560,6 +2509,7 @@ export function initializeApp(config) {
       role: context.role,
       metadataSource: context.metadataSource,
       nodeData: context.nodeData,
+      protocol: context.protocol,
       messageHtml: `${renderEmojiHtml('💾')} ${renderAnnouncementCopy('Updated node info')}`
     });
   }
@@ -2574,6 +2524,7 @@ export function initializeApp(config) {
       role: context.role,
       metadataSource: context.metadataSource,
       nodeData: context.nodeData,
+      protocol: context.protocol,
       messageHtml: `${renderEmojiHtml('🔋')} ${renderAnnouncementCopy('Broadcasted telemetry', highlightSuffix)}`
     });
   }
@@ -2588,6 +2539,7 @@ export function initializeApp(config) {
       role: context.role,
       metadataSource: context.metadataSource,
       nodeData: context.nodeData,
+      protocol: context.protocol,
       messageHtml: `${renderEmojiHtml('📍')} ${renderAnnouncementCopy('Broadcasted position info', highlightSuffix)}`
     });
   }
@@ -2613,6 +2565,7 @@ export function initializeApp(config) {
       role: context.role,
       metadataSource: context.metadataSource,
       nodeData: context.nodeData,
+      protocol: context.protocol,
       messageHtml: `${renderEmojiHtml('🏘️')} ${renderAnnouncementCopy('Broadcasted neighbor info', detail)}`
     });
   }
@@ -2651,7 +2604,8 @@ export function initializeApp(config) {
    *   role: ?string,
    *   metadataSource: Object|null,
    *   nodeData: Object|null,
-   *   messageHtml: string
+   *   messageHtml: string,
+   *   protocol: ?string
    * }} params Rendering parameters.
    * @returns {HTMLElement} Chat log element.
    */
@@ -2662,7 +2616,8 @@ export function initializeApp(config) {
     role,
     metadataSource,
     nodeData,
-    messageHtml
+    messageHtml,
+    protocol: protocolHint = null
   }) {
     const div = document.createElement('div');
     const tsDate = timestampSeconds != null ? new Date(timestampSeconds * 1000) : null;
@@ -2675,8 +2630,11 @@ export function initializeApp(config) {
     const presetTag = formatChatPresetTag({ presetCode: metadata.presetCode });
     const longNameDisplay = longName != null ? String(longName) : '';
     const shortHtml = renderShortHtml(shortName, role, longNameDisplay, nodeData || metadataSource || {});
+    const announcementProtocol =
+      protocolHint ?? pickFirstProperty([nodeData, metadataSource], ['protocol']);
+    const announcementIconPrefix = protocolIconPrefixHtml(announcementProtocol);
     div.className = 'chat-entry-node';
-    div.innerHTML = `${prefix}${presetTag} ${shortHtml} ${messageHtml}`;
+    div.innerHTML = `${prefix}${presetTag} ${announcementIconPrefix}${shortHtml} ${messageHtml}`;
     return div;
   }
 
@@ -2718,6 +2676,7 @@ export function initializeApp(config) {
       role: context.role,
       metadataSource: sourceNode || context.metadataSource,
       nodeData: sourceNode || context.nodeData,
+      protocol: context.protocol,
       messageHtml: `${renderEmojiHtml('👣')} ${renderAnnouncementCopy('Caught trace', labelSuffix)}`
     });
   }
@@ -2823,13 +2782,20 @@ export function initializeApp(config) {
    *   longName: ?string,
    *   role: ?string,
    *   metadataSource: Object|null,
-   *   nodeData: Object|null
+   *   nodeData: Object|null,
+   *   protocol: ?string
    * }} Normalised display metadata.
    */
   function buildDisplayContext(entry) {
     const resolvedNode = resolveNodeForLogEntry(entry);
-    const candidateSources = [resolvedNode, entry?.node, entry?.telemetry, entry?.position, entry?.neighbor]
-      .filter(source => source && typeof source === 'object');
+    const candidateSources = [
+      resolvedNode,
+      entry?.node,
+      entry?.telemetry,
+      entry?.position,
+      entry?.neighbor,
+      entry?.trace,
+    ].filter(source => source && typeof source === 'object');
     const nodeId = typeof entry?.nodeId === 'string' && entry.nodeId.trim().length
       ? entry.nodeId.trim()
       : pickFirstProperty(candidateSources, ['node_id', 'nodeId']);
@@ -2847,7 +2813,8 @@ export function initializeApp(config) {
     const role = pickFirstProperty(candidateSources, ['role']);
     const metadataSource = resolvedNode || candidateSources[0] || {};
     const nodeData = resolvedNode || candidateSources[0] || {};
-    return { nodeId, nodeNum, shortName, longName, role, metadataSource, nodeData };
+    const protocol = pickFirstProperty(candidateSources, ['protocol']);
+    return { nodeId, nodeNum, shortName, longName, role, metadataSource, nodeData, protocol };
   }
 
   /**
@@ -3064,7 +3031,41 @@ export function initializeApp(config) {
     );
     const tsDate = tsSeconds != null ? new Date(tsSeconds * 1000) : null;
     const ts = tsDate ? formatTime(tsDate) : '--:--:--';
-    const short = renderShortHtml(m.node?.short_name, m.node?.role, m.node?.long_name, m.node);
+    const messageProtocol = pickFirstProperty([m, m?.node], ['protocol']);
+
+    // MeshCore channel messages use "SenderName: body" text format.  The
+    // ingestor tries to resolve from_id via the contacts roster; when it
+    // succeeds m.node is hydrated normally.  When it fails (contact not yet
+    // known), m.node is null and we fall back to a name-based lookup here.
+    // Detection: channel messages always have to_id "^all".
+    const toId = m.to_id ?? m.toId;
+    const isMeshcoreChannelMsg = isMeshcoreProtocol(messageProtocol) && toId === '^all';
+
+    let meshcoreSenderNode = null;
+    let parsedMeshcorePrefix = null;
+    if (isMeshcoreChannelMsg && m?.text) {
+      parsedMeshcorePrefix = parseMeshcoreSenderPrefix(String(m.text));
+      // Only attempt the name lookup when the ingestor couldn't resolve the
+      // sender (m.node is null).  If it's already hydrated, m.node is used.
+      if (parsedMeshcorePrefix && !m.node) {
+        meshcoreSenderNode = findNodeByLongName(parsedMeshcorePrefix.senderName, nodesById);
+      }
+    }
+
+    let short;
+    if (isMeshcoreChannelMsg && !m.node && meshcoreSenderNode) {
+      // Fallback: ingestor couldn't resolve sender, but JS found the node by name.
+      short = renderShortHtml(
+        meshcoreSenderNode.short_name ?? meshcoreSenderNode.shortName,
+        meshcoreSenderNode.role,
+        meshcoreSenderNode.long_name ?? meshcoreSenderNode.longName,
+        meshcoreSenderNode
+      );
+    } else {
+      short = renderShortHtml(m.node?.short_name, m.node?.role, m.node?.long_name, m.node);
+    }
+
+    const nodeProtocolPrefix = protocolIconPrefixHtml(messageProtocol);
     const replyPrefix = resolveReplyPrefix({
       message: m,
       messagesById,
@@ -3083,11 +3084,39 @@ export function initializeApp(config) {
         messageBodyHtml = '';
       }
     } else {
+      // Mention rendering is active for all MeshCore messages (channel + DM):
+      // @[Name] patterns are replaced with a short-name badge when the named
+      // node is present in nodesById.
+      const isMeshcoreMsg = isMeshcoreProtocol(messageProtocol);
+      const renderMentionHtml = isMeshcoreMsg
+        ? (mentionedName) => {
+            const mentionNode = findNodeByLongName(mentionedName, nodesById);
+            if (mentionNode) {
+              return renderShortHtml(
+                mentionNode.short_name ?? mentionNode.shortName,
+                mentionNode.role,
+                mentionNode.long_name ?? mentionNode.longName,
+                mentionNode
+              );
+            }
+            // Node not found — render as escaped plain text fallback.
+            return `@[${escapeHtml(mentionedName)}]`;
+          }
+        : null;
+
+      // For channel messages, strip the "SenderName: " prefix before building
+      // the body so we can prepend a linked version of the sender name instead.
+      const bodyMsg = (isMeshcoreChannelMsg && parsedMeshcorePrefix)
+        ? { ...m, text: parsedMeshcorePrefix.bodyText }
+        : m;
+
       messageBodyHtml = buildMessageBody({
-        message: m || {},
+        message: bodyMsg || {},
         escapeHtml,
-        renderEmojiHtml
+        renderEmojiHtml,
+        renderMentionHtml,
       });
+
     }
 
     const combinedSegments = [];
@@ -3101,7 +3130,7 @@ export function initializeApp(config) {
     });
     const presetTag = formatChatPresetTag({ presetCode: metadata.presetCode });
     div.className = 'chat-entry-msg';
-    div.innerHTML = `${prefix}${presetTag} ${short} ${text}`;
+    div.innerHTML = `${prefix}${presetTag} ${nodeProtocolPrefix}${short} ${text}`;
     return div;
   }
 
@@ -3233,7 +3262,12 @@ export function initializeApp(config) {
 
     const channelTabs = filteredChannels.map(channel => ({
       id: channel.id || `channel-${channel.index}`,
-      label: channel.label,
+      label: `${channel.label} (${channel.messageCount})`,
+      iconSrc: isMeshtasticProtocol(channel.protocol)
+        ? MESHTASTIC_ICON_SRC
+        : isMeshcoreProtocol(channel.protocol)
+          ? MESHCORE_ICON_SRC
+          : null,
       content: buildChatFragment({
         entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
         renderEntry: entry => createMessageChatEntry(entry.item),
@@ -3380,70 +3414,6 @@ export function initializeApp(config) {
     const n = Number(value);
     if (!Number.isFinite(n)) return '';
     return `${n.toFixed(1)} dB`;
-  }
-
-  /**
-   * Normalise node name fields by trimming whitespace.
-   *
-   * @param {*} value Raw name value.
-   * @returns {string} Sanitised name string.
-   */
-  function normalizeNodeNameValue(value) {
-    if (value == null) return '';
-    const str = String(value).trim();
-    return str.length ? str : '';
-  }
-
-  /**
-   * Compute the node detail path for a given identifier.
-   *
-   * @param {string|null} identifier Node identifier.
-   * @returns {string|null} Detail path.
-   */
-  function buildNodeDetailHref(identifier) {
-    if (identifier == null) return null;
-    const trimmed = String(identifier).trim();
-    if (!trimmed) return null;
-    const body = trimmed.startsWith('!') ? trimmed.slice(1) : trimmed;
-    if (!body) return null;
-    const encoded = encodeURIComponent(body);
-    return `/nodes/!${encoded}`;
-  }
-
-  /**
-   * Ensure ``identifier`` includes the canonical ``!`` prefix.
-   *
-   * @param {*} identifier Candidate identifier.
-   * @returns {string|null} Canonical identifier or ``null``.
-   */
-  function canonicalNodeIdentifier(identifier) {
-    if (identifier == null) return null;
-    const trimmed = String(identifier).trim();
-    if (!trimmed) return null;
-    return trimmed.startsWith('!') ? trimmed : `!${trimmed}`;
-  }
-
-  /**
-   * Render a linked long name pointing to the node detail view.
-   *
-   * @param {string|null} longName Display name.
-   * @param {string|null} identifier Node identifier.
-   * @param {string} [className='node-long-link'] Optional class attribute.
-   * @returns {string} Escaped HTML snippet.
-   */
-  function renderNodeLongNameLink(longName, identifier, className = 'node-long-link') {
-    const text = normalizeNodeNameValue(longName);
-    if (!text) return '';
-    const href = buildNodeDetailHref(identifier);
-    if (!href) {
-      return escapeHtml(text);
-    }
-    const classAttr = className ? ` class="${escapeHtml(className)}"` : '';
-    const canonicalIdentifier = canonicalNodeIdentifier(identifier);
-    const dataAttrs = canonicalIdentifier
-      ? ` data-node-detail-link="true" data-node-id="${escapeHtml(canonicalIdentifier)}"`
-      : ' data-node-detail-link="true"';
-    return `<a${classAttr} href="${href}"${dataAttrs}>${escapeHtml(text)}</a>`;
   }
 
   /**
@@ -3967,9 +3937,12 @@ export function initializeApp(config) {
       const modemMetadata = extractModemMetadata(n);
       const loraFrequencyText = formatLoraFrequencyMHz(modemMetadata.loraFreq);
       const loraFrequencyDisplay = loraFrequencyText ? escapeHtml(loraFrequencyText) : '';
-      const modemPresetDisplay = modemMetadata.modemPreset ? escapeHtml(modemMetadata.modemPreset) : '';
+      const resolvedPreset = formatPresetDisplay(modemMetadata.modemPreset, modemMetadata.loraFreq);
+      const modemPresetDisplay = resolvedPreset ? escapeHtml(resolvedPreset) : '';
       const longNameHtml = renderNodeLongNameLink(n.long_name, n.node_id);
+      const protocolIconCell = protocolIconPrefixHtml(n.protocol);
       tr.innerHTML = `
+        <td class="nodes-col nodes-col--protocol">${protocolIconCell}</td>
         <td class="mono nodes-col nodes-col--node-id">${n.node_id || ""}</td>
         <td class="nodes-col nodes-col--short-name">${renderShortHtml(n.short_name, n.role, n.long_name, n)}</td>
         <td class="nodes-col nodes-col--long-name">${longNameHtml}</td>
@@ -4049,7 +4022,7 @@ export function initializeApp(config) {
       ? buildTraceSegments(allTraces, nodes, {
           limitDistance: LIMIT_DISTANCE,
           maxDistanceKm: MAX_DISTANCE_KM,
-          colorForNode: node => getRoleColor(node.role)
+          colorForNode: node => getRoleColor(node.role, node.protocol)
         })
       : [];
 
@@ -4089,7 +4062,7 @@ export function initializeApp(config) {
         if (LIMIT_DISTANCE && sourceNode.distance_km != null && sourceNode.distance_km > MAX_DISTANCE_KM) continue;
         if (LIMIT_DISTANCE && targetNode.distance_km != null && targetNode.distance_km > MAX_DISTANCE_KM) continue;
 
-        const priority = getRoleRenderPriority(sourceNode.role);
+        const priority = getRoleRenderPriority(sourceNode.role, sourceNode.protocol);
         const rxTimeRaw = entry.rx_time;
         let rxTime = 0;
         if (typeof rxTimeRaw === 'number' && Number.isFinite(rxTimeRaw)) {
@@ -4107,7 +4080,7 @@ export function initializeApp(config) {
 
         neighborSegments.push({
           latlngs: [[srcLat, srcLon], [tgtLat, tgtLon]],
-          color: getRoleColor(sourceNode.role),
+          color: getRoleColor(sourceNode.role, sourceNode.protocol),
           priority,
           rxTime,
           sourceId,
@@ -4239,8 +4212,8 @@ export function initializeApp(config) {
     const nodesByRenderOrder = nodes
       .map((node, index) => ({ node, index }))
       .sort((a, b) => {
-        const orderA = getRoleRenderPriority(a.node && a.node.role);
-        const orderB = getRoleRenderPriority(b.node && b.node.role);
+        const orderA = getRoleRenderPriority(a.node && a.node.role, a.node && a.node.protocol);
+        const orderB = getRoleRenderPriority(b.node && b.node.role, b.node && b.node.protocol);
         if (orderA !== orderB) return orderA - orderB;
         return a.index - b.index;
       })
@@ -4253,7 +4226,7 @@ export function initializeApp(config) {
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
       if (LIMIT_DISTANCE && n.distance_km != null && n.distance_km > MAX_DISTANCE_KM) continue;
 
-      const color = getRoleColor(n.role);
+      const color = getRoleColor(n.role, n.protocol);
       const marker = L.circleMarker([lat, lon], {
         radius: 9,
         color: '#000',
@@ -4314,10 +4287,6 @@ export function initializeApp(config) {
         },
       });
     }
-    if (pts.length && fitBoundsEl && fitBoundsEl.checked) {
-      const bounds = computeBoundsForPoints(pts, { ...autoFitBoundsConfig });
-      fitMapToBounds(bounds, { animate: false, paddingPx: AUTO_FIT_PADDING_PX });
-    }
     overlayStack.cleanupOrphans();
   }
 
@@ -4338,13 +4307,36 @@ export function initializeApp(config) {
   /**
    * Test whether a node matches the active role filters.
    *
+   * Filters use compound ``"<protocol>:<roleKey>"`` keys so that shared role
+   * names (e.g. ``SENSOR``, ``REPEATER``) can be toggled independently per
+   * protocol.  Nodes whose protocol is null/absent are treated as Meshtastic
+   * (via {@link normalizeFilterProtocol}) to keep legacy records visible when
+   * the Meshtastic SENSOR filter is active.
+   *
    * @param {Object} node Node payload.
    * @returns {boolean} True when the node should be visible.
    */
   function matchesRoleFilter(node) {
     if (!activeRoleFilters.size) return true;
-    const roleKey = getRoleKey(node && node.role);
-    return activeRoleFilters.has(roleKey);
+    const compoundKey = makeRoleFilterKey(node && node.role, node && node.protocol);
+    return activeRoleFilters.has(compoundKey);
+  }
+
+  /**
+   * Check whether a node passes the active protocol visibility filters.
+   *
+   * Nodes with a null/absent protocol are always shown — hiding
+   * ``'meshtastic'`` hides only nodes that explicitly carry that protocol
+   * value.  Pre-protocol legacy records remain visible regardless.
+   *
+   * @param {Object} node Node payload.
+   * @returns {boolean} True when the node should be visible.
+   */
+  function matchesProtocolFilter(node) {
+    if (!hiddenProtocols.size) return true;
+    const protocol = (node && node.protocol) || null;
+    if (protocol && hiddenProtocols.has(protocol)) return false;
+    return true;
   }
 
   /**
@@ -4366,15 +4358,25 @@ export function initializeApp(config) {
   function applyFilter() {
     updateFilterClearVisibility();
     const filterQuery = filterInput ? filterInput.value : '';
+    // Normalise query so empty strings and whitespace-only input are treated
+    // identically and comparisons are case-insensitive.
     const q = normaliseChatFilterQuery(filterQuery);
-    const filteredNodes = allNodes.filter(n => matchesTextFilter(n, q) && matchesRoleFilter(n));
+    // Text and role filters apply only to the node table and map; the chat log
+    // always receives the full node collection so reply-thread lookups succeed
+    // even for nodes that are currently hidden by the active filter.
+    const filteredNodes = allNodes.filter(n => matchesTextFilter(n, q) && matchesRoleFilter(n) && matchesProtocolFilter(n));
     const sortedNodes = sortNodes(filteredNodes);
     const nowSec = Date.now()/1000;
     renderTable(sortedNodes, nowSec);
     renderMap(sortedNodes, nowSec);
-    updateCount(sortedNodes, nowSec);
-    updateRefreshInfo(sortedNodes, nowSec);
+    // Title and legend counts are intentionally global — they reflect the whole
+    // network, not just the nodes visible under the current filter.
+    updateTitleCount(allNodes, nowSec);
+    updateLegendProtocolCounts(allNodes, nowSec);
+    updateFooterStats(sortedNodes, nowSec);
     updateSortIndicators();
+    // Pass the raw filterQuery (not the normalised form) so the chat log can
+    // highlight matching substrings in their original case.
     renderChatLog({
       nodes: allNodes,
       messages: allMessages,
@@ -4387,6 +4389,8 @@ export function initializeApp(config) {
     });
   }
 
+  // Re-filter on every keystroke so the table and map stay in sync with the
+  // input field without requiring an explicit submit action.
   if (filterInput) {
     filterInput.addEventListener('input', () => {
       updateFilterClearVisibility();
@@ -4395,6 +4399,8 @@ export function initializeApp(config) {
     updateFilterClearVisibility();
   }
 
+  // The clear button only resets the field when it contains text; when empty
+  // it focuses the input so the user can start typing immediately.
   if (filterClearButton) {
     filterClearButton.addEventListener('click', () => {
       if (!filterInput) return;
@@ -4419,6 +4425,10 @@ export function initializeApp(config) {
       if (statusEl) {
         statusEl.textContent = 'refreshing…';
       }
+      // Secondary fetches are fire-and-forget with individual error handlers so
+      // that a failure in one stream (e.g. telemetry) does not abort the whole
+      // refresh cycle.  Each promise resolves to an empty array on error, which
+      // preserves the previous data until the next successful fetch.
       const neighborPromise = fetchNeighbors().catch(err => {
         console.warn('neighbor refresh failed; continuing without connections', err);
         return [];
@@ -4439,6 +4449,8 @@ export function initializeApp(config) {
         console.warn('encrypted message refresh failed; continuing without encrypted entries', err);
         return [];
       });
+      // Fan-out all requests simultaneously; nodes are the primary resource and
+      // must succeed for rendering to proceed.
       const [
         nodes,
         positions,
@@ -4456,17 +4468,25 @@ export function initializeApp(config) {
         telemetryPromise,
         encryptedMessagesPromise
       ]);
+      // Collapse per-source snapshot arrays into single merged records; the
+      // snapshot window de-duplicates entries from multiple ingestors.
       const aggregatedNodes = aggregateNodeSnapshots(nodes);
       const aggregatedPositions = aggregatePositionSnapshots(positions);
       const aggregatedNeighbors = aggregateNeighborSnapshots(neighborTuples);
       const aggregatedTelemetry = aggregateTelemetrySnapshots(telemetryEntries);
+      // Enrich merged node records with display name, position, distance, and
+      // telemetry before any rendering or filtering takes place.
       aggregatedNodes.forEach(applyNodeNameFallback);
       mergePositionsIntoNodes(aggregatedNodes, aggregatedPositions);
       computeDistances(aggregatedNodes);
       mergeTelemetryIntoNodes(aggregatedNodes, aggregatedTelemetry);
       normalizeNodeCollection(aggregatedNodes);
       allNodes = aggregatedNodes;
+      // Rebuild lookup maps after every refresh so marker updates and message
+      // hydration always resolve to the latest node objects.
       rebuildNodeIndex(allNodes);
+      // Hydrate messages with node metadata in parallel; the node index must be
+      // rebuilt first so lookups find the freshly merged records.
       const [chatMessages, encryptedChatMessages] = await Promise.all([
         messageNodeHydrator.hydrate(messages, nodesById),
         messageNodeHydrator.hydrate(encryptedMessages, nodesById)
@@ -4489,31 +4509,26 @@ export function initializeApp(config) {
     }
   }
 
+  // Kick off the first data load immediately then start the silent background
+  // auto-refresh timer.
   refresh();
   restartAutoRefresh();
+
   if (refreshBtn) {
+    // Manual refresh button bypasses the interval and runs a fetch right away.
     refreshBtn.addEventListener('click', refresh);
   }
 
-  if (autoRefreshEl) {
-    autoRefreshEl.addEventListener('change', () => {
-      restartAutoRefresh();
-      if (autoRefreshEl.checked) {
-        refresh();
-      }
-    });
-  }
-
   /**
-   * Update the count badge showing how many nodes are displayed.
+   * Update the page/tab title with the total active-node count for the past 7 days.
    *
-   * @param {Array<Object>} nodes Node payloads.
+   * @param {Array<Object>} nodes All node payloads (unfiltered — counts are global).
    * @param {number} nowSec Reference timestamp.
    * @returns {void}
    */
-  function updateCount(nodes, nowSec) {
-    const dayAgoSec = nowSec - 86400;
-    const count = nodes.filter(n => n.last_heard && Number(n.last_heard) >= dayAgoSec).length;
+  function updateTitleCount(nodes, nowSec) {
+    const weekAgoSec = nowSec - 7 * 86_400;
+    const count = nodes.filter(n => n.last_heard && Number(n.last_heard) >= weekAgoSec).length;
     const text = `${baseTitle} (${count})`;
     titleEl.textContent = text;
     if (headerTitleTextEl) {
@@ -4524,26 +4539,80 @@ export function initializeApp(config) {
   }
 
   /**
-   * Update the status message describing the currently rendered data.
+   * Update legend column headers with per-protocol active node counts (7 days).
+   *
+   * @param {Array<Object>} nodes All node payloads (unfiltered).
+   * @param {number} nowSec Reference timestamp.
+   * @returns {void}
+   */
+  function updateLegendProtocolCounts(nodes, nowSec) {
+    if (!meshcoreCountEl && !meshtasticCountEl) return;
+    const weekAgoSec = nowSec - 7 * 86_400;
+    const recentNodes = nodes.filter(n => Number.isFinite(Number(n.last_heard)) && Number(n.last_heard) >= weekAgoSec);
+    const meshcoreCount = recentNodes.filter(n => n.protocol === 'meshcore').length;
+    // Treat any non-meshcore node as Meshtastic until additional protocols are supported.
+    const meshtasticCount = recentNodes.filter(n => n.protocol !== 'meshcore').length;
+    if (meshcoreCountEl) meshcoreCountEl.textContent = ` (${meshcoreCount})`;
+    if (meshtasticCountEl) meshtasticCountEl.textContent = ` (${meshtasticCount})`;
+  }
+
+  /**
+   * Update the footer active-node stats element with day/week/month counts.
    *
    * @param {Array<Object>} nodes Node payloads.
    * @param {number} nowSec Reference timestamp.
    * @returns {void}
    */
-  function updateRefreshInfo(nodes, nowSec) {
-    if (!refreshInfo || !isDashboardView) {
+  function updateFooterStats(nodes, nowSec) {
+    if (!footerActiveNodes) {
       return;
     }
-    const requestId = ++refreshInfoRequestId;
+    const requestId = ++activeStatsRequestId;
     void fetchActiveNodeStats({ nodes, nowSeconds: nowSec }).then(stats => {
-      if (requestId !== refreshInfoRequestId) {
+      if (requestId !== activeStatsRequestId) {
         return;
       }
-      refreshInfo.textContent = formatActiveNodeStatsText({
-        channel: config.channel,
-        frequency: config.frequency,
-        stats
-      });
+      footerActiveNodes.textContent = 'Active: ' + formatActiveNodeStatsText({ stats });
     });
   }
+
+  /**
+   * Inner closures exposed for unit tests. Production callers should ignore
+   * this return value.
+   *
+   * @returns {{ _testUtils: { buildMapPopupHtml: Function, normalizeOverlaySource: Function, createAnnouncementEntry: Function, createMessageChatEntry: Function, buildDisplayContext: Function, rebuildNodeIndex: Function } }}
+   */
+  return {
+    _testUtils: {
+      buildMapPopupHtml,
+      normalizeOverlaySource,
+      createAnnouncementEntry,
+      createMessageChatEntry,
+      buildDisplayContext,
+      rebuildNodeIndex,
+      makeRoleFilterKey,
+      normalizeFilterProtocol,
+      matchesRoleFilter,
+      matchesProtocolFilter,
+      buildProtocolIconImg,
+      buildMeshtasticIconImg,
+      buildMeshcoreIconImg,
+      buildRoleButtons,
+      updateLegendRoleFiltersUI,
+      legendClickHandler,
+      activeRoleFilters,
+      hiddenProtocols,
+      legendRoleButtons,
+      legendProtocolButtons,
+      updateTitleCount,
+      updateLegendProtocolCounts,
+      updateFooterStats,
+      restartAutoRefresh,
+      /** Inject mock count span elements for legend protocol count tests. */
+      _setProtocolCountElements(mc, mt) {
+        meshcoreCountEl = mc;
+        meshtasticCountEl = mt;
+      },
+    },
+  };
 }

@@ -228,13 +228,14 @@ def mesh_module(monkeypatch):
 
 
 def test_instance_domain_prefers_primary_env(mesh_module, monkeypatch):
-    """Ensure the ingestor prefers ``INSTANCE_DOMAIN`` over the legacy variable."""
+    """Ensure the ingestor reads ``INSTANCE_DOMAIN``."""
 
     monkeypatch.setenv("INSTANCE_DOMAIN", "https://new.example")
-    monkeypatch.setenv("POTATOMESH_INSTANCE", "https://legacy.example")
 
     try:
+        refreshed_instances = mesh_module.config._resolve_instance_domains()
         refreshed_instance = mesh_module.config._resolve_instance_domain()
+        mesh_module.config.INSTANCES = refreshed_instances
         mesh_module.config.INSTANCE = refreshed_instance
         mesh_module.INSTANCE = refreshed_instance
 
@@ -242,26 +243,7 @@ def test_instance_domain_prefers_primary_env(mesh_module, monkeypatch):
         assert mesh_module.INSTANCE == "https://new.example"
     finally:
         monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
-        mesh_module.config.INSTANCE = mesh_module.config._resolve_instance_domain()
-        mesh_module.INSTANCE = mesh_module.config.INSTANCE
-
-
-def test_instance_domain_falls_back_to_legacy(mesh_module, monkeypatch):
-    """Verify ``POTATOMESH_INSTANCE`` is used when ``INSTANCE_DOMAIN`` is unset."""
-
-    monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
-    monkeypatch.setenv("POTATOMESH_INSTANCE", "https://legacy-only.example")
-
-    try:
-        refreshed_instance = mesh_module.config._resolve_instance_domain()
-        mesh_module.config.INSTANCE = refreshed_instance
-        mesh_module.INSTANCE = refreshed_instance
-
-        assert refreshed_instance == "https://legacy-only.example"
-        assert mesh_module.INSTANCE == "https://legacy-only.example"
-    finally:
-        monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
+        mesh_module.config.INSTANCES = mesh_module.config._resolve_instance_domains()
         mesh_module.config.INSTANCE = mesh_module.config._resolve_instance_domain()
         mesh_module.INSTANCE = mesh_module.config.INSTANCE
 
@@ -270,10 +252,11 @@ def test_instance_domain_infers_scheme_for_hostnames(mesh_module, monkeypatch):
     """Ensure bare hostnames are promoted to HTTPS URLs for ingestion."""
 
     monkeypatch.setenv("INSTANCE_DOMAIN", "mesh.example.org")
-    monkeypatch.delenv("POTATOMESH_INSTANCE", raising=False)
 
     try:
+        refreshed_instances = mesh_module.config._resolve_instance_domains()
         refreshed_instance = mesh_module.config._resolve_instance_domain()
+        mesh_module.config.INSTANCES = refreshed_instances
         mesh_module.config.INSTANCE = refreshed_instance
         mesh_module.INSTANCE = refreshed_instance
 
@@ -281,6 +264,7 @@ def test_instance_domain_infers_scheme_for_hostnames(mesh_module, monkeypatch):
         assert mesh_module.INSTANCE == "https://mesh.example.org"
     finally:
         monkeypatch.delenv("INSTANCE_DOMAIN", raising=False)
+        mesh_module.config.INSTANCES = mesh_module.config._resolve_instance_domains()
         mesh_module.config.INSTANCE = mesh_module.config._resolve_instance_domain()
         mesh_module.INSTANCE = mesh_module.config.INSTANCE
 
@@ -1637,7 +1621,7 @@ def test_main_retries_interface_creation(mesh_module, monkeypatch):
             raise RuntimeError("boom")
         return iface, port
 
-    monkeypatch.setattr(mesh, "PORT", "/dev/ttyTEST")
+    monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh.threading, "Event", DummyEvent)
     monkeypatch.setattr(mesh.signal, "signal", lambda *_, **__: None)
@@ -1709,7 +1693,7 @@ def test_main_reconnects_when_connection_event_clears(mesh_module, monkeypatch):
             self._flag = True
             return True
 
-    monkeypatch.setattr(mesh, "PORT", "/dev/ttyTEST")
+    monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh.threading, "Event", DummyStopEvent)
     monkeypatch.setattr(mesh.signal, "signal", lambda *_, **__: None)
@@ -1773,7 +1757,7 @@ def test_main_recreates_interface_after_snapshot_error(mesh_module, monkeypatch)
     def record_upsert(node_id, node):
         upsert_calls.append(node_id)
 
-    monkeypatch.setattr(mesh, "PORT", "/dev/ttyTEST")
+    monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh, "upsert_node", record_upsert)
     monkeypatch.setattr(mesh.threading, "Event", DummyEvent)
@@ -1795,7 +1779,7 @@ def test_main_exits_when_defaults_unavailable(mesh_module, monkeypatch):
     def fail_default():
         raise mesh.NoAvailableMeshInterface("no interface available")
 
-    monkeypatch.setattr(mesh, "PORT", None)
+    monkeypatch.setattr(mesh, "CONNECTION", None)
     monkeypatch.setattr(mesh, "_create_default_interface", fail_default)
     monkeypatch.setattr(mesh.signal, "signal", lambda *_, **__: None)
 
@@ -2134,7 +2118,7 @@ def test_store_packet_dict_skips_hidden_channel(mesh_module, monkeypatch, capsys
         lambda path, payload, *, priority: captured.append((path, payload, priority)),
     )
     monkeypatch.setattr(
-        mesh.handlers,
+        mesh.handlers.ignored,
         "_record_ignored_packet",
         lambda packet, *, reason: ignored.append(reason),
     )
@@ -2204,7 +2188,7 @@ def test_store_packet_dict_skips_disallowed_channel(mesh_module, monkeypatch, ca
         lambda path, payload, *, priority: captured.append((path, payload, priority)),
     )
     monkeypatch.setattr(
-        mesh.handlers,
+        mesh.handlers.ignored,
         "_record_ignored_packet",
         lambda packet, *, reason: ignored.append(reason),
     )
@@ -2342,6 +2326,7 @@ def test_store_packet_dict_handles_telemetry_packet(mesh_module, monkeypatch):
     assert payload["lora_freq"] == 868
     assert payload["modem_preset"] == "MediumFast"
     assert payload["ingestor"] == "!f00dbabe"
+    assert payload["telemetry_type"] == "device"
 
 
 def test_store_packet_dict_handles_environment_telemetry(mesh_module, monkeypatch):
@@ -2421,6 +2406,144 @@ def test_store_packet_dict_handles_environment_telemetry(mesh_module, monkeypatc
     assert payload["soil_temperature"] == pytest.approx(18.9)
     assert payload["lora_freq"] == 868
     assert payload["modem_preset"] == "MediumFast"
+    assert payload["telemetry_type"] == "environment"
+
+
+def test_store_packet_dict_handles_power_telemetry(mesh_module, monkeypatch):
+    """Power-metrics packets are tagged telemetry_type='power'."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    packet = {
+        "id": 3_000_000_001,
+        "rxTime": 1_758_030_000,
+        "fromId": "!aabbccdd",
+        "toId": "^all",
+        "decoded": {
+            "portnum": "TELEMETRY_APP",
+            "telemetry": {
+                "time": 1_758_030_000,
+                "powerMetrics": {
+                    "ch1Voltage": 5.02,
+                    "ch1Current": 0.48,
+                },
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured
+    _, payload, _ = captured[0]
+    assert payload["telemetry_type"] == "power"
+
+
+def test_store_packet_dict_handles_air_quality_telemetry(mesh_module, monkeypatch):
+    """Air-quality-metrics packets are tagged telemetry_type='air_quality'."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    packet = {
+        "id": 3_000_000_003,
+        "rxTime": 1_758_032_000,
+        "fromId": "!aabbccdd",
+        "toId": "^all",
+        "decoded": {
+            "portnum": "TELEMETRY_APP",
+            "telemetry": {
+                "time": 1_758_032_000,
+                "airQualityMetrics": {
+                    "pm10Standard": 4,
+                    "pm25Standard": 8,
+                    "iaq": 65,
+                },
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured
+    _, payload, _ = captured[0]
+    assert payload["telemetry_type"] == "air_quality"
+
+
+def test_store_packet_dict_telemetry_type_absent_for_unknown_subtype(
+    mesh_module, monkeypatch
+):
+    """Packets with no recognised sub-object do not include telemetry_type in the payload."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    packet = {
+        "id": 3_000_000_002,
+        "rxTime": 1_758_031_000,
+        "fromId": "!aabbccdd",
+        "toId": "^all",
+        "decoded": {
+            "portnum": "TELEMETRY_APP",
+            "telemetry": {
+                "time": 1_758_031_000,
+                "someUnknownMetrics": {"foo": 1},
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured
+    _, payload, _ = captured[0]
+    assert "telemetry_type" not in payload
+
+
+def test_store_packet_dict_invalid_telemetry_type_is_dropped(mesh_module, monkeypatch):
+    """A telemetry_type value that isn't in _VALID_TELEMETRY_TYPES is omitted from the payload."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+
+    # Inject a bad type by monkey-patching the validator constant so we can
+    # verify the drop path without needing a real packet with an impossible type.
+    monkeypatch.setattr(mesh.handlers.telemetry, "_VALID_TELEMETRY_TYPES", frozenset())
+
+    packet = {
+        "id": 3_000_000_010,
+        "rxTime": 1_758_040_000,
+        "fromId": "!aabbccdd",
+        "toId": "^all",
+        "decoded": {
+            "portnum": "TELEMETRY_APP",
+            "telemetry": {
+                "time": 1_758_040_000,
+                "deviceMetrics": {"batteryLevel": 80},
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured
+    _, payload, _ = captured[0]
+    assert "telemetry_type" not in payload
 
 
 def test_store_packet_dict_throttles_host_telemetry(mesh_module, monkeypatch):
@@ -2579,7 +2702,8 @@ def test_traceroute_packet_without_identifiers_is_ignored(mesh_module, monkeypat
     assert captured == []
 
 
-def test_post_queue_prioritises_messages(mesh_module, monkeypatch):
+def test_post_queue_prioritises_nodes_over_messages(mesh_module, monkeypatch):
+    """Nodes (priority 20) must be processed before messages (priority 30)."""
     mesh = mesh_module
     mesh._clear_post_queue()
     calls = []
@@ -2596,7 +2720,7 @@ def test_post_queue_prioritises_messages(mesh_module, monkeypatch):
 
     mesh._drain_post_queue()
 
-    assert [path for path, _ in calls] == ["/api/messages", "/api/nodes"]
+    assert [path for path, _ in calls] == ["/api/nodes", "/api/messages"]
 
 
 def test_drain_post_queue_handles_enqueued_items_during_send(mesh_module):
@@ -2884,7 +3008,7 @@ def test_default_serial_targets_deduplicates(mesh_module, monkeypatch):
             return ["/dev/ttyACM1"]
         return []
 
-    monkeypatch.setattr(mesh.interfaces.glob, "glob", fake_glob)
+    monkeypatch.setattr(mesh.connection.glob, "glob", fake_glob)
 
     targets = mesh._default_serial_targets()
 
@@ -3059,7 +3183,30 @@ def test_queue_ingestor_heartbeat_enqueues_and_throttles(mesh_module, monkeypatc
     assert payload["version"] == mesh.VERSION
     assert payload["lora_freq"] == 915
     assert payload["modem_preset"] == "LongFast"
+    assert payload["protocol"] == "meshtastic"
     assert priority == mesh.queue._INGESTOR_POST_PRIORITY
+
+
+def test_queue_ingestor_heartbeat_protocol_meshcore(mesh_module, monkeypatch):
+    """Heartbeat payload must carry the configured PROTOCOL as its protocol."""
+    mesh = mesh_module
+    captured = []
+
+    monkeypatch.setattr(
+        mesh.queue,
+        "_queue_post_json",
+        lambda path, payload, *, priority, send=None: captured.append(payload),
+    )
+
+    mesh.ingestors.STATE.last_heartbeat = None
+    mesh.ingestors.STATE.node_id = None
+    mesh.config.PROTOCOL = "meshcore"
+
+    mesh.ingestors.set_ingestor_node_id("!aabbccdd")
+    mesh.ingestors.queue_ingestor_heartbeat(force=True)
+
+    assert len(captured) == 1, "expected exactly one heartbeat payload"
+    assert captured[0]["protocol"] == "meshcore"
 
 
 def test_mesh_version_export_matches_package(mesh_module):
@@ -3116,8 +3263,8 @@ def test_store_packet_dict_records_ignored_packets(mesh_module, monkeypatch, tmp
 
     monkeypatch.setattr(mesh, "DEBUG", True)
     ignored_path = tmp_path / "ignored.txt"
-    monkeypatch.setattr(mesh.handlers, "_IGNORED_PACKET_LOG_PATH", ignored_path)
-    monkeypatch.setattr(mesh.handlers, "_IGNORED_PACKET_LOCK", threading.Lock())
+    monkeypatch.setattr(mesh.handlers.ignored, "_IGNORED_PACKET_LOG_PATH", ignored_path)
+    monkeypatch.setattr(mesh.handlers.ignored, "_IGNORED_PACKET_LOCK", threading.Lock())
 
     packet = {"decoded": {"portnum": "UNKNOWN"}}
     mesh.store_packet_dict(packet)
@@ -3469,3 +3616,118 @@ def test_on_receive_skips_seen_packets(mesh_module):
     mesh.on_receive(packet, interface=None)
 
     assert packet["_potatomesh_seen"] is True
+
+
+def test_upsert_node_includes_ingestor_key(mesh_module, monkeypatch):
+    """upsert_node must attach the host node ID so /api/nodes can resolve protocol."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+    mesh.register_host_node_id("!aabbccdd")
+
+    mesh.upsert_node("!deadbeef", {"user": {"shortName": "X"}})
+
+    assert captured
+    _, payload, _ = captured[0]
+    assert payload.get("ingestor") == "!aabbccdd"
+
+
+def test_store_packet_dict_nodeinfo_includes_ingestor_key(mesh_module, monkeypatch):
+    """store_nodeinfo_packet must include the ingestor key in the /api/nodes payload."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+    mesh.register_host_node_id("!11223344")
+
+    packet = {
+        "id": 1,
+        "rxTime": 1_700_000_000,
+        "fromId": "!aabbccdd",
+        "decoded": {
+            "portnum": "NODEINFO_APP",
+            "user": {"id": "!aabbccdd", "shortName": "N"},
+        },
+    }
+    mesh.store_packet_dict(packet)
+
+    node_calls = [(p, pl) for p, pl, _ in captured if p == "/api/nodes"]
+    assert node_calls, "Expected a /api/nodes POST"
+    _, payload = node_calls[0]
+    assert payload.get("ingestor") == "!11223344"
+
+
+def test_store_packet_dict_router_heartbeat(mesh_module, monkeypatch):
+    """STORE_FORWARD_APP ROUTER_HEARTBEAT upserts the node at low priority."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda path, payload, *, priority: captured.append((path, payload, priority)),
+    )
+    mesh.register_host_node_id("!f00dbabe")
+
+    packet = {
+        "id": 2377284085,
+        "rxTime": 1_774_868_197,
+        "fromId": "!435a7fbc",
+        "toId": "^all",
+        "hopLimit": "2",
+        "rxSnr": "-12.25",
+        "rxRssi": "-110",
+        "decoded": {
+            "portnum": "STORE_FORWARD_APP",
+            "storeforward": {
+                "heartbeat": {"period": "900"},
+                "rr": "ROUTER_HEARTBEAT",
+            },
+        },
+    }
+
+    mesh.store_packet_dict(packet)
+
+    assert captured, "Expected a POST for router heartbeat"
+    path, payload, priority = captured[0]
+    assert path == "/api/nodes"
+    assert priority == mesh._DEFAULT_POST_PRIORITY
+    assert "!435a7fbc" in payload
+    node_entry = payload["!435a7fbc"]
+    assert node_entry["lastHeard"] == 1_774_868_197
+    assert payload.get("ingestor") == "!f00dbabe"
+    assert set(node_entry.keys()) == {
+        "lastHeard"
+    }, "Heartbeat must only set lastHeard, nothing else"
+
+
+def test_store_packet_dict_store_forward_non_heartbeat_ignored(
+    mesh_module, monkeypatch
+):
+    """STORE_FORWARD_APP packets that are not ROUTER_HEARTBEAT are dropped."""
+    mesh = mesh_module
+    captured = []
+    monkeypatch.setattr(
+        mesh,
+        "_queue_post_json",
+        lambda *a, **kw: captured.append(a),
+    )
+
+    packet = {
+        "id": 1,
+        "rxTime": 1_700_000_000,
+        "fromId": "!aabbccdd",
+        "decoded": {
+            "portnum": "STORE_FORWARD_APP",
+            "storeforward": {"rr": "ROUTER_CLIENT_RESPONSE"},
+        },
+    }
+    mesh.store_packet_dict(packet)
+
+    assert not captured, "Non-heartbeat STORE_FORWARD_APP must not be queued"

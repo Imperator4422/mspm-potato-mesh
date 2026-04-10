@@ -83,8 +83,15 @@ function resolveSnapshotList(entry) {
  * }} params Aggregation inputs.
  * @returns {{
  *   logEntries: Array<{ ts: number, type: string, nodeId?: string, nodeNum?: number }>,
- *   channels: Array<{ id: string, index: number, label: string, entries: Array<{ ts: number, message: Object }> }>
- * }} Sorted tab model data.
+ *   channels: Array<{
+ *     id: string,
+ *     index: number,
+ *     label: string,
+ *     messageCount: number,
+ *     entries: Array<{ ts: number, message: Object }>
+ *   }>
+ * }} Tab model data. Channels are sorted by {@code messageCount} descending (7-day activity),
+ *   with alphabetical label ordering as a tiebreaker.
  */
 export function buildChatTabModel({
   nodes = [],
@@ -259,7 +266,11 @@ export function buildChatTabModel({
         label: labelInfo.label,
         entries: [],
         labelPriority: labelInfo.priority,
-        isPrimaryFallback: bucketKey === '0'
+        isPrimaryFallback: bucketKey === '0',
+        // Protocol is captured from the first message that creates the bucket.
+        // In practice all messages in a bucket share the same ingestor/protocol,
+        // so subsequent messages don't update this field.
+        protocol: message.protocol ?? null
       };
       channelBuckets.set(bucketKey, bucket);
     } else {
@@ -295,15 +306,22 @@ export function buildChatTabModel({
 
   logEntries.sort((a, b) => a.ts - b.ts);
 
-  const channels = Array.from(channelBuckets.values()).sort((a, b) => {
-    if (a.index !== b.index) {
-      return a.index - b.index;
-    }
-    return a.label.localeCompare(b.label);
-  });
-  for (const channel of channels) {
+  // Sort entries chronologically and record the 7-day message count before sorting channels.
+  for (const channel of channelBuckets.values()) {
     channel.entries.sort((a, b) => a.ts - b.ts);
+    channel.messageCount = channel.entries.length;
   }
+  // Sort channels into two tiers:
+  //   1. Primary channels (channel index 0 — LongFast, MediumFast, Public, etc.)
+  //      ordered by activity desc so the most-active protocol leads within the tier.
+  //   2. Secondary channels (index > 0) ordered by activity desc, then alpha.
+  // Within each tier, ties on messageCount are broken alphabetically by label.
+  const channels = Array.from(channelBuckets.values()).sort((a, b) => {
+    const aTier = a.index === 0 ? 0 : 1;
+    const bTier = b.index === 0 ? 0 : 1;
+    if (aTier !== bTier) return aTier - bTier;
+    return b.messageCount - a.messageCount || a.label.localeCompare(b.label);
+  });
 
   return { logEntries, channels };
 }

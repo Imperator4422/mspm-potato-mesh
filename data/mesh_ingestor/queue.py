@@ -73,13 +73,14 @@ def _payload_key_value_pairs(payload: Mapping[str, object]) -> str:
     return " ".join(pairs)
 
 
-_MESSAGE_POST_PRIORITY = 10
-_INGESTOR_POST_PRIORITY = 80
-_NEIGHBOR_POST_PRIORITY = 20
-_TRACE_POST_PRIORITY = 25
-_POSITION_POST_PRIORITY = 30
-_TELEMETRY_POST_PRIORITY = 40
-_NODE_POST_PRIORITY = 50
+_INGESTOR_POST_PRIORITY = 0
+_CHANNEL_POST_PRIORITY = 10
+_NODE_POST_PRIORITY = 20
+_MESSAGE_POST_PRIORITY = 30
+_NEIGHBOR_POST_PRIORITY = 40
+_TRACE_POST_PRIORITY = 50
+_POSITION_POST_PRIORITY = 60
+_TELEMETRY_POST_PRIORITY = 70
 _DEFAULT_POST_PRIORITY = 90
 
 
@@ -96,29 +97,24 @@ class QueueState:
 STATE = QueueState()
 
 
-def _post_json(
+def _send_single(
+    instance: str,
+    api_token: str,
     path: str,
     payload: dict,
-    *,
-    instance: str | None = None,
-    api_token: str | None = None,
 ) -> None:
-    """Send a JSON payload to the configured web API.
+    """Transmit a single JSON payload to one instance.
 
     Parameters:
-        path: API path relative to the configured instance root.
+        instance: Base URL of the target instance.
+        api_token: Bearer token for this instance (may be empty).
+        path: API path relative to the instance root.
         payload: JSON-serialisable body to transmit.
-        instance: Optional override for :data:`config.INSTANCE`.
-        api_token: Optional override for :data:`config.API_TOKEN`.
     """
-
-    if instance is None:
-        instance = config.INSTANCE
-    if api_token is None:
-        api_token = config.API_TOKEN
 
     if not instance:
         return
+
     url = f"{instance}{path}"
     data = json.dumps(payload).encode("utf-8")
 
@@ -154,6 +150,49 @@ def _post_json(
         )
 
 
+def _post_json(
+    path: str,
+    payload: dict,
+    *,
+    instance: str | None = None,
+    api_token: str | None = None,
+) -> None:
+    """Send a JSON payload to one or more configured web API instances.
+
+    When ``instance`` is provided explicitly the payload is sent to that
+    single target.  Otherwise every ``(url, token)`` pair in
+    :data:`config.INSTANCES` receives the payload independently so that
+    one failure does not block delivery to the remaining targets.
+
+    Parameters:
+        path: API path relative to the instance root.
+        payload: JSON-serialisable body to transmit.
+        instance: Optional single-instance override.
+        api_token: Optional token override (only used with ``instance``).
+    """
+
+    if instance is not None:
+        if not instance:
+            return
+        _send_single(instance, api_token or "", path, payload)
+        return
+
+    targets: tuple[tuple[str, str], ...] = config.INSTANCES
+    if not targets:
+        # Backward-compatible fallback for callers that only set
+        # config.INSTANCE / config.API_TOKEN directly.
+        inst = config.INSTANCE
+        if not inst:
+            return
+        _send_single(inst, api_token or config.API_TOKEN, path, payload)
+        return
+
+    for inst, token in targets:
+        if not inst:
+            continue
+        _send_single(inst, token, path, payload)
+
+
 def _enqueue_post_json(
     path: str,
     payload: dict,
@@ -172,6 +211,10 @@ def _enqueue_post_json(
 
     with state.lock:
         counter = next(state.counter)
+        # Heap tuple: (priority, counter, path, payload).  Lower priority
+        # values are dequeued first (min-heap semantics).  The monotonically
+        # increasing counter breaks ties so equal-priority items are processed
+        # in FIFO order without comparing the non-orderable payload dict.
         heapq.heappush(state.queue, (priority, counter, path, payload))
 
 
@@ -258,9 +301,10 @@ def _clear_post_queue(state: QueueState = STATE) -> None:
 __all__ = [
     "STATE",
     "QueueState",
+    "_CHANNEL_POST_PRIORITY",
     "_DEFAULT_POST_PRIORITY",
-    "_MESSAGE_POST_PRIORITY",
     "_INGESTOR_POST_PRIORITY",
+    "_MESSAGE_POST_PRIORITY",
     "_NEIGHBOR_POST_PRIORITY",
     "_NODE_POST_PRIORITY",
     "_POSITION_POST_PRIORITY",

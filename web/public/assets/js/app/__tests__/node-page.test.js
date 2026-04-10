@@ -47,6 +47,7 @@ const {
   categoriseNeighbors,
   renderNeighborGroups,
   renderSingleNodeTable,
+  classifySnapshot,
   renderTelemetryCharts,
   renderMessages,
   renderTraceroutes,
@@ -59,6 +60,31 @@ const {
   fetchMessages,
   fetchTracesForNode,
 } = __testUtils;
+
+/**
+ * Builds a node fixture whose telemetry comes from the aggregated API path
+ * (node.rawSources.telemetry.snapshots). typeFilter is skipped for this path
+ * so all series data is visible regardless of telemetry_type.
+ * @param {object[]} snapshots
+ */
+// Shared time anchor used by most chart tests.  One fixed value lets Sonar
+// identify the setup as a constant rather than repeated literal.
+const CHART_NOW_MS = Date.UTC(2025, 0, 8, 12, 0, 0);
+const CHART_NOW_SECONDS = Math.floor(CHART_NOW_MS / 1000);
+
+function makeAggregatedNode(snapshots) {
+  return { rawSources: { telemetry: { snapshots } } };
+}
+
+/**
+ * Builds a node fixture whose telemetry comes from the per-packet history path
+ * (node.rawSources.telemetrySnapshots). typeFilter IS applied for this path,
+ * so device/power/environment rows are separated by chart.
+ * @param {object[]} snapshots
+ */
+function makeHistoryNode(snapshots) {
+  return { rawSources: { telemetrySnapshots: snapshots } };
+}
 
 test('format helpers normalise values as expected', () => {
   assert.equal(stringOrNull('  foo  '), 'foo');
@@ -334,7 +360,8 @@ test('renderSingleNodeTable renders a condensed table for the node', () => {
     10_000,
   );
   assert.equal(html.includes('<table'), true);
-  assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">Example Node<\/a>/);
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in long name link');
+  assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">.*Example Node<\/a>/s);
   assert.equal(html.includes('66.0%'), true);
   assert.equal(html.includes('1.230%'), true);
   assert.equal(html.includes('52.52000'), true);
@@ -343,59 +370,35 @@ test('renderSingleNodeTable renders a condensed table for the node', () => {
 });
 
 test('renderTelemetryCharts renders condensed scatter charts when telemetry exists', () => {
-  const nowMs = Date.UTC(2025, 0, 8, 12, 0, 0);
-  const nowSeconds = Math.floor(nowMs / 1000);
-  const node = {
-    rawSources: {
-      telemetry: {
-        snapshots: [
-          {
-            rx_time: nowSeconds - 60,
-            device_metrics: {
-              battery_level: 80,
-              voltage: 4.1,
-              channel_utilization: 40,
-              air_util_tx: 22,
-              current: 0.75,
-            },
-            environment_metrics: {
-              temperature: 19.5,
-              relative_humidity: 55,
-              barometric_pressure: 995,
-              gas_resistance: 1500,
-              iaq: 83,
-            },
-          },
-          {
-            rx_time: nowSeconds - 3_600,
-            deviceMetrics: {
-              batteryLevel: 78,
-              voltage: 4.05,
-              channelUtilization: 35,
-              airUtilTx: 20,
-              current: 0.65,
-            },
-            environmentMetrics: {
-              temperature: 18.4,
-              relativeHumidity: 52,
-              barometricPressure: 1000,
-              gasResistance: 2000,
-              iaq: 88,
-            },
-          },
-        ],
-      },
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  const node = makeAggregatedNode([
+    {
+      rx_time: nowSeconds - 60,
+      telemetry_type: 'device',
+      battery_level: 80,
+      voltage: 4.1,
+      channel_utilization: 40,
+      air_util_tx: 22,
     },
-  };
+    {
+      rx_time: nowSeconds - 3_600,
+      telemetry_type: 'environment',
+      temperature: 18.4,
+      relative_humidity: 52,
+      barometric_pressure: 1000,
+      gas_resistance: 2000,
+      iaq: 88,
+    },
+  ]);
   const html = renderTelemetryCharts(node, { nowMs });
   const fmt = new Date(nowMs);
   const expectedDate = String(fmt.getDate()).padStart(2, '0');
   assert.equal(html.includes('node-detail__charts'), true);
-  assert.equal(html.includes('Power metrics'), true);
+  assert.equal(html.includes('Device health'), true);
   assert.equal(html.includes('Environmental telemetry'), true);
   assert.equal(html.includes('Battery (%)'), true);
   assert.equal(html.includes('Voltage (V)'), true);
-  assert.equal(html.includes('Current (A)'), true);
   assert.equal(html.includes('Channel utilization (%)'), true);
   assert.equal(html.includes('Air util TX (%)'), true);
   assert.equal(html.includes('Utilization (%)'), true);
@@ -408,74 +411,165 @@ test('renderTelemetryCharts renders condensed scatter charts when telemetry exis
 });
 
 test('renderTelemetryCharts expands upper bounds when overflow metrics exceed defaults', () => {
-  const nowMs = Date.UTC(2025, 0, 8, 12, 0, 0);
-  const nowSeconds = Math.floor(nowMs / 1000);
-  const node = {
-    rawSources: {
-      telemetry: {
-        snapshots: [
-          {
-            rx_time: nowSeconds - 120,
-            device_metrics: {
-              battery_level: 90,
-              voltage: 7.2,
-              current: 3.6,
-              channel_utilization: 45,
-              air_util_tx: 18,
-            },
-            environment_metrics: {
-              temperature: 45,
-              relative_humidity: 48,
-              barometric_pressure: 1250,
-              gas_resistance: 1200,
-              iaq: 650,
-            },
-          },
-        ],
-      },
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  const node = makeAggregatedNode([
+    {
+      rx_time: nowSeconds - 120,
+      telemetry_type: 'device',
+      battery_level: 90,
+      voltage: 7.2,
+      channel_utilization: 45,
+      air_util_tx: 18,
     },
-  };
+    {
+      rx_time: nowSeconds - 180,
+      telemetry_type: 'environment',
+      temperature: 45,
+      relative_humidity: 48,
+      barometric_pressure: 1250,
+      gas_resistance: 1200,
+      iaq: 650,
+    },
+  ]);
   const html = renderTelemetryCharts(node, { nowMs });
   assert.match(html, />7\.2<\/text>/);
-  assert.match(html, />3\.6<\/text>/);
   assert.match(html, />45<\/text>/);
   assert.match(html, />650<\/text>/);
   assert.match(html, />1100<\/text>/);
 });
 
 test('renderTelemetryCharts keeps default bounds when metrics stay within limits', () => {
-  const nowMs = Date.UTC(2025, 0, 8, 12, 0, 0);
-  const nowSeconds = Math.floor(nowMs / 1000);
-  const node = {
-    rawSources: {
-      telemetry: {
-        snapshots: [
-          {
-            rx_time: nowSeconds - 180,
-            device_metrics: {
-              battery_level: 70,
-              voltage: 4.5,
-              current: 1.5,
-              channel_utilization: 35,
-              air_util_tx: 15,
-            },
-            environment_metrics: {
-              temperature: 25,
-              relative_humidity: 50,
-              barometric_pressure: 1015,
-              gas_resistance: 1500,
-              iaq: 200,
-            },
-          },
-        ],
-      },
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  const node = makeAggregatedNode([
+    {
+      rx_time: nowSeconds - 180,
+      telemetry_type: 'device',
+      battery_level: 70,
+      voltage: 4.5,
+      channel_utilization: 35,
+      air_util_tx: 15,
     },
-  };
+    {
+      rx_time: nowSeconds - 240,
+      telemetry_type: 'environment',
+      temperature: 25,
+      relative_humidity: 50,
+      barometric_pressure: 1015,
+      gas_resistance: 1500,
+      iaq: 200,
+    },
+  ]);
   const html = renderTelemetryCharts(node, { nowMs });
   assert.match(html, />6\.0<\/text>/);
-  assert.match(html, />3\.0<\/text>/);
   assert.match(html, />40<\/text>/);
   assert.match(html, />500<\/text>/);
+});
+
+test('classifySnapshot returns stored telemetry_type when present', () => {
+  assert.equal(classifySnapshot({ telemetry_type: 'device' }), 'device');
+  assert.equal(classifySnapshot({ telemetry_type: 'environment' }), 'environment');
+  assert.equal(classifySnapshot({ telemetry_type: 'power' }), 'power');
+  assert.equal(classifySnapshot({ telemetry_type: 'air_quality' }), 'air_quality');
+});
+
+test('classifySnapshot falls back to field-presence heuristics for legacy rows', () => {
+  // Flat battery field → device
+  assert.equal(classifySnapshot({ battery_level: 80 }), 'device');
+  // channel_utilization → device
+  assert.equal(classifySnapshot({ channel_utilization: 40 }), 'device');
+  // Nested device_metrics shape → device
+  assert.equal(classifySnapshot({ device_metrics: { battery_level: 80 } }), 'device');
+  // Nested camelCase shape → device
+  assert.equal(classifySnapshot({ deviceMetrics: { batteryLevel: 78 } }), 'device');
+  // Flat temperature → environment
+  assert.equal(classifySnapshot({ temperature: 21.5 }), 'environment');
+  // Nested environment_metrics → environment
+  assert.equal(classifySnapshot({ environment_metrics: { temperature: 20 } }), 'environment');
+  // voltage+current with no battery → power
+  assert.equal(classifySnapshot({ current: 0.5, voltage: 5.0 }), 'power');
+  // Empty or null → unknown
+  assert.equal(classifySnapshot({}), 'unknown');
+  assert.equal(classifySnapshot(null), 'unknown');
+  assert.equal(classifySnapshot(undefined), 'unknown');
+});
+
+test('renderTelemetryCharts shows device-health chart for device snapshots and power-sensor chart for power snapshots', () => {
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  const node = makeHistoryNode([
+    {
+      rx_time: nowSeconds - 60,
+      telemetry_type: 'device',
+      battery_level: 80,
+      voltage: 4.1,
+      channel_utilization: 40,
+    },
+    {
+      rx_time: nowSeconds - 120,
+      telemetry_type: 'power',
+      voltage: 5.0,
+      current: 0.5,
+    },
+  ]);
+  const html = renderTelemetryCharts(node, { nowMs });
+  assert.equal(html.includes('Device health'), true, 'Device health chart should render');
+  assert.equal(html.includes('Battery (%)'), true, 'Battery series label from device chart');
+  assert.equal(html.includes('Power sensor'), true, 'Power sensor chart should render');
+  assert.equal(html.includes('Current (A)'), true, 'Current series label from power chart');
+});
+
+test('renderTelemetryCharts backward compat: old rows without telemetry_type render via heuristics', () => {
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  const node = makeHistoryNode([
+    {
+      rx_time: nowSeconds - 60,
+      battery_level: 75,
+      voltage: 4.08,
+      channel_utilization: 30,
+    },
+  ]);
+  const html = renderTelemetryCharts(node, { nowMs });
+  assert.equal(html.includes('Device health'), true, 'Device health renders via battery_level heuristic');
+  assert.equal(html.includes('Battery (%)'), true, 'Battery series present');
+});
+
+test('renderTelemetryCharts power-sensor chart does not include device snapshots (per-packet history)', () => {
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  // Per-packet history path: typeFilter IS applied, so device rows are excluded from power-sensor chart
+  const node = makeHistoryNode([
+    {
+      rx_time: nowSeconds - 60,
+      telemetry_type: 'device',
+      battery_level: 80,
+      voltage: 4.1,
+    },
+  ]);
+  const html = renderTelemetryCharts(node, { nowMs });
+  assert.equal(html.includes('Device health'), true, 'Device health renders');
+  assert.equal(html.includes('Power sensor'), false, 'Power sensor should not render with only device snapshots');
+});
+
+test('renderTelemetryCharts aggregated mixed-bucket without telemetry_type shows all series', () => {
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  // Aggregated path: typeFilter is skipped; a bucket combining battery + temperature shows both charts
+  const node = makeAggregatedNode([
+    {
+      rx_time: nowSeconds - 60,
+      battery_level: 80,
+      voltage: 4.1,
+      channel_utilization: 30,
+      temperature: 21.5,
+      relative_humidity: 55,
+    },
+  ]);
+  const html = renderTelemetryCharts(node, { nowMs });
+  assert.equal(html.includes('Device health'), true, 'Device health renders from battery field');
+  assert.equal(html.includes('Environmental telemetry'), true, 'Environment renders from temperature field');
 });
 
 test('renderNodeDetailHtml composes the table, neighbors, and messages', () => {
@@ -510,7 +604,8 @@ test('renderNodeDetailHtml composes the table, neighbors, and messages', () => {
   assert.equal(html.includes('Heard by'), true);
   assert.equal(html.includes('We hear'), true);
   assert.equal(html.includes('Messages'), true);
-  assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">Example Node<\/a>/);
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in heading and table');
+  assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">.*Example Node<\/a>/s);
   assert.equal(html.includes('PEER'), true);
   assert.equal(html.includes('ALLY'), true);
   assert.equal(html.includes('Traceroutes'), true);
@@ -527,21 +622,23 @@ test('renderNodeDetailHtml embeds telemetry charts when snapshots are present', 
     role: 'CLIENT',
     rawSources: {
       node: { node_id: '!abcd', role: 'CLIENT', short_name: 'NODE' },
-      telemetry: {
-        snapshots: [
-          {
-            rx_time: Math.floor(nowMs / 1000) - 120,
-            battery_level: 75,
-            voltage: 4.08,
-            channel_utilization: 30,
-            current: 0.42,
-            temperature: 20,
-            relative_humidity: 45,
-            barometric_pressure: 990,
-            gas_resistance: 1800,
-          },
-        ],
-      },
+      ...makeAggregatedNode([
+        {
+          rx_time: Math.floor(nowMs / 1000) - 120,
+          telemetry_type: 'device',
+          battery_level: 75,
+          voltage: 4.08,
+          channel_utilization: 30,
+        },
+        {
+          rx_time: Math.floor(nowMs / 1000) - 180,
+          telemetry_type: 'environment',
+          temperature: 20,
+          relative_humidity: 45,
+          barometric_pressure: 990,
+          gas_resistance: 1800,
+        },
+      ]).rawSources,
     },
   };
   const html = renderNodeDetailHtml(node, {
@@ -549,8 +646,132 @@ test('renderNodeDetailHtml embeds telemetry charts when snapshots are present', 
     chartNowMs: nowMs,
   });
   assert.equal(html.includes('node-detail__charts'), true);
-  assert.equal(html.includes('Power metrics'), true);
+  assert.equal(html.includes('Device health'), true);
   assert.equal(html.includes('Air quality'), true);
+});
+
+// --- Protocol icon in renderSingleNodeTable ---
+
+test('renderSingleNodeTable shows meshtastic icon for meshtastic protocol in long name link', () => {
+  const node = {
+    shortName: 'A',
+    longName: 'Alice',
+    nodeId: '!aa',
+    role: 'CLIENT',
+    protocol: 'meshtastic',
+    rawSources: { node: { node_id: '!aa', role: 'CLIENT' } },
+  };
+  const html = renderSingleNodeTable(node, (short, role) => `<span data-role="${role}">${short}</span>`, 0);
+  assert.ok(html.includes('meshtastic.svg'), 'meshtastic protocol should show icon in long name link');
+});
+
+test('renderSingleNodeTable shows no protocol icon when protocol is absent in long name link', () => {
+  const node = {
+    shortName: 'A',
+    longName: 'Alice',
+    nodeId: '!aa',
+    role: 'CLIENT',
+    rawSources: { node: { node_id: '!aa', role: 'CLIENT' } },
+  };
+  const html = renderSingleNodeTable(node, (short, role) => `<span data-role="${role}">${short}</span>`, 0);
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in long name link');
+  assert.ok(!html.includes('meshcore.svg'), 'absent protocol should show no meshcore icon in long name link');
+});
+
+test('renderSingleNodeTable omits meshtastic icon for meshcore protocol in long name link', () => {
+  const node = {
+    shortName: 'M',
+    longName: 'MeshCore Node',
+    nodeId: '!mc',
+    role: 'REPEATER',
+    protocol: 'meshcore',
+    rawSources: { node: { node_id: '!mc', role: 'REPEATER' } },
+  };
+  const html = renderSingleNodeTable(node, (short, role) => `<span data-role="${role}">${short}</span>`, 0);
+  assert.ok(!html.includes('meshtastic.svg'), 'meshcore protocol should not show meshtastic icon in long name link');
+});
+
+// --- Protocol icon in renderNodeDetailHtml heading ---
+
+test('renderNodeDetailHtml shows meshtastic icon in heading for meshtastic protocol', () => {
+  const html = renderNodeDetailHtml(
+    { shortName: 'A', longName: 'Alice', nodeId: '!aa', role: 'CLIENT', protocol: 'meshtastic' },
+    { renderShortHtml: short => `<span>${short}</span>` },
+  );
+  assert.ok(html.includes('meshtastic.svg'), 'meshtastic protocol should show icon in heading');
+});
+
+test('renderNodeDetailHtml shows no protocol icon in heading when protocol is absent', () => {
+  const html = renderNodeDetailHtml(
+    { shortName: 'A', longName: 'Alice', nodeId: '!aa', role: 'CLIENT' },
+    { renderShortHtml: short => `<span>${short}</span>` },
+  );
+  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in heading');
+  assert.ok(!html.includes('meshcore.svg'), 'absent protocol should show no meshcore icon in heading');
+});
+
+test('renderNodeDetailHtml omits meshtastic icon in heading for meshcore protocol', () => {
+  const html = renderNodeDetailHtml(
+    { shortName: 'M', longName: 'MeshCore Node', nodeId: '!mc', role: 'REPEATER', protocol: 'meshcore' },
+    { renderShortHtml: short => `<span>${short}</span>` },
+  );
+  assert.ok(!html.includes('meshtastic.svg'), 'meshcore protocol should not show icon in heading');
+});
+
+// --- Protocol icon in renderMessages chat ---
+
+test('renderMessages prefixes meshtastic icon for meshtastic node protocol', () => {
+  const nodeContext = {
+    shortName: 'SRC',
+    longName: 'Source',
+    role: 'CLIENT',
+    nodeId: '!src',
+    nodeNum: 1,
+    rawSources: { node: { node_id: '!src', role: 'CLIENT', short_name: 'SRC' } },
+    protocol: 'meshtastic',
+  };
+  const html = renderMessages(
+    [{ text: 'hello', rx_time: 1_700_000_000, node: { short_name: 'SRC', role: 'CLIENT', protocol: 'meshtastic' } }],
+    (short, role) => `<span data-role="${role}">${short}</span>`,
+    nodeContext,
+  );
+  assert.ok(html.includes('meshtastic.svg'), 'meshtastic node chat entry should show icon');
+});
+
+test('renderMessages shows no protocol icon when node protocol is absent', () => {
+  const nodeContext = {
+    shortName: 'SRC',
+    longName: 'Source',
+    role: 'CLIENT',
+    nodeId: '!src',
+    nodeNum: 1,
+    rawSources: { node: { node_id: '!src', role: 'CLIENT', short_name: 'SRC' } },
+  };
+  const html = renderMessages(
+    [{ text: 'hello', rx_time: 1_700_000_000, node: { short_name: 'SRC', role: 'CLIENT' } }],
+    (short, role) => `<span data-role="${role}">${short}</span>`,
+    nodeContext,
+  );
+  assert.ok(!html.includes('meshtastic.svg'), 'absent node protocol chat entry should show no meshtastic icon');
+  assert.ok(!html.includes('meshcore.svg'), 'absent node protocol chat entry should show no meshcore icon');
+});
+
+test('renderMessages omits meshtastic icon for meshcore node protocol', () => {
+  const nodeContext = {
+    shortName: 'MC',
+    longName: 'MeshCore',
+    role: 'REPEATER',
+    nodeId: '!mc',
+    nodeNum: 2,
+    rawSources: { node: { node_id: '!mc', role: 'REPEATER', short_name: 'MC' } },
+    protocol: 'meshcore',
+  };
+  const html = renderMessages(
+    [{ text: 'test', rx_time: 1_700_000_000, node: { short_name: 'MC', role: 'REPEATER', protocol: 'meshcore' } }],
+    (short, role) => `<span data-role="${role}">${short}</span>`,
+    nodeContext,
+  );
+  assert.ok(!html.includes('meshtastic.svg'), 'meshcore node chat entry should not show meshtastic icon');
 });
 
 test('fetchNodeDetailHtml renders the node layout for overlays', async () => {
