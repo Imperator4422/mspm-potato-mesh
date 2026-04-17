@@ -63,7 +63,11 @@ module PotatoMesh
       def self_instance_attributes
         domain = self_instance_domain
         last_update = latest_node_update_timestamp || Time.now.to_i
-        nodes_count = active_node_count_since(Time.now.to_i - PotatoMesh::Config.remote_instance_max_node_age)
+        cutoff = Time.now.to_i - PotatoMesh::Config.remote_instance_max_node_age
+        db = open_database(readonly: true)
+        nodes_count = active_node_count_since(cutoff, db: db)
+        mc_count = active_node_count_since_for_protocol(cutoff, "meshcore", db: db)
+        mt_count = active_node_count_since_for_protocol(cutoff, "meshtastic", db: db)
         {
           id: app_constant(:SELF_INSTANCE_ID),
           domain: domain,
@@ -78,7 +82,11 @@ module PotatoMesh
           is_private: private_mode?,
           contact_link: sanitized_contact_link,
           nodes_count: nodes_count,
+          meshcore_nodes_count: mc_count,
+          meshtastic_nodes_count: mt_count,
         }
+      ensure
+        db&.close
       end
 
       # Count the number of nodes active since the supplied timestamp.
@@ -99,6 +107,39 @@ module PotatoMesh
         warn_log(
           "Failed to count active nodes",
           context: "instances.nodes_count",
+          error_class: e.class.name,
+          error_message: e.message,
+        )
+        nil
+      ensure
+        handle&.close unless db
+      end
+
+      # Count the number of nodes for a specific protocol active since the
+      # supplied timestamp.
+      #
+      # @param cutoff [Integer] unix timestamp in seconds.
+      # @param protocol [String] protocol name (e.g. "meshcore", "meshtastic").
+      # @param db [SQLite3::Database, nil] optional open handle to reuse.
+      # @return [Integer, nil] node count or nil when unavailable.
+      def active_node_count_since_for_protocol(cutoff, protocol, db: nil)
+        return nil unless cutoff && protocol
+
+        handle = db || open_database(readonly: true)
+        count =
+          with_busy_retry do
+            handle.get_first_value(
+              "SELECT COUNT(*) FROM nodes WHERE last_heard >= ? AND protocol = ?",
+              cutoff.to_i,
+              protocol,
+            )
+          end
+        Integer(count)
+      rescue SQLite3::Exception, ArgumentError => e
+        warn_log(
+          "Failed to count active nodes for protocol",
+          context: "instances.protocol_nodes_count",
+          protocol: protocol,
           error_class: e.class.name,
           error_message: e.message,
         )
@@ -128,6 +169,9 @@ module PotatoMesh
           "lastUpdateTime" => attributes[:last_update_time],
           "isPrivate" => attributes[:is_private],
           "contactLink" => attributes[:contact_link],
+          "nodesCount" => attributes[:nodes_count],
+          "meshcoreNodesCount" => attributes[:meshcore_nodes_count],
+          "meshtasticNodesCount" => attributes[:meshtastic_nodes_count],
           "signature" => signature,
         }
         payload.reject { |_, value| value.nil? }
@@ -380,6 +424,13 @@ module PotatoMesh
         db&.close
       end
 
+      # Announce the local instance record to a remote federation peer,
+      # cycling through resolved IP addresses when transport-level failures
+      # occur.
+      #
+      # @param domain [String] remote peer hostname.
+      # @param payload_json [String] JSON-encoded announcement body.
+      # @return [Boolean] true when the announcement was accepted.
       def announce_instance_to_domain(domain, payload_json)
         return false unless domain && !domain.empty?
         return false if federation_shutdown_requested?
@@ -390,14 +441,7 @@ module PotatoMesh
           break false if federation_shutdown_requested?
 
           begin
-            http = build_remote_http_client(uri)
-            response = Timeout.timeout(PotatoMesh::Config.remote_instance_request_timeout) do
-              http.start do |connection|
-                request = build_federation_http_request(Net::HTTP::Post, uri)
-                request.body = payload_json
-                connection.request(request)
-              end
-            end
+            response = perform_announce_request(uri, payload_json)
             if response.is_a?(Net::HTTPSuccess)
               debug_log(
                 "Published federation announcement",
@@ -451,6 +495,55 @@ module PotatoMesh
         published
       end
 
+      # Execute a POST announcement request against the supplied URI, cycling
+      # through resolved IP addresses on connection-level failures.
+      #
+      # @param uri [URI::Generic] target endpoint.
+      # @param payload_json [String] JSON-encoded announcement body.
+      # @return [Net::HTTPResponse] the HTTP response from the first reachable address.
+      # @raise [StandardError] when all addresses fail or a non-retryable error occurs.
+      def perform_announce_request(uri, payload_json)
+        remote_addresses = sort_addresses_for_connection(resolve_remote_ip_addresses(uri))
+        addresses = remote_addresses.empty? ? [nil] : remote_addresses
+
+        last_error = nil
+        addresses.each do |address|
+          break if federation_shutdown_requested?
+
+          begin
+            return perform_single_announce_request(uri, payload_json, ip_address: address&.to_s)
+          rescue StandardError => e
+            if connection_refused_or_unreachable?(e)
+              last_error = e
+            else
+              raise
+            end
+          end
+        end
+
+        raise(last_error || StandardError.new("all resolved addresses failed"))
+      end
+
+      # Execute a single POST announcement request, optionally pinning the
+      # connection to a specific IP address.
+      #
+      # @param uri [URI::Generic] target endpoint.
+      # @param payload_json [String] JSON-encoded announcement body.
+      # @param ip_address [String, nil] resolved IP address to pin the
+      #   connection to, or +nil+ to let {build_remote_http_client} resolve.
+      # @return [Net::HTTPResponse] the HTTP response.
+      # @raise [StandardError] when the request fails.
+      def perform_single_announce_request(uri, payload_json, ip_address: nil)
+        http = build_remote_http_client(uri, ip_address: ip_address)
+        Timeout.timeout(PotatoMesh::Config.remote_instance_request_timeout) do
+          http.start do |connection|
+            request = build_federation_http_request(Net::HTTP::Post, uri)
+            request.body = payload_json
+            connection.request(request)
+          end
+        end
+      end
+
       # Determine whether an HTTPS announcement failure should fall back to HTTP.
       #
       # @param error [StandardError] failure raised while attempting HTTPS.
@@ -459,6 +552,34 @@ module PotatoMesh
         current = error
         while current
           return true if current.is_a?(Errno::ECONNREFUSED)
+
+          current = current.respond_to?(:cause) ? current.cause : nil
+        end
+
+        false
+      end
+
+      # Determine whether an error indicates a transport-level connection
+      # failure that may succeed on an alternative resolved address.
+      #
+      # Connection refusals, host/network unreachable errors, and TCP open
+      # timeouts signal that the selected IP address cannot be reached but
+      # do not rule out alternative addresses for the same hostname.
+      #
+      # @param error [StandardError] failure raised during the connection attempt.
+      # @return [Boolean] true when a retry with a different address is warranted.
+      def connection_refused_or_unreachable?(error)
+        retryable_classes = [
+          Errno::ECONNREFUSED,
+          Errno::EHOSTUNREACH,
+          Errno::ENETUNREACH,
+          Errno::ECONNRESET,
+          Errno::ETIMEDOUT,
+          Net::OpenTimeout,
+        ]
+        current = error
+        while current
+          return true if retryable_classes.any? { |klass| current.is_a?(klass) }
 
           current = current.respond_to?(:cause) ? current.cause : nil
         end
@@ -664,10 +785,57 @@ module PotatoMesh
         []
       end
 
+      # Execute a GET request against the supplied federation URI, cycling
+      # through resolved IP addresses when a transport-level connection
+      # failure occurs.
+      #
+      # DNS resolution is performed once and the resulting addresses are
+      # sorted with IPv4 first via {sort_addresses_for_connection}.  Each
+      # address is attempted sequentially; when a connection-level error
+      # (refused, unreachable, timeout) is raised the next address is tried.
+      # Non-connection errors (SSL failures, HTTP-level errors) are raised
+      # immediately without trying further addresses.
+      #
+      # @param uri [URI::Generic] target endpoint to request.
+      # @return [String] raw HTTP response body on success.
+      # @raise [InstanceFetchError] when all addresses are exhausted or a
+      #   non-retryable error occurs.
       def perform_instance_http_request(uri)
         raise InstanceFetchError, "federation shutdown requested" if federation_shutdown_requested?
 
-        http = build_remote_http_client(uri)
+        remote_addresses = sort_addresses_for_connection(resolve_remote_ip_addresses(uri))
+        addresses = remote_addresses.empty? ? [nil] : remote_addresses
+
+        last_error = nil
+        addresses.each do |address|
+          break if federation_shutdown_requested?
+
+          begin
+            return perform_single_http_request(uri, ip_address: address&.to_s)
+          rescue InstanceFetchError => e
+            if connection_refused_or_unreachable?(e)
+              last_error = e
+            else
+              raise
+            end
+          end
+        end
+
+        raise last_error || InstanceFetchError.new("all resolved addresses failed")
+      rescue ArgumentError => e
+        raise_instance_fetch_error(e)
+      end
+
+      # Execute a single HTTP GET request against the supplied URI, optionally
+      # pinning the connection to a specific IP address.
+      #
+      # @param uri [URI::Generic] target endpoint.
+      # @param ip_address [String, nil] resolved IP address to pin the
+      #   connection to, or +nil+ to let {build_remote_http_client} resolve.
+      # @return [String] raw HTTP response body.
+      # @raise [InstanceFetchError] when the request fails.
+      def perform_single_http_request(uri, ip_address: nil)
+        http = build_remote_http_client(uri, ip_address: ip_address)
         Timeout.timeout(PotatoMesh::Config.remote_instance_request_timeout) do
           http.start do |connection|
             request = build_federation_http_request(Net::HTTP::Get, uri)
@@ -1097,6 +1265,14 @@ module PotatoMesh
           )
           attributes[:nodes_count] = stats_count if stats_count
 
+          # Extract per-protocol 24h counts (informational, not signed).
+          if stats_payload.is_a?(Hash)
+            mc_day = stats_payload.dig("meshcore", "day")
+            mt_day = stats_payload.dig("meshtastic", "day")
+            attributes[:meshcore_nodes_count] = coerce_integer(mc_day) if mc_day
+            attributes[:meshtastic_nodes_count] = coerce_integer(mt_day) if mt_day
+          end
+
           nodes_since_path = "/api/nodes?since=#{recent_cutoff}&limit=1000"
           nodes_since_window, nodes_since_metadata = fetch_instance_json(attributes[:domain], nodes_since_path)
           if stats_count.nil? && attributes[:nodes_count].nil? && nodes_since_window.is_a?(Array)
@@ -1197,15 +1373,41 @@ module PotatoMesh
         unrestricted_addresses
       end
 
+      # Sort resolved addresses so that IPv4 precedes IPv6.
+      #
+      # Federation peers with dual-stack DNS may publish addresses where one
+      # family is unreachable.  Placing IPv4 entries first mirrors the
+      # preference used by {discover_local_ip_address} and improves the
+      # likelihood that the first connection attempt succeeds.
+      #
+      # @param addresses [Array<IPAddr>] resolved IP address list.
+      # @return [Array<IPAddr>] addresses sorted with IPv4 entries before IPv6.
+      def sort_addresses_for_connection(addresses)
+        return addresses if addresses.nil? || addresses.length <= 1
+
+        v4, v6 = addresses.partition { |ip| !ip.ipv6? }
+        v4 + v6
+      end
+
       # Build an HTTP client configured for communication with a remote instance.
       #
+      # When +ip_address+ is supplied the client is pinned to that specific
+      # address, bypassing DNS resolution.  Callers that iterate over
+      # multiple resolved addresses should pass each candidate in turn.
+      #
       # @param uri [URI::Generic] target URI describing the remote endpoint.
+      # @param ip_address [String, nil] explicit IP address to connect to,
+      #   or +nil+ to resolve via DNS and use the first result.
       # @return [Net::HTTP] HTTP client ready to execute the request.
-      def build_remote_http_client(uri)
-        remote_addresses = resolve_remote_ip_addresses(uri)
+      def build_remote_http_client(uri, ip_address: nil)
         http = Net::HTTP.new(uri.host, uri.port)
-        if http.respond_to?(:ipaddr=) && remote_addresses.any?
-          http.ipaddr = remote_addresses.first.to_s
+        if ip_address
+          http.ipaddr = ip_address if http.respond_to?(:ipaddr=)
+        else
+          remote_addresses = resolve_remote_ip_addresses(uri)
+          if http.respond_to?(:ipaddr=) && remote_addresses.any?
+            http.ipaddr = remote_addresses.first.to_s
+          end
         end
         http.open_timeout = PotatoMesh::Config.remote_instance_http_timeout
         http.read_timeout = PotatoMesh::Config.remote_instance_read_timeout
@@ -1398,8 +1600,9 @@ module PotatoMesh
         sql = <<~SQL
           INSERT INTO instances (
             id, domain, pubkey, name, version, channel, frequency,
-            latitude, longitude, last_update_time, is_private, nodes_count, contact_link, signature
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            latitude, longitude, last_update_time, is_private, nodes_count,
+            meshcore_nodes_count, meshtastic_nodes_count, contact_link, signature
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             domain=excluded.domain,
             pubkey=excluded.pubkey,
@@ -1411,7 +1614,9 @@ module PotatoMesh
             longitude=excluded.longitude,
             last_update_time=excluded.last_update_time,
             is_private=excluded.is_private,
-            nodes_count=excluded.nodes_count,
+            nodes_count=COALESCE(excluded.nodes_count, instances.nodes_count),
+            meshcore_nodes_count=COALESCE(excluded.meshcore_nodes_count, instances.meshcore_nodes_count),
+            meshtastic_nodes_count=COALESCE(excluded.meshtastic_nodes_count, instances.meshtastic_nodes_count),
             contact_link=excluded.contact_link,
             signature=excluded.signature
         SQL
@@ -1430,6 +1635,8 @@ module PotatoMesh
           attributes[:last_update_time],
           attributes[:is_private] ? 1 : 0,
           nodes_count,
+          coerce_integer(attributes[:meshcore_nodes_count]),
+          coerce_integer(attributes[:meshtastic_nodes_count]),
           attributes[:contact_link],
           signature,
         ]

@@ -589,10 +589,10 @@ def test_ensure_radio_metadata_extracts_config(mesh_module, capsys):
     first_log = capsys.readouterr().out
 
     assert iface.wait_calls == 1
-    assert mesh.config.LORA_FREQ == 868
+    assert mesh.config.LORA_FREQ == 869
     assert mesh.config.MODEM_PRESET == "MediumFast"
     assert "Captured LoRa radio metadata" in first_log
-    assert "lora_freq=868" in first_log
+    assert "lora_freq=869" in first_log
     assert "modem_preset='MediumFast'" in first_log
 
     secondary_lora = make_lora(7, "US_915", 2, "LONG_FAST", preset_field="preset")
@@ -602,7 +602,7 @@ def test_ensure_radio_metadata_extracts_config(mesh_module, capsys):
     second_log = capsys.readouterr().out
 
     assert second_iface.wait_calls == 1
-    assert mesh.config.LORA_FREQ == 868
+    assert mesh.config.LORA_FREQ == 869
     assert mesh.config.MODEM_PRESET == "MediumFast"
     assert second_log == ""
 
@@ -1621,6 +1621,8 @@ def test_main_retries_interface_creation(mesh_module, monkeypatch):
             raise RuntimeError("boom")
         return iface, port
 
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
     monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh.threading, "Event", DummyEvent)
@@ -1693,6 +1695,8 @@ def test_main_reconnects_when_connection_event_clears(mesh_module, monkeypatch):
             self._flag = True
             return True
 
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
     monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh.threading, "Event", DummyStopEvent)
@@ -1757,6 +1761,8 @@ def test_main_recreates_interface_after_snapshot_error(mesh_module, monkeypatch)
     def record_upsert(node_id, node):
         upsert_calls.append(node_id)
 
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
     monkeypatch.setattr(mesh, "CONNECTION", "/dev/ttyTEST")
     monkeypatch.setattr(mesh, "_create_serial_interface", fake_create)
     monkeypatch.setattr(mesh, "upsert_node", record_upsert)
@@ -1779,6 +1785,8 @@ def test_main_exits_when_defaults_unavailable(mesh_module, monkeypatch):
     def fail_default():
         raise mesh.NoAvailableMeshInterface("no interface available")
 
+    monkeypatch.setattr(mesh, "INSTANCES", (("http://test", ""),))
+    monkeypatch.setattr(mesh, "INSTANCE", "http://test")
     monkeypatch.setattr(mesh, "CONNECTION", None)
     monkeypatch.setattr(mesh, "_create_default_interface", fail_default)
     monkeypatch.setattr(mesh.signal, "signal", lambda *_, **__: None)

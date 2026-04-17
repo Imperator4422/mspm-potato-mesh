@@ -92,6 +92,7 @@ import {
   aggregateTelemetrySnapshots,
 } from './snapshot-aggregator.js';
 import { normalizeNodeCollection } from './node-snapshot-normalizer.js';
+import { maxRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit } from './incremental-helpers.js';
 import { buildTraceSegments } from './trace-paths.js';
 import {
   getRoleColor,
@@ -133,6 +134,9 @@ export function initializeApp(config) {
   const statusEl = document.getElementById('status');
   const footerActiveNodes = document.getElementById('footerActiveNodes');
   const refreshBtn = document.getElementById('refreshBtn');
+  const autorefreshToggle = document.getElementById('autorefreshToggle');
+  const protocolToggleMeshcore = document.getElementById('protocolToggleMeshcore');
+  const protocolToggleMeshtastic = document.getElementById('protocolToggleMeshtastic');
   const filterInput = document.getElementById('filterInput');
   const filterClearButton = document.getElementById('filterClear');
   const shortInfoTemplate = document.getElementById('shortInfoOverlayTemplate');
@@ -226,6 +230,18 @@ export function initializeApp(config) {
     applyNodeFallback: applyNodeNameFallback,
     logger: console,
   });
+  // Timestamps of the most recent record seen per data type.  Used to pass
+  // the ``since`` query parameter on subsequent refreshes so only new/changed
+  // rows are transferred over the wire.
+  let lastNodeTimestamp = 0;
+  let lastMessageTimestamp = 0;
+  let lastPositionTimestamp = 0;
+  let lastTelemetryTimestamp = 0;
+  let lastNeighborTimestamp = 0;
+  let lastTraceTimestamp = 0;
+  /** Whether the very first full fetch has completed. */
+  let initialFetchDone = false;
+
   const NODE_LIMIT = 2000;
   const TRACE_LIMIT = 500;
   const TRACE_MAX_AGE_SECONDS = 28 * 24 * 60 * 60;
@@ -248,6 +264,7 @@ export function initializeApp(config) {
 
   /** @type {ReturnType<typeof setTimeout>|null} */
   let refreshTimer = null;
+  let autorefreshPaused = false;
   let activeStatsRequestId = 0;
 
   /**
@@ -453,7 +470,9 @@ export function initializeApp(config) {
     }
     // Only arm the timer when a positive interval is configured; a zero or
     // negative value means auto-refresh is intentionally disabled.
-    if (REFRESH_MS > 0) {
+    // When the user has explicitly paused auto-refresh, skip arming the timer
+    // entirely so no background API requests are made.
+    if (REFRESH_MS > 0 && !autorefreshPaused) {
       refreshTimer = setInterval(refresh, REFRESH_MS);
     }
   }
@@ -772,7 +791,7 @@ export function initializeApp(config) {
     });
   }
 
-  /** @type {Set<string>} Active compound role-filter keys, each ``"<protocol>:<roleKey>"``. */
+  /** @type {Set<string>} Hidden role compound keys — roles in this set are excluded from display. */
   const activeRoleFilters = new Set();
   /** @type {Map<string, HTMLElement>} Compound key → legend button element. */
   const legendRoleButtons = new Map();
@@ -827,8 +846,7 @@ export function initializeApp(config) {
     return `${normalizeFilterProtocol(protocol)}:${getRoleKey(role)}`;
   }
 
-  /** @type {Readonly<Record<string,string>>} Display names for protocol tokens. */
-  const PROTOCOL_DISPLAY_NAMES = Object.freeze({ meshtastic: 'Meshtastic', meshcore: 'MeshCore' });
+
 
   /**
    * Lazily create the floating map status element used for progress messages.
@@ -1314,6 +1332,8 @@ export function initializeApp(config) {
   let legendToggleControl = null;
   let meshcoreCountEl = null;
   let meshtasticCountEl = null;
+  let meshcoreColEl = null;
+  let meshtasticColEl = null;
   let legendToggleButton = null;
   let legendVisible = true;
 
@@ -1463,18 +1483,14 @@ export function initializeApp(config) {
    */
   function updateLegendRoleFiltersUI() {
     const hasFilters = activeRoleFilters.size > 0;
-    // legendRoleButtons is keyed by compound key ("protocol:roleKey")
+    // activeRoleFilters is a *hidden-roles* set: roles present in the set are
+    // hidden.  Buttons show aria-pressed="true" when the role is *visible*
+    // (i.e. NOT in the hidden set) so that the default all-visible state
+    // highlights every button.
     legendRoleButtons.forEach((button, compoundKey) => {
       if (!button) return;
-      const isActive = activeRoleFilters.has(compoundKey);
-      button.setAttribute('aria-pressed', isActive ? 'true' : 'false');
-    });
-    legendProtocolButtons.forEach((button, protocol) => {
-      if (!button) return;
-      const isHidden = hiddenProtocols.has(protocol);
-      const displayName = PROTOCOL_DISPLAY_NAMES[protocol] ?? protocol;
-      button.setAttribute('aria-pressed', isHidden ? 'true' : 'false');
-      button.textContent = isHidden ? `Show ${displayName}` : `Hide ${displayName}`;
+      const isHidden = activeRoleFilters.has(compoundKey);
+      button.setAttribute('aria-pressed', isHidden ? 'false' : 'true');
     });
     if (legendContainer) {
       if (hasFilters || hiddenProtocols.size > 0) {
@@ -1483,7 +1499,35 @@ export function initializeApp(config) {
         legendContainer.removeAttribute('data-has-active-filters');
       }
     }
+    updateMetaProtocolToggleUI();
     updateLegendToggleState();
+  }
+
+  /**
+   * Sync the meta-row protocol toggle buttons with the current
+   * {@link hiddenProtocols} state.
+   *
+   * When a protocol is hidden the button's ``<img>`` receives a greyscale
+   * filter and ``aria-pressed`` is set to ``"true"``.
+   *
+   * @returns {void}
+   */
+  function updateMetaProtocolToggleUI() {
+    /** @type {Array<{btn: HTMLElement|null, protocol: string, name: string}>} */
+    const toggles = [
+      { btn: protocolToggleMeshcore, protocol: 'meshcore', name: 'MeshCore' },
+      { btn: protocolToggleMeshtastic, protocol: 'meshtastic', name: 'Meshtastic' },
+    ];
+    toggles.forEach(({ btn, protocol, name }) => {
+      if (!btn) return;
+      const isHidden = hiddenProtocols.has(protocol);
+      btn.setAttribute('aria-pressed', isHidden ? 'true' : 'false');
+      btn.setAttribute('aria-label', isHidden ? `Show ${name} nodes` : `Hide ${name} nodes`);
+      const img = btn.querySelector('.protocol-toggle-icon');
+      if (img) {
+        img.style.filter = isHidden ? 'grayscale(1) opacity(0.4)' : '';
+      }
+    });
   }
 
   /**
@@ -1523,7 +1567,7 @@ export function initializeApp(config) {
       item.className = 'legend-item';
       colEl.appendChild(item);
       item.type = 'button';
-      item.setAttribute('aria-pressed', 'false');
+      item.setAttribute('aria-pressed', 'true');
       item.dataset.role = role;
       item.dataset.protocol = protocol;
       const swatch = document.createElement('span');
@@ -1538,6 +1582,7 @@ export function initializeApp(config) {
       item.addEventListener('click', legendClickHandler(event => {
         const exclusive = event.metaKey || event.ctrlKey;
         if (exclusive) {
+          // Ctrl/Cmd+Click: hide only this role (all others become visible).
           activeRoleFilters.clear();
           activeRoleFilters.add(compoundKey);
           updateLegendRoleFiltersUI();
@@ -1588,6 +1633,7 @@ export function initializeApp(config) {
 
       // --- MeshCore column (left, bottom-aligned) ---
       const meshcoreCol = L.DomUtil.create('div', 'legend-column legend-column--bottom', itemsContainer);
+      meshcoreColEl = meshcoreCol;
       const meshcoreColHeader = L.DomUtil.create('div', 'legend-column-header', meshcoreCol);
       meshcoreColHeader.appendChild(buildMeshcoreIconImg());
       const meshcoreColTitle = document.createElement('span');
@@ -1599,6 +1645,7 @@ export function initializeApp(config) {
 
       // --- Meshtastic column (right) ---
       const meshtasticCol = L.DomUtil.create('div', 'legend-column', itemsContainer);
+      meshtasticColEl = meshtasticCol;
       const meshtasticColHeader = L.DomUtil.create('div', 'legend-column-header', meshtasticCol);
       meshtasticColHeader.appendChild(buildMeshtasticIconImg());
       const meshtasticColTitle = document.createElement('span');
@@ -1612,28 +1659,7 @@ export function initializeApp(config) {
       buildRoleButtons(meshcoreCol, meshcoreRoleColors, 'meshcore');
       buildRoleButtons(meshtasticCol, roleColors, 'meshtastic');
 
-      // --- MeshCore column footer: protocol hide toggle ---
-      legendProtocolButtons.clear();
-      const buildProtocolToggle = (protocol, col) => {
-        const displayName = PROTOCOL_DISPLAY_NAMES[protocol] ?? protocol;
-        const btn = L.DomUtil.create('button', 'legend-item legend-protocol-toggle', col);
-        btn.type = 'button';
-        btn.setAttribute('aria-pressed', 'false');
-        btn.textContent = `Hide ${displayName}`;
-        btn.addEventListener('click', legendClickHandler(() => {
-          if (hiddenProtocols.has(protocol)) {
-            hiddenProtocols.delete(protocol);
-          } else {
-            hiddenProtocols.add(protocol);
-          }
-          updateLegendRoleFiltersUI();
-          applyFilter();
-        }));
-        legendProtocolButtons.set(protocol, btn);
-      };
-      buildProtocolToggle('meshcore', meshcoreCol);
-
-      // --- Meshtastic column: line toggles then protocol hide toggle at bottom ---
+      // --- Meshtastic column: line toggles at bottom ---
       neighborLinesToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-neighbors', meshtasticCol);
       neighborLinesToggleButton.type = 'button';
       neighborLinesToggleButton.addEventListener('click', legendClickHandler(() => {
@@ -1647,9 +1673,6 @@ export function initializeApp(config) {
         setTraceLinesVisibility(!traceLinesVisible);
       }));
       updateTraceLinesToggleState();
-
-      // Hide Meshtastic toggle at the very bottom of the Meshtastic column.
-      buildProtocolToggle('meshtastic', meshtasticCol);
 
       updateLegendRoleFiltersUI();
 
@@ -3249,8 +3272,24 @@ export function initializeApp(config) {
     });
 
     const enrichedLogEntries = attachNodeContextToLogEntries(logEntries);
+    // When a protocol is hidden, exclude its entries from the chat display.
+    // Entries without a resolved node are kept; entries with a node but a
+    // null/missing protocol are treated as meshtastic (the default protocol).
+    const protocolVisibleEntries = hiddenProtocols.size > 0
+      ? enrichedLogEntries.filter(e => {
+        if (!e || !e.node) return true;
+        const proto = normalizeFilterProtocol(e.node.protocol);
+        return !hiddenProtocols.has(proto);
+      })
+      : enrichedLogEntries;
+    const protocolVisibleChannels = hiddenProtocols.size > 0
+      ? channels.filter(ch => {
+        const proto = ch.protocol ? normalizeFilterProtocol(ch.protocol) : null;
+        return !proto || !hiddenProtocols.has(proto);
+      })
+      : channels;
     const { logEntries: filteredLogEntries, channels: filteredChannels } = filterChatModel(
-      { logEntries: enrichedLogEntries, channels },
+      { logEntries: protocolVisibleEntries, channels: protocolVisibleChannels },
       filterQuery
     );
 
@@ -3571,11 +3610,14 @@ export function initializeApp(config) {
    * Fetch the latest nodes from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of records.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed node payloads.
    */
-  async function fetchNodes(limit = NODE_LIMIT) {
+  async function fetchNodes(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/nodes?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/nodes?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3590,7 +3632,7 @@ export function initializeApp(config) {
     if (typeof nodeId !== 'string') return null;
     const trimmed = nodeId.trim();
     if (trimmed.length === 0) return null;
-    const r = await fetch(`/api/nodes/${encodeURIComponent(trimmed)}`, { cache: 'no-store' });
+    const r = await fetch(`/api/nodes/${encodeURIComponent(trimmed)}`, { cache: 'default' });
     if (r.status === 404) return null;
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
@@ -3600,7 +3642,7 @@ export function initializeApp(config) {
    * Fetch recent messages from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
-   * @param {{ encrypted?: boolean }} [options] Optional retrieval flags.
+   * @param {{ encrypted?: boolean, since?: number }} [options] Optional retrieval flags.
    * @returns {Promise<Array<Object>>} Parsed message payloads.
    */
   async function fetchMessages(limit = MESSAGE_LIMIT, options = {}) {
@@ -3610,8 +3652,11 @@ export function initializeApp(config) {
     if (options && options.encrypted) {
       params.set('encrypted', 'true');
     }
+    if (options && options.since > 0) {
+      params.set('since', String(options.since));
+    }
     const query = params.toString();
-    const r = await fetch(`/api/messages?${query}`, { cache: 'no-store' });
+    const r = await fetch(`/api/messages?${query}`, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3620,11 +3665,14 @@ export function initializeApp(config) {
    * Fetch neighbour information from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed neighbour payloads.
    */
-  async function fetchNeighbors(limit = NODE_LIMIT) {
+  async function fetchNeighbors(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/neighbors?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/neighbors?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3633,12 +3681,15 @@ export function initializeApp(config) {
    * Fetch traceroute observations from the JSON API.
    *
    * @param {number} [limit=TRACE_LIMIT] Maximum number of records.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed trace payloads.
    */
-  async function fetchTraces(limit = TRACE_LIMIT) {
+  async function fetchTraces(limit = TRACE_LIMIT, since = 0) {
     const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : TRACE_LIMIT;
     const effectiveLimit = Math.min(safeLimit, NODE_LIMIT);
-    const r = await fetch(`/api/traces?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/traces?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const traces = await r.json();
     return filterRecentTraces(traces, TRACE_MAX_AGE_SECONDS);
@@ -3648,11 +3699,14 @@ export function initializeApp(config) {
    * Fetch telemetry entries from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed telemetry payloads.
    */
-  async function fetchTelemetry(limit = NODE_LIMIT) {
+  async function fetchTelemetry(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/telemetry?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/telemetry?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3661,11 +3715,14 @@ export function initializeApp(config) {
    * Fetch position packets from the JSON API.
    *
    * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
+   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
    * @returns {Promise<Array<Object>>} Parsed position payloads.
    */
-  async function fetchPositions(limit = NODE_LIMIT) {
+  async function fetchPositions(limit = NODE_LIMIT, since = 0) {
     const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    const r = await fetch(`/api/positions?limit=${effectiveLimit}`, { cache: 'no-store' });
+    let url = `/api/positions?limit=${effectiveLimit}`;
+    if (since > 0) url += `&since=${since}`;
+    const r = await fetch(url, { cache: 'default' });
     if (!r.ok) throw new Error('HTTP ' + r.status);
     return r.json();
   }
@@ -3681,6 +3738,7 @@ export function initializeApp(config) {
     const num = typeof value === 'number' ? value : Number(value);
     return Number.isFinite(num) ? num : null;
   }
+
 
   /**
    * Determine the best-effort timestamp in seconds from numeric or ISO values.
@@ -4319,7 +4377,7 @@ export function initializeApp(config) {
   function matchesRoleFilter(node) {
     if (!activeRoleFilters.size) return true;
     const compoundKey = makeRoleFilterKey(node && node.role, node && node.protocol);
-    return activeRoleFilters.has(compoundKey);
+    return !activeRoleFilters.has(compoundKey);
   }
 
   /**
@@ -4351,6 +4409,31 @@ export function initializeApp(config) {
   }
 
   /**
+   * Return a copy of the stats object with totals reduced by the counts of
+   * any protocols the user has explicitly hidden.
+   *
+   * Per-protocol sub-objects are left untouched so legend column counts and
+   * visibility decisions still use the raw server values.
+   *
+   * @param {Object|null} stats Normalised stats from ``/api/stats``.
+   * @returns {Object|null} Adjusted stats (new object) or the original if nothing is hidden.
+   */
+  function adjustStatsForHiddenProtocols(stats) {
+    if (!hiddenProtocols.size || !stats) return stats;
+    const adjusted = { ...stats };
+    for (const protocol of hiddenProtocols) {
+      const bucket = stats[protocol];
+      if (!bucket || typeof bucket !== 'object') continue;
+      for (const key of ['hour', 'day', 'week', 'month']) {
+        if (typeof adjusted[key] === 'number' && typeof bucket[key] === 'number') {
+          adjusted[key] = Math.max(0, adjusted[key] - bucket[key]);
+        }
+      }
+    }
+    return adjusted;
+  }
+
+  /**
    * Apply text and role filters to the node list and re-render outputs.
    *
    * @returns {void}
@@ -4369,11 +4452,21 @@ export function initializeApp(config) {
     const nowSec = Date.now()/1000;
     renderTable(sortedNodes, nowSec);
     renderMap(sortedNodes, nowSec);
-    // Title and legend counts are intentionally global — they reflect the whole
-    // network, not just the nodes visible under the current filter.
-    updateTitleCount(allNodes, nowSec);
-    updateLegendProtocolCounts(allNodes, nowSec);
-    updateFooterStats(sortedNodes, nowSec);
+    // Show an immediate local estimate for the title so it doesn't flicker
+    // to (0) while waiting for the async /api/stats response.
+    const localStats = computeLocalActiveNodeStats(allNodes, nowSec);
+    updateTitleCount(adjustStatsForHiddenProtocols(localStats));
+    // Title, legend, footer, and visibility are then corrected by /api/stats
+    // which provides the authoritative, uncapped counts.
+    const statsRequestId = ++activeStatsRequestId;
+    void fetchActiveNodeStats({ nodes: allNodes, nowSeconds: nowSec }).then(stats => {
+      if (statsRequestId !== activeStatsRequestId) return;
+      const visibleStats = adjustStatsForHiddenProtocols(stats);
+      updateTitleCount(visibleStats);
+      updateLegendProtocolCounts(stats);
+      updateFooterStats(visibleStats);
+      applyProtocolVisibility(stats);
+    });
     updateSortIndicators();
     // Pass the raw filterQuery (not the normalised form) so the chat log can
     // highlight matching substrings in their original case.
@@ -4425,49 +4518,102 @@ export function initializeApp(config) {
       if (statusEl) {
         statusEl.textContent = 'refreshing…';
       }
+      // On the first load fetch the full dataset; subsequent refreshes pass
+      // the ``since`` timestamp so only new/changed rows are transferred.
+      // A 1-second overlap avoids missing rows that arrive at the boundary.
+      const useSince = initialFetchDone;
+      const nodeSince = useSince ? Math.max(0, lastNodeTimestamp - 1) : 0;
+      const msgSince = useSince ? Math.max(0, lastMessageTimestamp - 1) : 0;
+      const posSince = useSince ? Math.max(0, lastPositionTimestamp - 1) : 0;
+      const telSince = useSince ? Math.max(0, lastTelemetryTimestamp - 1) : 0;
+      const nbSince = useSince ? Math.max(0, lastNeighborTimestamp - 1) : 0;
+      const trSince = useSince ? Math.max(0, lastTraceTimestamp - 1) : 0;
+
       // Secondary fetches are fire-and-forget with individual error handlers so
       // that a failure in one stream (e.g. telemetry) does not abort the whole
       // refresh cycle.  Each promise resolves to an empty array on error, which
       // preserves the previous data until the next successful fetch.
-      const neighborPromise = fetchNeighbors().catch(err => {
+      const neighborPromise = fetchNeighbors(NODE_LIMIT, nbSince).catch(err => {
         console.warn('neighbor refresh failed; continuing without connections', err);
         return [];
       });
-      const telemetryPromise = fetchTelemetry().catch(err => {
+      const telemetryPromise = fetchTelemetry(NODE_LIMIT, telSince).catch(err => {
         console.warn('telemetry refresh failed; continuing without telemetry', err);
         return [];
       });
-      const positionsPromise = fetchPositions().catch(err => {
+      const positionsPromise = fetchPositions(NODE_LIMIT, posSince).catch(err => {
         console.warn('position refresh failed; continuing without updates', err);
         return [];
       });
-      const tracesPromise = fetchTraces().catch(err => {
+      const tracesPromise = fetchTraces(TRACE_LIMIT, trSince).catch(err => {
         console.warn('trace refresh failed; continuing without traceroutes', err);
         return [];
       });
-      const encryptedMessagesPromise = fetchMessages(MESSAGE_LIMIT, { encrypted: true }).catch(err => {
+      const encryptedMessagesPromise = fetchMessages(MESSAGE_LIMIT, { encrypted: true, since: msgSince }).catch(err => {
         console.warn('encrypted message refresh failed; continuing without encrypted entries', err);
         return [];
       });
       // Fan-out all requests simultaneously; nodes are the primary resource and
       // must succeed for rendering to proceed.
       const [
-        nodes,
-        positions,
-        neighborTuples,
-        traceEntries,
-        messages,
-        telemetryEntries,
-        encryptedMessages
+        incomingNodes,
+        incomingPositions,
+        incomingNeighbors,
+        incomingTraces,
+        incomingMessages,
+        incomingTelemetry,
+        incomingEncryptedMessages
       ] = await Promise.all([
-        fetchNodes(),
+        fetchNodes(NODE_LIMIT, nodeSince),
         positionsPromise,
         neighborPromise,
         tracesPromise,
-        fetchMessages(MESSAGE_LIMIT),
+        fetchMessages(MESSAGE_LIMIT, { since: msgSince }),
         telemetryPromise,
         encryptedMessagesPromise
       ]);
+
+      // Update high-water marks for incremental fetching.
+      const incomingNodeTs = maxRecordTimestamp(incomingNodes, ['last_heard']);
+      const incomingMsgTs = maxRecordTimestamp(incomingMessages, ['rx_time']);
+      const incomingEncMsgTs = maxRecordTimestamp(incomingEncryptedMessages, ['rx_time']);
+      const incomingPosTs = maxRecordTimestamp(incomingPositions, ['rx_time', 'position_time']);
+      const incomingTelTs = maxRecordTimestamp(incomingTelemetry, ['rx_time', 'telemetry_time']);
+      const incomingNbTs = maxRecordTimestamp(incomingNeighbors, ['rx_time']);
+      const incomingTrTs = maxRecordTimestamp(incomingTraces, ['rx_time']);
+      if (incomingNodeTs > lastNodeTimestamp) lastNodeTimestamp = incomingNodeTs;
+      const latestMsgTs = Math.max(incomingMsgTs, incomingEncMsgTs);
+      if (latestMsgTs > lastMessageTimestamp) lastMessageTimestamp = latestMsgTs;
+      if (incomingPosTs > lastPositionTimestamp) lastPositionTimestamp = incomingPosTs;
+      if (incomingTelTs > lastTelemetryTimestamp) lastTelemetryTimestamp = incomingTelTs;
+      if (incomingNbTs > lastNeighborTimestamp) lastNeighborTimestamp = incomingNbTs;
+      if (incomingTrTs > lastTraceTimestamp) lastTraceTimestamp = incomingTrTs;
+
+      // Merge incremental results with existing data.  On first load the
+      // existing arrays are empty so the merge is effectively a no-op.
+      // Merge incremental results with existing data then trim to the
+      // configured limits so long-running tabs do not accumulate stale
+      // entries beyond what the server would return on a fresh fetch.
+      const nodes = useSince ? mergeById(allNodes, incomingNodes, 'node_id') : incomingNodes;
+      const positions = useSince
+        ? trimToLimit(mergeById(allPositionEntries, incomingPositions, 'id'), NODE_LIMIT)
+        : incomingPositions;
+      const neighborTuples = useSince
+        ? mergeByCompositeKey(allNeighbors, incomingNeighbors, ['node_id', 'neighbor_id'])
+        : incomingNeighbors;
+      const telemetryEntries = useSince
+        ? trimToLimit(mergeById(allTelemetryEntries, incomingTelemetry, 'id'), NODE_LIMIT)
+        : incomingTelemetry;
+      const traceEntries = useSince
+        ? trimToLimit(mergeById(allTraces, incomingTraces, 'id'), TRACE_LIMIT)
+        : incomingTraces;
+      const messages = useSince
+        ? trimToLimit(mergeById(allMessages, incomingMessages, 'id'), MESSAGE_LIMIT)
+        : incomingMessages;
+      const encryptedMessages = useSince
+        ? trimToLimit(mergeById(allEncryptedMessages, incomingEncryptedMessages, 'id'), MESSAGE_LIMIT)
+        : incomingEncryptedMessages;
+
       // Collapse per-source snapshot arrays into single merged records; the
       // snapshot window de-duplicates entries from multiple ingestors.
       const aggregatedNodes = aggregateNodeSnapshots(nodes);
@@ -4497,6 +4643,7 @@ export function initializeApp(config) {
       allPositionEntries = aggregatedPositions;
       allNeighbors = aggregatedNeighbors;
       allTraces = Array.isArray(traceEntries) ? traceEntries : [];
+      initialFetchDone = true;
       applyFilter();
       if (statusEl) {
         statusEl.textContent = 'updated ' + new Date().toLocaleTimeString();
@@ -4519,18 +4666,64 @@ export function initializeApp(config) {
     refreshBtn.addEventListener('click', refresh);
   }
 
+  // --- Auto-refresh play/pause toggle ---
+  if (autorefreshToggle) {
+    autorefreshToggle.addEventListener('click', () => {
+      autorefreshPaused = !autorefreshPaused;
+      if (autorefreshPaused) {
+        if (refreshTimer) {
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }
+        autorefreshToggle.textContent = '\u25B6';
+        autorefreshToggle.setAttribute('aria-label', 'Resume auto-refresh');
+        autorefreshToggle.setAttribute('aria-pressed', 'true');
+        if (statusEl) statusEl.textContent = 'Refresh paused.';
+      } else {
+        autorefreshToggle.textContent = '\u23F8';
+        autorefreshToggle.setAttribute('aria-label', 'Pause auto-refresh');
+        autorefreshToggle.setAttribute('aria-pressed', 'false');
+        refresh();
+        restartAutoRefresh();
+      }
+    });
+  }
+
+  // --- Meta-row protocol toggle buttons ---
+  /**
+   * Wire a meta-row protocol toggle button to the shared
+   * {@link hiddenProtocols} set.
+   *
+   * @param {HTMLElement|null} btn Button element.
+   * @param {string} protocol Protocol token (``'meshcore'`` or ``'meshtastic'``).
+   * @returns {void}
+   */
+  function setupMetaProtocolToggle(btn, protocol) {
+    if (!btn) return;
+    btn.addEventListener('click', () => {
+      if (hiddenProtocols.has(protocol)) {
+        hiddenProtocols.delete(protocol);
+      } else {
+        hiddenProtocols.add(protocol);
+      }
+      updateMetaProtocolToggleUI();
+      updateLegendRoleFiltersUI();
+      applyFilter();
+    });
+  }
+  setupMetaProtocolToggle(protocolToggleMeshcore, 'meshcore');
+  setupMetaProtocolToggle(protocolToggleMeshtastic, 'meshtastic');
+
   /**
    * Update the page/tab title with the total active-node count for the past 7 days.
    *
-   * @param {Array<Object>} nodes All node payloads (unfiltered — counts are global).
-   * @param {number} nowSec Reference timestamp.
+   * @param {{week: number}} stats Active-node stats from /api/stats.
    * @returns {void}
    */
-  function updateTitleCount(nodes, nowSec) {
-    const weekAgoSec = nowSec - 7 * 86_400;
-    const count = nodes.filter(n => n.last_heard && Number(n.last_heard) >= weekAgoSec).length;
+  function updateTitleCount(stats) {
+    const count = stats?.week ?? 0;
     const text = `${baseTitle} (${count})`;
-    titleEl.textContent = text;
+    if (titleEl) titleEl.textContent = text;
     if (headerTitleTextEl) {
       headerTitleTextEl.textContent = text;
     } else if (headerEl) {
@@ -4541,38 +4734,52 @@ export function initializeApp(config) {
   /**
    * Update legend column headers with per-protocol active node counts (7 days).
    *
-   * @param {Array<Object>} nodes All node payloads (unfiltered).
-   * @param {number} nowSec Reference timestamp.
+   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}}} stats Stats from /api/stats.
    * @returns {void}
    */
-  function updateLegendProtocolCounts(nodes, nowSec) {
+  function updateLegendProtocolCounts(stats) {
     if (!meshcoreCountEl && !meshtasticCountEl) return;
-    const weekAgoSec = nowSec - 7 * 86_400;
-    const recentNodes = nodes.filter(n => Number.isFinite(Number(n.last_heard)) && Number(n.last_heard) >= weekAgoSec);
-    const meshcoreCount = recentNodes.filter(n => n.protocol === 'meshcore').length;
-    // Treat any non-meshcore node as Meshtastic until additional protocols are supported.
-    const meshtasticCount = recentNodes.filter(n => n.protocol !== 'meshcore').length;
-    if (meshcoreCountEl) meshcoreCountEl.textContent = ` (${meshcoreCount})`;
-    if (meshtasticCountEl) meshtasticCountEl.textContent = ` (${meshtasticCount})`;
+    if (meshcoreCountEl) meshcoreCountEl.textContent = ` (${stats?.meshcore?.week ?? 0})`;
+    if (meshtasticCountEl) meshtasticCountEl.textContent = ` (${stats?.meshtastic?.week ?? 0})`;
   }
 
   /**
    * Update the footer active-node stats element with day/week/month counts.
    *
-   * @param {Array<Object>} nodes Node payloads.
-   * @param {number} nowSec Reference timestamp.
+   * @param {{day: number, week: number, month: number, sampled: boolean}} stats Stats from /api/stats.
    * @returns {void}
    */
-  function updateFooterStats(nodes, nowSec) {
-    if (!footerActiveNodes) {
-      return;
-    }
-    const requestId = ++activeStatsRequestId;
-    void fetchActiveNodeStats({ nodes, nowSeconds: nowSec }).then(stats => {
-      if (requestId !== activeStatsRequestId) {
-        return;
-      }
-      footerActiveNodes.textContent = 'Active: ' + formatActiveNodeStatsText({ stats });
+  function updateFooterStats(stats) {
+    if (!footerActiveNodes) return;
+    footerActiveNodes.textContent = 'Active: ' + formatActiveNodeStatsText({ stats });
+  }
+
+  /**
+   * Hide/show UI elements based on per-protocol activity in the past 7 days.
+   *
+   * Hides the Charts nav link when meshtastic has no active nodes, and hides
+   * legend columns for protocols with zero weekly activity.
+   *
+   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}}} stats Stats from /api/stats.
+   * @returns {void}
+   */
+  function applyProtocolVisibility(stats) {
+    const meshcoreWeek = stats?.meshcore?.week ?? 0;
+    const meshtasticWeek = stats?.meshtastic?.week ?? 0;
+
+    // Hide legend columns for protocols with no activity in the past 7 days.
+    if (meshcoreColEl) meshcoreColEl.style.display = meshcoreWeek === 0 ? 'none' : '';
+    if (meshtasticColEl) meshtasticColEl.style.display = meshtasticWeek === 0 ? 'none' : '';
+
+    // Show protocol toggle buttons only when both protocols have weekly
+    // activity — filtering is pointless when only one protocol is present.
+    const bothActive = meshcoreWeek > 0 && meshtasticWeek > 0;
+    if (protocolToggleMeshcore) protocolToggleMeshcore.hidden = !bothActive;
+    if (protocolToggleMeshtastic) protocolToggleMeshtastic.hidden = !bothActive;
+
+    // Charts is meshtastic-only; hide the nav link when no meshtastic activity.
+    document.querySelectorAll('a[href="/charts"]').forEach(el => {
+      el.style.display = meshtasticWeek === 0 ? 'none' : '';
     });
   }
 
@@ -4607,12 +4814,24 @@ export function initializeApp(config) {
       updateTitleCount,
       updateLegendProtocolCounts,
       updateFooterStats,
+      applyProtocolVisibility,
       restartAutoRefresh,
+      updateMetaProtocolToggleUI,
+      adjustStatsForHiddenProtocols,
+      /** Whether auto-refresh is currently paused. */
+      isAutorefreshPaused: () => autorefreshPaused,
       /** Inject mock count span elements for legend protocol count tests. */
       _setProtocolCountElements(mc, mt) {
         meshcoreCountEl = mc;
         meshtasticCountEl = mt;
       },
+      /** Inject mock column elements for protocol visibility tests. */
+      _setProtocolColElements(mc, mt) {
+        meshcoreColEl = mc;
+        meshtasticColEl = mt;
+      },
+      /** Trigger a manual refresh cycle (test use only). */
+      refresh,
     },
   };
 }
