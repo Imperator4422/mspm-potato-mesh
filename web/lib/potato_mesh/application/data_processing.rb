@@ -20,6 +20,20 @@ module PotatoMesh
       # Allowed values for the +telemetry_type+ discriminator column.
       VALID_TELEMETRY_TYPES = %w[device environment power air_quality].freeze
 
+      # Half-window (seconds) for the meshcore content-level message dedup
+      # in +insert_message+ and the matching one-shot backfill.  Set to
+      # roughly 3× the observed relay-retransmit delta (~10 s) so genuine
+      # clock skew across co-operating ingestors still collapses, while
+      # rapid legitimate re-sends ("ack", "ok", "test") ≥30 s apart remain
+      # distinct rows.  See issue #756 and ``CONTRACTS.md`` for rationale.
+      #
+      # IMPORTANT: widening this value only takes effect at runtime — the
+      # one-shot backfill in +PotatoMesh::App::Database+ is frozen at
+      # +MESHCORE_CONTENT_DEDUP_BACKFILL_VERSION+.  To re-sweep pre-existing
+      # rows that newly fall within an expanded window, bump the backfill
+      # version so the migration re-runs on the next deploy.
+      MESHCORE_CONTENT_DEDUP_WINDOW_SECONDS = 30
+
       # Coerce a Ruby boolean into a SQLite integer (1/0) while passing through
       # any other value unchanged. Used when writing boolean node fields.
       #
@@ -467,12 +481,17 @@ module PotatoMesh
                 AND NOT (COALESCE(nodes.synthetic,0) = 0 AND excluded.synthetic = 1)
             SQL
 
-            # When a real (non-synthetic) node is upserted with a known long
-            # name, migrate any synthetic placeholder rows that share that name.
-            # This fires when the MeshCore device finally receives the sender's
-            # contact advertisement, resolving the placeholder to a real node ID.
-            if synthetic == 0 && long_name && !long_name.empty?
-              merge_synthetic_nodes(db, node_id, long_name)
+            # Reconcile synthetic placeholder rows with their real counterparts
+            # whenever a MeshCore node is upserted.  Both directions must fire —
+            # the arrival order of chat messages vs contact advertisements is
+            # not guaranteed and may differ across co-operating ingestors that
+            # share this database.  See issue #755.
+            if protocol == "meshcore" && long_name && !long_name.empty?
+              if synthetic == 0
+                merge_synthetic_nodes(db, node_id, long_name)
+              else
+                merge_into_real_node(db, node_id, long_name)
+              end
             end
           end
         end
@@ -494,6 +513,17 @@ module PotatoMesh
       # @param long_name [String] long name to match against synthetic rows.
       # @return [void]
       def merge_synthetic_nodes(db, real_node_id, long_name)
+        # long_name is user-editable and not unique across pubkeys — two real
+        # meshcore devices can legitimately share the same display name.  When
+        # that happens we cannot tell which real node a given chat-derived
+        # synthetic was acting as placeholder for, so any merge would risk
+        # mis-attributing messages.  Bail out and leave the synthetic intact.
+        other_real = db.execute(
+          "SELECT 1 FROM nodes WHERE long_name = ? AND synthetic = 0 AND protocol = 'meshcore' AND node_id != ? LIMIT 1",
+          [long_name, real_node_id],
+        ).first
+        return if other_real
+
         synthetic_ids = db.execute(
           "SELECT node_id FROM nodes WHERE long_name = ? AND synthetic = 1 AND protocol = 'meshcore' AND node_id != ?",
           [long_name, real_node_id],
@@ -509,6 +539,50 @@ module PotatoMesh
             [synthetic_id],
           )
         end
+      end
+
+      # Reverse of +merge_synthetic_nodes+: when a synthetic placeholder is
+      # upserted for a MeshCore sender whose real contact advertisement has
+      # already been stored (e.g. by a co-operating ingestor that saw the
+      # advertisement first), migrate any messages from the synthetic id to the
+      # real id and drop the synthetic row.
+      #
+      # Fixes duplication bug #755 where a chat-derived synthetic node and a
+      # pubkey-derived real node coexisted because the forward merge only fired
+      # on real-node upserts and never back-filled late-arriving synthetics.
+      #
+      # @param db [SQLite3::Database] open database connection.
+      # @param synthetic_node_id [String] canonical node ID of the synthetic placeholder being upserted.
+      # @param long_name [String] long name to match against existing real rows.
+      # @return [void]
+      def merge_into_real_node(db, synthetic_node_id, long_name)
+        # Index by [0] rather than the hash key so this works whether the db
+        # handle was opened with results_as_hash = true or not.
+        real_rows = db.execute(
+          "SELECT node_id FROM nodes WHERE long_name = ? AND synthetic = 0 AND protocol = 'meshcore' AND node_id != ? LIMIT 2",
+          [long_name, synthetic_node_id],
+        )
+        # Ambiguous name: two distinct real meshcore devices share this
+        # long_name.  The synthetic placeholder could legitimately represent
+        # either, so we cannot pick one without risking mis-attribution.  Leave
+        # the synthetic in place; an operator can resolve the duplicate
+        # manually.
+        return if real_rows.length > 1
+
+        row = real_rows.first
+        return unless row
+
+        real_node_id = row[0]
+        return unless real_node_id
+
+        db.execute(
+          "UPDATE messages SET from_id = ? WHERE from_id = ?",
+          [real_node_id, synthetic_node_id],
+        )
+        db.execute(
+          "DELETE FROM nodes WHERE node_id = ? AND synthetic = 1",
+          [synthetic_node_id],
+        )
       end
 
       def require_token!
@@ -1854,6 +1928,59 @@ module PotatoMesh
         ]
 
         with_busy_retry do
+          # Meshcore-only content-level dedup (issue #756).  The deterministic
+          # message id (``_derive_message_id`` in the Python ingestor) hashes
+          # ``sender_timestamp`` among other fields, but the MeshCore library
+          # has been observed delivering the same physical packet twice with
+          # a rewritten ``sender_timestamp`` (relay/retransmit behaviour).
+          # The PK path below cannot catch that — two copies compute two
+          # different ids — so we add a narrow content+window pre-check here.
+          #
+          # Ruby integer ``0`` is truthy, so the ``channel_index`` guard
+          # passes for the broadcast channel intentionally; we only skip when
+          # the channel is absent/nil.  ``from_id`` + non-empty ``text`` keep
+          # encrypted or anonymous traffic on the id-PK path.
+          #
+          # Known race: the SELECT and the downstream INSERT do not share a
+          # transaction, so two Puma threads carrying the same content with
+          # different ids can both pass the pre-check and both insert.  The
+          # deploy-time backfill sweeps the survivors; wrapping the pair in
+          # ``db.transaction(:immediate)`` is a future tightening if the race
+          # is ever observed in production.
+          if protocol == "meshcore" && from_id && channel_index && text && !text.to_s.empty?
+            # ``channel = ?`` matches the ``channel_index`` bind cleanly
+            # because the guard above rejects nil; ``to_id`` may legitimately
+            # be nil (rare meshcore fallback), so it keeps ``IS ?`` for a
+            # NULL-safe compare.
+            duplicate_id = db.get_first_value(
+              <<~SQL,
+              SELECT id FROM messages
+                WHERE protocol = 'meshcore'
+                  AND from_id = ?
+                  AND to_id IS ?
+                  AND channel = ?
+                  AND text = ?
+                  AND rx_time BETWEEN ? AND ?
+                  AND id != ?
+                LIMIT 1
+            SQL
+              [from_id, to_id, channel_index, text,
+               rx_time - MESHCORE_CONTENT_DEDUP_WINDOW_SECONDS,
+               rx_time + MESHCORE_CONTENT_DEDUP_WINDOW_SECONDS, msg_id],
+            )
+            if duplicate_id
+              debug_log(
+                "Skipped meshcore message duplicate",
+                context: "data_processing.insert_message",
+                new_id: msg_id,
+                existing_id: duplicate_id,
+                from_id: from_id,
+                channel: channel_index,
+              )
+              return
+            end
+          end
+
           existing = db.get_first_row(
             "SELECT from_id, to_id, text, encrypted, lora_freq, modem_preset, channel_name, reply_id, emoji, portnum, ingestor, protocol FROM messages WHERE id = ?",
             [msg_id],

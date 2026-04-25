@@ -70,6 +70,21 @@ from meshcore import (
     TCPConnection,
 )
 
+from . import _meshcore_patches
+
+# Apply upstream-library patches before any ``MeshCore`` instance is built,
+# otherwise the first malformed advertisement dies inside a detached asyncio
+# task before our handler can observe it.  See
+# :mod:`data.mesh_ingestor.protocols._meshcore_patches` for the specific
+# upstream bugs covered.
+#
+# This mutates the upstream class at import time.  The blast radius is
+# narrow because ``protocols/__init__.py`` exposes this module only through
+# a lazy ``__getattr__`` and the daemon resolves it only when
+# ``PROTOCOL=meshcore`` is active.  Any future diagnostic CLI that imports
+# this module will inherit the shim.
+_meshcore_patches.apply()
+
 from .. import config, ingestors as _ingestors, queue as _queue
 from ..connection import default_serial_targets, parse_ble_target, parse_tcp_target
 from ..serialization import _iso, _node_num_from_id
@@ -123,27 +138,58 @@ _MESHCORE_ADV_TYPE_ROLE: dict[int, str] = {
 # ---------------------------------------------------------------------------
 
 
-def _derive_message_id(sender_ts: int, discriminator: str, text: str) -> int:
-    """Derive a stable 32-bit message ID from available MeshCore fields.
+_MESHCORE_ID_BITS = 53
+"""Width of the synthetic MeshCore message ID, in bits.
 
-    MeshCore does not assign firmware-side packet IDs.  This function
-    produces a deterministic 32-bit integer so that re-delivered messages
-    resolve to the same database row via the UPSERT ON CONFLICT path, while
-    messages that differ in timestamp, channel/peer, or text content produce
-    distinct IDs.
+53 bits keeps the value within :js:data:`Number.MAX_SAFE_INTEGER`
+(``2**53 - 1``) so the JSON ID round-trips through the JavaScript frontend
+without precision loss, while giving roughly :math:`2^{26.5}` (~95 million)
+distinct messages of birthday-collision headroom.
+"""
+
+_MESHCORE_ID_MASK = (1 << _MESHCORE_ID_BITS) - 1
+"""Bitmask applied to the SHA-256 prefix to clamp the id to 53 bits."""
+
+
+def _derive_message_id(
+    sender_identity: str,
+    sender_ts: int,
+    discriminator: str,
+    text: str,
+) -> int:
+    """Derive a stable 53-bit message ID from sender-side MeshCore fields.
+
+    MeshCore does not assign firmware-side packet IDs.  This function produces
+    a deterministic 53-bit integer fingerprint of a physical transmission so
+    that the same packet heard by multiple ingestors collapses to a single
+    ``messages`` row via the ``messages.id`` PRIMARY KEY upsert path.  Every
+    component of the fingerprint is sender-side, ensuring two receivers with
+    different clocks or roster state still compute the same value.
 
     Parameters:
-        sender_ts: Unix timestamp from the sender's clock.
-        discriminator: Channel index (``"c<N>"`` for channel messages) or
-            pubkey prefix (for direct messages) to separate messages with
-            the same timestamp.
-        text: Message text.
+        sender_identity: Stable sender identifier shared across receivers.
+            For channel messages this is the lowercased+stripped sender name
+            parsed from the message text via :func:`_parse_sender_name`; for
+            direct messages it is the sender's MeshCore ``pubkey_prefix``.
+            Must be a string (use ``""`` when unavailable).
+        sender_ts: Unix timestamp from the sender's clock (identical across
+            receivers regardless of receiver-side clock skew).
+        discriminator: Namespace tag separating message classes that could
+            otherwise collide.  ``"c<N>"`` is reserved for channel messages
+            on channel ``N``; ``"dm"`` is reserved for direct messages.
+        text: Message text exactly as transmitted by the sender.
 
     Returns:
-        A non-negative 32-bit integer suitable for the ``id`` column.
+        A non-negative 53-bit integer suitable for the ``id`` column.  The
+        value is bounded by ``0 <= id <= (1 << 53) - 1`` so it survives the
+        JSON → JavaScript number round-trip without precision loss.
     """
-    data = f"{sender_ts}:{discriminator}:{text}".encode("utf-8", errors="replace")
-    return int.from_bytes(hashlib.sha256(data).digest()[:4], "big")
+    # The ``v1:`` prefix lets us evolve the fingerprint format (e.g. add a
+    # channel-secret hash) by bumping to ``v2:`` without colliding with
+    # existing ids written under the v1 scheme.
+    fingerprint = f"v1:{sender_identity}:{sender_ts}:{discriminator}:{text}"
+    digest = hashlib.sha256(fingerprint.encode("utf-8", errors="replace")).digest()
+    return int.from_bytes(digest[:7], "big") & _MESHCORE_ID_MASK
 
 
 def _meshcore_node_id(public_key_hex: str | None) -> str | None:
@@ -904,8 +950,18 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
                     )
                     iface._synthetic_node_ids.add(mention_id)
 
+        # The dedup fingerprint uses the parsed sender name (lowercased and
+        # stripped) rather than ``from_id``: each ingestor independently
+        # resolves Alice to either her real ``!aabbccdd`` (when she is in its
+        # contact roster) or to a synthetic id derived from her name; the
+        # parsed name lives in the message text itself, so it is identical
+        # across all receivers regardless of roster state.
+        sender_identity = (sender_name or "").strip().lower()
+
         packet = {
-            "id": _derive_message_id(sender_ts, f"c{channel_idx}", text),
+            "id": _derive_message_id(
+                sender_identity, sender_ts, f"c{channel_idx}", text
+            ),
             "rxTime": rx_time,
             "rx_time": rx_time,
             "from_id": from_id,
@@ -941,8 +997,12 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
         pubkey_prefix = payload.get("pubkey_prefix", "")
         from_id = iface.lookup_node_id(pubkey_prefix)
 
+        # ``pubkey_prefix`` is already a sender-side stable identifier (the
+        # first six bytes of the sender's public key); ``"dm"`` namespaces
+        # direct messages so they cannot collide with channel messages that
+        # happen to share the other components.
         packet = {
-            "id": _derive_message_id(sender_ts, pubkey_prefix or "", text),
+            "id": _derive_message_id(pubkey_prefix or "", sender_ts, "dm", text),
             "rxTime": rx_time,
             "rx_time": rx_time,
             "from_id": from_id,
@@ -1013,6 +1073,46 @@ def _make_connection(target: str, baudrate: int) -> object:
         return TCPConnection(host, port)
 
     return SerialConnection(target, baudrate)
+
+
+def _log_unhandled_loop_exception(
+    loop: asyncio.AbstractEventLoop, context: dict
+) -> None:
+    """Route asyncio's "unhandled task exception" warnings through our logger.
+
+    The upstream ``meshcore`` library spawns detached
+    ``asyncio.create_task`` tasks for every inbound radio frame.  When one
+    of those tasks raises and nobody awaits the future, asyncio's default
+    handler writes ``Task exception was never retrieved`` to stderr.  That
+    bypasses our structured log pipeline and clutters container logs.
+    This handler preserves the same information under
+    ``context=asyncio.unhandled`` so operators grep for one place.
+
+    Parameters:
+        loop: Event loop that surfaced the exception (unused but required
+            by the asyncio handler signature).
+        context: Asyncio exception-context dictionary.  Fields we care
+            about: ``message`` (human summary) and ``exception`` (the raw
+            exception object, when available).
+    """
+    del loop
+    exception = context.get("exception")
+    task = context.get("task")
+    task_name = None
+    if task is not None:
+        # Prefer the friendly ``get_name()``; fall back to ``repr`` for any
+        # future Task-like object that does not implement it.
+        get_name = getattr(task, "get_name", None)
+        task_name = get_name() if callable(get_name) else repr(task)
+    config._debug_log(
+        context.get("message") or "Unhandled asyncio task exception",
+        context="asyncio.unhandled",
+        severity="error",
+        always=True,
+        error_class=type(exception).__name__ if exception else None,
+        error_message=str(exception) if exception else None,
+        task=task_name,
+    )
 
 
 async def _run_meshcore(
@@ -1209,6 +1309,12 @@ class MeshcoreProvider:
         def _run_loop() -> None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
+            # Second line of defence around issue #754: if a detached task
+            # inside the upstream ``meshcore`` library ever raises an
+            # exception we do not anticipate in ``_meshcore_patches``, funnel
+            # it through our logger instead of the default handler (which
+            # only writes ``Task exception was never retrieved`` to stderr).
+            loop.set_exception_handler(_log_unhandled_loop_exception)
             iface._loop = loop
             try:
                 loop.run_until_complete(
