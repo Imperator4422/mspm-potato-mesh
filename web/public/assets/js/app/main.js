@@ -118,6 +118,74 @@ import {
   protocolIconPrefixHtml,
 } from './protocol-helpers.js';
 
+// Pure helpers extracted into focused submodules under ``./main/``.  They
+// remain locally callable inside ``initializeApp`` because module-level
+// bindings are visible in every nested scope.
+import {
+  cssEscape,
+  fmtCoords,
+  fmtHw,
+  formatDate,
+  formatShortInfoUptime,
+  formatSnrDisplay,
+  formatTime,
+  pad,
+  parseNodeNumericRef,
+  pickFirstProperty,
+  pickNumericProperty,
+  resolveTimestampSeconds,
+  shortInfoValueOrDash,
+  timeAgo,
+  timeHum,
+  toFiniteNumber,
+} from './main/format-utils.js';
+import {
+  applyNodeNameFallback,
+  extractIdentifierFromHref,
+  getNodeDisplayNameForOverlay,
+  getNodeIdentifierFromLink,
+  shouldHandleNodeLongLink,
+} from './main/long-link-router.js';
+import {
+  buildTelemetryIndex,
+  mergePositionsIntoNodes,
+  mergeTelemetryIntoNodes,
+} from './main/data-merge.js';
+import { renderShortHtml } from './main/short-html-renderer.js';
+import {
+  NODE_LIMIT,
+  SNAPSHOT_LIMIT,
+  TRACE_LIMIT,
+  TRACE_MAX_AGE_SECONDS,
+} from './main/constants.js';
+import {
+  fetchNeighbors,
+  fetchNodeById,
+  fetchNodes,
+  fetchPositions,
+  fetchTelemetry,
+  fetchTraces,
+  filterRecentTraces,
+  resolveSnapshotLimit,
+  fetchMessages as fetchMessagesImpl,
+} from './main/data-fetchers.js';
+import {
+  compareNumber,
+  compareString,
+  hasNumberValue,
+  hasStringValue,
+} from './main/sort-comparators.js';
+import { makeRoleFilterKey, normalizeFilterProtocol } from './main/filter-helpers.js';
+import { tileToLat, tileToLon } from './main/tile-coords.js';
+import {
+  buildMeshcoreIconImg,
+  buildMeshtasticIconImg,
+  buildProtocolIconImg,
+} from './main/protocol-icons.js';
+import { buildNeighborTooltipHtml, buildTraceTooltipHtml } from './main/tooltip-html.js';
+import { createOfflineTileLayer as createOfflineTileLayerImpl } from './main/offline-tile-layer.js';
+import { getActiveFullscreenElement, legendClickHandler } from './main/fullscreen-helpers.js';
+
 /**
  * Entry point for the interactive dashboard. Wires up event listeners,
  * initializes the map, and triggers the first data refresh cycle.
@@ -248,10 +316,10 @@ export function initializeApp(config) {
   /** Whether the very first full fetch has completed. */
   let initialFetchDone = false;
 
-  const NODE_LIMIT = 2000;
-  const TRACE_LIMIT = 500;
-  const TRACE_MAX_AGE_SECONDS = 28 * 24 * 60 * 60;
-  const SNAPSHOT_LIMIT = SNAPSHOT_WINDOW;
+  // NODE_LIMIT, TRACE_LIMIT, TRACE_MAX_AGE_SECONDS, and SNAPSHOT_LIMIT are
+  // imported from ``./main/constants.js`` so the helpers extracted into
+  // ``./main/data-fetchers.js`` and ``./main/data-merge.js`` share the same
+  // values without re-declaring them here.
   const CHAT_LIMIT = MESSAGE_LIMIT;
   const CHAT_RECENT_WINDOW_SECONDS = 7 * 24 * 60 * 60;
   const REFRESH_MS = config.refreshMs;
@@ -318,68 +386,6 @@ export function initializeApp(config) {
     if (panel && typeof panel.scrollHeight === 'number' && typeof panel.scrollTop === 'number') {
       panel.scrollTop = panel.scrollHeight;
     }
-  }
-
-  /**
-   * Determine whether the provided value contains a non-empty string.
-   *
-   * @param {*} value Candidate value extracted from a node record.
-   * @returns {boolean} True when the value is a non-empty string.
-   */
-  function hasStringValue(value) {
-    if (value == null) return false;
-    return String(value).trim().length > 0;
-  }
-
-  /**
-   * Determine whether the provided value can be interpreted as a finite number.
-   *
-   * @param {*} value Candidate value extracted from a node record.
-   * @returns {boolean} True when the value parses to a finite number.
-   */
-  function hasNumberValue(value) {
-    if (value == null || value === '') return false;
-    const num = typeof value === 'number' ? value : Number(value);
-    return Number.isFinite(num);
-  }
-
-  /**
-   * Locale-aware comparator for string table values.
-   *
-   * @param {*} a First value.
-   * @param {*} b Second value.
-   * @returns {number} Comparator result compatible with ``Array.prototype.sort``.
-   */
-  function compareString(a, b) {
-    const strA = (a == null ? '' : String(a)).trim();
-    const strB = (b == null ? '' : String(b)).trim();
-    const hasA = strA.length > 0;
-    const hasB = strB.length > 0;
-    if (!hasA && !hasB) return 0;
-    if (!hasA) return 1;
-    if (!hasB) return -1;
-    return strA.localeCompare(strB, undefined, { numeric: true, sensitivity: 'base' });
-  }
-
-  /**
-   * Comparator for numeric table values that tolerates string inputs.
-   *
-   * @param {*} a First value.
-   * @param {*} b Second value.
-   * @returns {number} Comparator result for ``Array.prototype.sort``.
-   */
-  function compareNumber(a, b) {
-    const numA = typeof a === 'number' ? a : Number(a);
-    const numB = typeof b === 'number' ? b : Number(b);
-    const validA = Number.isFinite(numA);
-    const validB = Number.isFinite(numB);
-    if (validA && validB) {
-      if (numA === numB) return 0;
-      return numA < numB ? -1 : 1;
-    }
-    if (validA) return -1;
-    if (validB) return 1;
-    return 0;
   }
 
   /**
@@ -509,6 +515,15 @@ export function initializeApp(config) {
   const INITIAL_VIEW_PADDING_PX = 12;
   const AUTO_FIT_PADDING_PX = 12;
   const MAX_INITIAL_ZOOM = 13;
+  // Below this zoom level the co-located spider feature is disabled
+  // entirely: markers stack at their shared coordinate (no fan, no leader
+  // lines, no hub badge).  At or above it, multi-node groups collapse into
+  // a single hub badge that the user can click to expand into the spider.
+  // Intentionally aligned with ``MAX_INITIAL_ZOOM`` above so the auto-fit
+  // initial view (which clamps at zoom 13) lands directly on the bucket
+  // boundary and users see the hub representation as soon as the map is
+  // ready rather than after their first zoom-in interaction.
+  const COLOCATED_HUB_MIN_ZOOM = 13;
   let neighborLinesLayer = null;
   let traceLinesLayer = null;
   let neighborLinesVisible = true;
@@ -527,6 +542,27 @@ export function initializeApp(config) {
   // into a single refresh; reset to ``null`` once the scheduled callback
   // runs so the next frame can schedule again.
   let pendingSpiderRefreshHandle = null;
+  // Leaflet layer that holds the small "asterisk + count" hub badges that
+  // collapse co-located groups at zoom levels at or above
+  // ``COLOCATED_HUB_MIN_ZOOM``.  Initialised alongside the other map layers
+  // and cleared on every render before being re-populated.
+  let colocatedHubsLayer = null;
+  // Bucket keys (as returned by ``computeColocatedOffsets``) for groups the
+  // user has explicitly clicked open.  Hubs whose key is in the set render
+  // their members fanned out + leader lines; absent keys render the hub
+  // alone.  Cleared whenever the map crosses the zoom threshold so the
+  // collapsed default is restored when the visual context changes.
+  let expandedColocatedKeys = new Set();
+  // Tracks whether the most recent render was below or at/above the zoom
+  // threshold so the ``zoomend`` handler can detect threshold crossings and
+  // trigger a re-render that swaps the hub representation in or out.
+  let lastRenderedZoomBucket = null;
+  // Cache of divIcon instances keyed by group size.  Building an icon for
+  // every multi-node group on every render is expensive at scale (hundreds
+  // of nodes can produce dozens of hubs); since the icon's html only varies
+  // by groupSize we share a single instance across same-size groups and
+  // across renders.  See ``getColocatedHubIcon`` for the lookup.
+  const colocatedHubIconCache = new Map();
   let tileDomObserver = null;
   const fullscreenChangeEvents = [
     'fullscreenchange',
@@ -612,21 +648,6 @@ export function initializeApp(config) {
       typeof fullscreenContainer.requestFullscreen === 'function' ||
       typeof fullscreenContainer.webkitRequestFullscreen === 'function' ||
       typeof fullscreenContainer.msRequestFullscreen === 'function'
-    );
-  }
-
-  /**
-   * Resolve the element currently being displayed in fullscreen mode.
-   *
-   * @returns {Element|null} Active fullscreen element if any.
-   */
-  function getActiveFullscreenElement() {
-    if (typeof document === 'undefined') return null;
-    return (
-      document.fullscreenElement ||
-      document.webkitFullscreenElement ||
-      document.msFullscreenElement ||
-      null
     );
   }
 
@@ -826,13 +847,6 @@ export function initializeApp(config) {
    * @param {function(Event): void} fn Handler body.
    * @returns {function(Event): void} Full click listener.
    */
-  function legendClickHandler(fn) {
-    return (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      fn(event);
-    };
-  }
 
   /**
    * Canonical protocol token for use in compound filter keys.
@@ -843,28 +857,6 @@ export function initializeApp(config) {
    * @param {string|null|undefined} protocol Raw protocol value.
    * @returns {'meshtastic'|'meshcore'} Normalised protocol token.
    */
-  function normalizeFilterProtocol(protocol) {
-    return isMeshcoreProtocol(protocol) ? 'meshcore' : 'meshtastic';
-  }
-
-  /**
-   * Build a compound filter key that encodes both protocol and role.
-   *
-   * Using compound keys avoids collisions between role names that appear in
-   * both Meshtastic and MeshCore (e.g. ``SENSOR``, ``REPEATER``).  The filter
-   * set stores these keys so that clicking the MeshCore SENSOR button only
-   * includes MeshCore SENSOR nodes, not Meshtastic ones.
-   *
-   * @param {*} role Raw role value from the API.
-   * @param {string|null|undefined} protocol Protocol string from the API.
-   * @returns {string} Compound key in the form ``"<protocol>:<roleKey>"``.
-   */
-  function makeRoleFilterKey(role, protocol) {
-    return `${normalizeFilterProtocol(protocol)}:${getRoleKey(role)}`;
-  }
-
-
-
   /**
    * Lazily create the floating map status element used for progress messages.
    *
@@ -1026,132 +1018,21 @@ export function initializeApp(config) {
   }
 
   /**
-   * Convert a tile X coordinate to longitude degrees.
+   * Closure-bound dependency-injection bridge to
+   * ``createOfflineTileLayerImpl``.  The implementation in
+   * ``./main/offline-tile-layer.js`` is dependency-free so it can be unit
+   * tested standalone; this shim feeds it the Leaflet global from
+   * ``initializeApp``'s closure.  **Do not inline** — keeping the wrapper
+   * preserves Leaflet-as-parameter so tests can pass a fake.
    *
-   * @param {number} x Tile X index.
-   * @param {number} z Zoom level.
-   * @returns {number} Longitude in degrees.
-   */
-  function tileToLon(x, z) {
-    return (x / Math.pow(2, z)) * 360 - 180;
-  }
-
-  /**
-   * Convert a tile Y coordinate to latitude degrees.
+   * Returns ``null`` when Leaflet is absent to preserve the original
+   * semantics.
    *
-   * @param {number} y Tile Y index.
-   * @param {number} z Zoom level.
-   * @returns {number} Latitude in degrees.
-   */
-  function tileToLat(y, z) {
-    const n = Math.PI - (2 * Math.PI * y) / Math.pow(2, z);
-    return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
-  }
-
-  /**
-   * Create a minimal Leaflet tile layer that renders offline tiles from cache.
-   *
-   * @returns {L.GridLayer} Configured tile layer instance.
+   * @returns {Object|null} Configured Leaflet ``GridLayer`` or ``null``.
    */
   function createOfflineTileLayer() {
     if (!hasLeaflet) return null;
-    const offlineLayer = L.gridLayer({ className: 'map-tiles map-tiles-offline' });
-    /** @type {HTMLElement|null} */
-    let cachedOfflineFallbackTile = null;
-
-    /**
-     * Provide a minimal placeholder tile when canvas rendering is not available.
-     *
-     * @param {number} size Pixel width and height of the tile.
-     * @returns {HTMLElement} Cloned fallback element ready for Leaflet consumption.
-     */
-    function getOfflineFallbackTile(size) {
-      if (!cachedOfflineFallbackTile) {
-        const placeholder = document.createElement('div');
-        placeholder.className = 'offline-tile-fallback';
-        placeholder.style.width = `${size}px`;
-        placeholder.style.height = `${size}px`;
-        placeholder.style.backgroundColor = 'rgba(33, 66, 110, 0.92)';
-        placeholder.style.display = 'flex';
-        placeholder.style.alignItems = 'center';
-        placeholder.style.justifyContent = 'center';
-        placeholder.style.color = 'rgba(255, 255, 255, 0.6)';
-        placeholder.style.font = 'bold 14px system-ui, sans-serif';
-        placeholder.style.textTransform = 'uppercase';
-        placeholder.textContent = 'Offline tile';
-        cachedOfflineFallbackTile = placeholder;
-      }
-      return /** @type {HTMLElement} */ (cachedOfflineFallbackTile.cloneNode(true));
-    }
-
-    /**
-     * Render a placeholder tile for offline map usage.
-     *
-     * @param {{x: number, y: number, z: number}} coords Tile coordinates supplied by Leaflet.
-     * @returns {HTMLElement} Tile node containing placeholder artwork.
-     */
-    offlineLayer.createTile = coords => {
-      const size = 256;
-      const canvas = document.createElement('canvas');
-      canvas.width = size;
-      canvas.height = size;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        console.warn('Canvas 2D context unavailable for offline tile rendering. Using fallback placeholder.');
-        return getOfflineFallbackTile(size);
-      }
-      try {
-        const gradient = ctx.createLinearGradient(0, 0, size, size);
-        gradient.addColorStop(0, 'rgba(33, 66, 110, 0.92)');
-        gradient.addColorStop(1, 'rgba(64, 98, 144, 0.92)');
-        ctx.fillStyle = gradient;
-        ctx.fillRect(0, 0, size, size);
-
-        ctx.strokeStyle = 'rgba(255,255,255,0.12)';
-        ctx.lineWidth = 1;
-        const steps = 4;
-        for (let i = 1; i < steps; i++) {
-          const pos = (size / steps) * i;
-          ctx.beginPath();
-          ctx.moveTo(pos, 0);
-          ctx.lineTo(pos, size);
-          ctx.stroke();
-          ctx.beginPath();
-          ctx.moveTo(0, pos);
-          ctx.lineTo(size, pos);
-          ctx.stroke();
-        }
-
-        const west = tileToLon(coords.x, coords.z);
-        const east = tileToLon(coords.x + 1, coords.z);
-        const north = tileToLat(coords.y, coords.z);
-        const south = tileToLat(coords.y + 1, coords.z);
-
-        ctx.fillStyle = 'rgba(255,255,255,0.7)';
-        ctx.font = '12px system-ui, sans-serif';
-        ctx.textBaseline = 'top';
-        ctx.fillText(`${west.toFixed(1)}°`, 8, 8);
-        ctx.textBaseline = 'bottom';
-        ctx.fillText(`${east.toFixed(1)}°`, 8, size - 8);
-        ctx.textAlign = 'right';
-        ctx.textBaseline = 'top';
-        ctx.fillText(`${north.toFixed(1)}°`, size - 8, 8);
-        ctx.textBaseline = 'bottom';
-        ctx.fillText(`${south.toFixed(1)}°`, size - 8, size - 8);
-
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = 'rgba(255,255,255,0.35)';
-        ctx.font = 'bold 22px system-ui, sans-serif';
-        ctx.fillText('PotatoMesh offline basemap', size / 2, size / 2);
-
-        return canvas;
-      } catch (error) {
-        console.error('Failed to render offline tile. Falling back to placeholder element.', error);
-        return getOfflineFallbackTile(size);
-      }
-    };
-    return offlineLayer;
+    return createOfflineTileLayerImpl(L);
   }
 
   /**
@@ -1332,6 +1213,10 @@ export function initializeApp(config) {
     // but never sit on top of the marker glyphs themselves.
     spiderLinesLayer = L.layerGroup().addTo(map);
     markersLayer = L.layerGroup().addTo(map);
+    // Hub badges render on top of the marker glyphs so the click target is
+    // always reachable, even when a stale marker happens to share the exact
+    // pixel coordinate of the hub centre.
+    colocatedHubsLayer = L.layerGroup().addTo(map);
 
     // Pixel-space offsets are baked into a LatLng at render time, so the
     // on-screen spread would otherwise scale with zoom — at extreme zoom-outs
@@ -1341,9 +1226,11 @@ export function initializeApp(config) {
     // through `requestAnimationFrame` to coalesce redundant updates into a
     // single redraw per frame; `zoomend` snaps to the final position; and
     // `viewreset` covers projection resets such as resize / fullscreen /
-    // dateline wrap.
+    // dateline wrap.  ``zoomend`` additionally watches for crossings of
+    // ``COLOCATED_HUB_MIN_ZOOM`` and re-runs ``applyFilter`` so the marker
+    // representation switches between flat / hub modes.
     map.on('zoom', scheduleColocatedSpiderRefresh);
-    map.on('zoomend', refreshColocatedSpiderState);
+    map.on('zoomend', handleZoomEndForColocatedHubs);
     map.on('viewreset', refreshColocatedSpiderState);
 
     if (typeof navigator !== 'undefined' && navigator && navigator.onLine === false) {
@@ -1425,29 +1312,6 @@ export function initializeApp(config) {
    * @param {string} variantClass BEM modifier class, e.g. ``protocol-icon--meshtastic``.
    * @returns {HTMLImageElement} Icon element ready to append.
    */
-  function buildProtocolIconImg(src, variantClass) {
-    const img = document.createElement('img');
-    img.setAttribute('src', src);
-    img.setAttribute('alt', '');
-    img.setAttribute('width', '12');
-    img.setAttribute('height', '12');
-    img.setAttribute('aria-hidden', 'true');
-    img.setAttribute('loading', 'lazy');
-    img.setAttribute('decoding', 'async');
-    img.className = `protocol-icon ${variantClass}`;
-    return img;
-  }
-
-  /** @returns {HTMLImageElement} Meshtastic protocol icon element. */
-  function buildMeshtasticIconImg() {
-    return buildProtocolIconImg(MESHTASTIC_ICON_SRC, 'protocol-icon--meshtastic');
-  }
-
-  /** @returns {HTMLImageElement} MeshCore protocol icon element. */
-  function buildMeshcoreIconImg() {
-    return buildProtocolIconImg(MESHCORE_ICON_SRC, 'protocol-icon--meshcore');
-  }
-
   function updateNeighborLinesToggleState() {
     if (!neighborLinesToggleButton) return;
     const label = neighborLinesVisible ? 'Hide neighbor lines' : 'Show neighbor lines';
@@ -1873,67 +1737,8 @@ export function initializeApp(config) {
   });
 
   // --- Helpers ---
-  /**
-   * Render a short name badge with role-based styling.
-   *
-   * @param {string} short Short node identifier.
-   * @param {string} role Node role string.
-   * @param {string} longName Full node name.
-   * @param {?Object} nodeData Optional node metadata attached to the badge.
-   * @returns {string} HTML snippet describing the badge.
-   */
-  function renderShortHtml(short, role, longName, nodeData = null) {
-    const safeTitle = longName ? escapeHtml(String(longName)) : '';
-    const titleAttr = safeTitle ? ` title="${safeTitle}"` : '';
-    const roleValue = normalizeRole(role != null && role !== '' ? role : (nodeData && nodeData.role));
-    let infoAttr = '';
-      if (nodeData && typeof nodeData === 'object') {
-        const info = {
-          nodeId: nodeData.node_id ?? nodeData.nodeId ?? '',
-          nodeNum: nodeData.num ?? nodeData.node_num ?? nodeData.nodeNum ?? null,
-          shortName: short != null ? String(short) : (nodeData.short_name ?? ''),
-          longName: nodeData.long_name ?? longName ?? '',
-          role: roleValue,
-          hwModel: nodeData.hw_model ?? nodeData.hwModel ?? '',
-          telemetryTime: nodeData.telemetry_time ?? nodeData.telemetryTime ?? null,
-        };
-        Object.assign(info, collectTelemetryMetrics(nodeData));
-      const attrParts = [` data-node-info="${escapeHtml(JSON.stringify(info))}"`];
-      const attrNodeIdRaw = info.nodeId != null ? String(info.nodeId).trim() : '';
-      if (attrNodeIdRaw) {
-        attrParts.push(` data-node-id="${escapeHtml(attrNodeIdRaw)}"`);
-      }
-      const attrNodeNum = Number(info.nodeNum);
-      if (Number.isFinite(attrNodeNum)) {
-        attrParts.push(` data-node-num="${escapeHtml(String(attrNodeNum))}"`);
-      }
-      infoAttr = attrParts.join('');
-    }
-    if (!short) {
-      return `<span class="short-name" style="background:#ccc"${titleAttr}${infoAttr}>&nbsp;?&nbsp;</span>`;
-    }
-    // Pad the label for the badge.  For plain-ASCII names that are already
-    // 4 characters (meshtastic always stores exactly 4) no padding is added.
-    // Shorter names or names containing emoji/non-ASCII get a single space
-    // on each side — grapheme width varies too much for character-count
-    // centering to work reliably.
-    const raw = String(short);
-    const graphemeCount = typeof Intl !== 'undefined' && Intl.Segmenter
-      ? [...new Intl.Segmenter().segment(raw)].length
-      : raw.length;
-    let centred;
-    if (graphemeCount >= 4) {
-      centred = raw;
-    } else {
-      centred = ` ${raw} `;
-    }
-    const padded = escapeHtml(centred).replace(/ /g, '&nbsp;');
-    const protocol = nodeData?.protocol ?? null;
-    const color = getRoleColor(roleValue, protocol);
-    const textColor = getRoleTextColor(roleValue, protocol);
-    const styleAttr = textColor ? `background:${color};color:${textColor}` : `background:${color}`;
-    return `<span class="short-name" style="${styleAttr}"${titleAttr}${infoAttr}>${padded}</span>`;
-  }
+  // ``renderShortHtml`` is imported from ``./main/short-html-renderer.js`` —
+  // see the module-level imports near the top of this file.
 
   const potatoMeshNamespace = globalThis.PotatoMesh || (globalThis.PotatoMesh = {});
   potatoMeshNamespace.renderShortHtml = renderShortHtml;
@@ -1948,47 +1753,6 @@ export function initializeApp(config) {
    * @param {string} value Raw selector fragment.
    * @returns {string} Escaped selector fragment safe for interpolation.
    */
-  function cssEscape(value) {
-    if (typeof value !== 'string' || value.length === 0) {
-      return '';
-    }
-    if (typeof window !== 'undefined' && window.CSS && typeof window.CSS.escape === 'function') {
-      return window.CSS.escape(value);
-    }
-    return value.replace(/[^a-zA-Z0-9_-]/g, chr => `\\${chr}`);
-  }
-
-  /**
-   * Parse a node identifier or numeric reference into a finite number.
-   *
-   * @param {*} ref Identifier or numeric reference.
-   * @returns {number|null} Parsed number or ``null``.
-   */
-  function parseNodeNumericRef(ref) {
-    if (ref == null) return null;
-    if (typeof ref === 'number') {
-      return Number.isFinite(ref) ? ref : null;
-    }
-    if (typeof ref === 'string') {
-      const trimmed = ref.trim();
-      if (!trimmed) return null;
-      if (trimmed.startsWith('!')) {
-        const hex = trimmed.slice(1);
-        if (!/^[0-9A-Fa-f]+$/.test(hex)) return null;
-        const parsedHex = Number.parseInt(hex, 16);
-        return Number.isFinite(parsedHex) ? parsedHex >>> 0 : null;
-      }
-      if (/^0[xX][0-9A-Fa-f]+$/.test(trimmed)) {
-        const parsedHex = Number.parseInt(trimmed, 16);
-        return Number.isFinite(parsedHex) ? parsedHex >>> 0 : null;
-      }
-      const parsed = Number(trimmed);
-      return Number.isFinite(parsed) ? parsed : null;
-    }
-    const parsed = Number(ref);
-    return Number.isFinite(parsed) ? parsed : null;
-  }
-
   /**
    * Populate the ``nodesById`` index for quick lookups.
    *
@@ -2163,29 +1927,6 @@ export function initializeApp(config) {
     }
 
     return lines.join('<br/>');
-  }
-
-  /**
-   * Format uptime values for the short-info overlay.
-   *
-   * @param {*} value Raw uptime value.
-   * @returns {string} Human readable uptime string.
-   */
-  function formatShortInfoUptime(value) {
-    if (value == null || value === '') return '';
-    const num = Number(value);
-    if (!Number.isFinite(num)) return '';
-    return num === 0 ? '0s' : timeHum(num);
-  }
-
-  /**
-   * Format overlay values with an em dash fallback when blank.
-   *
-   * @param {*} value Candidate value.
-   * @returns {string} Formatted value or em dash.
-   */
-  function shortInfoValueOrDash(value) {
-    return value != null && value !== '' ? String(value) : '—';
   }
 
   /**
@@ -2739,60 +2480,6 @@ export function initializeApp(config) {
   }
 
   /**
-   * Build tooltip HTML showing styled short-name badges for a trace path.
-   *
-   * @param {Array<Object>} pathNodes Ordered node payloads along the trace.
-   * @returns {string} HTML fragment or ``''`` when unavailable.
-   */
-  function buildTraceTooltipHtml(pathNodes) {
-    if (!Array.isArray(pathNodes) || pathNodes.length < 2) {
-      return '';
-    }
-    const parts = pathNodes
-      .map(node => {
-        if (!node || typeof node !== 'object') {
-          return null;
-        }
-        const short = normalizeNodeNameValue(node.short_name ?? node.shortName) || (typeof node.node_id === 'string' ? node.node_id : '');
-        const long = normalizeNodeNameValue(node.long_name ?? node.longName) || '';
-        return renderShortHtml(short, node.role, long, node);
-      })
-      .filter(Boolean);
-    if (!parts.length) return '';
-    const arrow = '<span class="trace-tooltip__arrow" aria-hidden="true">→</span>';
-    return `<div class="trace-tooltip__content">${parts.join(arrow)}</div>`;
-  }
-
-  /**
-   * Build tooltip HTML for a neighbor segment showing styled short-name badges.
-   *
-   * @param {{sourceNode?: Object, targetNode?: Object, sourceShortName?: string, targetShortName?: string, sourceRole?: string, targetRole?: string}} segment Neighbor segment descriptor.
-   * @returns {string} HTML fragment or ``''`` when unavailable.
-   */
-  function buildNeighborTooltipHtml(segment) {
-    if (!segment) return '';
-    const sourceNode = segment.sourceNode || null;
-    const targetNode = segment.targetNode || null;
-    const sourceShort = normalizeNodeNameValue(
-      segment.sourceShortName ||
-      (sourceNode ? sourceNode.short_name ?? sourceNode.shortName : null) ||
-      (sourceNode && typeof sourceNode.node_id === 'string' ? sourceNode.node_id : '')
-    );
-    const targetShort = normalizeNodeNameValue(
-      segment.targetShortName ||
-      (targetNode ? targetNode.short_name ?? targetNode.shortName : null) ||
-      (targetNode && typeof targetNode.node_id === 'string' ? targetNode.node_id : '')
-    );
-    if (!sourceShort || !targetShort) return '';
-    const sourceLong = normalizeNodeNameValue(sourceNode?.long_name ?? sourceNode?.longName) || '';
-    const targetLong = normalizeNodeNameValue(targetNode?.long_name ?? targetNode?.longName) || '';
-    const sourceHtml = renderShortHtml(sourceShort, segment.sourceRole, sourceLong, sourceNode || {});
-    const targetHtml = renderShortHtml(targetShort, segment.targetRole, targetLong, targetNode || {});
-    const arrow = '<span class="trace-tooltip__arrow" aria-hidden="true">→</span>';
-    return `<div class="trace-tooltip__content">${sourceHtml}${arrow}${targetHtml}</div>`;
-  }
-
-  /**
    * Resolve a node reference for a trace hop using cached node indices.
    *
    * @param {{id?: string, num?: number}|null} hop Trace hop descriptor.
@@ -2914,62 +2601,6 @@ export function initializeApp(config) {
     for (const num of numCandidates) {
       if (Number.isFinite(num) && nodesByNum.has(num)) {
         return nodesByNum.get(num);
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Retrieve the first present property value from a collection of objects.
-   *
-   * @param {Array<Object>} sources Candidate objects.
-   * @param {Array<string>} keys Ordered property names to inspect.
-   * @returns {*} First present non-blank value or ``null`` when absent.
-   */
-  function pickFirstProperty(sources, keys) {
-    if (!Array.isArray(sources) || !Array.isArray(keys)) {
-      return null;
-    }
-    for (const source of sources) {
-      if (!source || typeof source !== 'object') continue;
-      for (const key of keys) {
-        if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
-        const value = source[key];
-        if (value == null) continue;
-        if (typeof value === 'string') {
-          const trimmed = value.trim();
-          if (trimmed.length === 0) {
-            continue;
-          }
-          return trimmed;
-        }
-        return value;
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Retrieve the first finite numeric property from candidate objects.
-   *
-   * @param {Array<Object>} sources Candidate objects.
-   * @param {Array<string>} keys Ordered property names to inspect.
-   * @returns {?number} First finite number when available.
-   */
-  function pickNumericProperty(sources, keys) {
-    if (!Array.isArray(sources) || !Array.isArray(keys)) {
-      return null;
-    }
-    for (const source of sources) {
-      if (!source || typeof source !== 'object') continue;
-      for (const key of keys) {
-        if (!Object.prototype.hasOwnProperty.call(source, key)) continue;
-        const raw = source[key];
-        if (raw == null || raw === '') continue;
-        const num = typeof raw === 'number' ? raw : Number(raw);
-        if (Number.isFinite(num)) {
-          return num;
-        }
       }
     }
     return null;
@@ -3363,545 +2994,24 @@ export function initializeApp(config) {
   }
 
   /**
-   * Pad a numeric value with leading zeros.
+   * Closure-bound dependency-injection bridge to ``fetchMessagesImpl``.  The
+   * implementation in ``./main/data-fetchers.js`` is dependency-free so it
+   * can be unit tested standalone; this shim feeds it the dashboard's
+   * ``CHAT_ENABLED`` flag and ``normaliseMessageLimit`` from
+   * ``initializeApp``'s closure.  **Do not inline** — keeping the wrapper
+   * preserves the chat-enabled and limit-normalisation flags as injected
+   * dependencies so the underlying fetcher remains pure.
    *
-   * @param {number} n Numeric value.
-   * @returns {string} Padded string.
-   */
-  function pad(n) { return String(n).padStart(2, "0"); }
-
-  /**
-   * Format a ``Date`` object as ``HH:MM``.
-   *
-   * @param {Date} d Date instance.
-   * @returns {string} Time string.
-   */
-  function formatTime(d) {
-    return pad(d.getHours()) + ":" +
-          pad(d.getMinutes()) + ":" +
-          pad(d.getSeconds());
-  }
-
-  /**
-   * Format a ``Date`` object as ``YYYY-MM-DD``.
-   *
-   * @param {Date} d Date instance.
-   * @returns {string} Date string.
-   */
-  function formatDate(d) {
-    return d.getFullYear() + "-" +
-          pad(d.getMonth() + 1) + "-" +
-          pad(d.getDate());
-  }
-
-  /**
-   * Format hardware model strings for display.
-   *
-   * @param {*} v Raw hardware model value.
-   * @returns {string} Sanitised string.
-   */
-  function fmtHw(v) {
-    return v && v !== "UNSET" ? String(v) : "";
-  }
-
-  /**
-   * Format coordinate values with a configurable precision.
-   *
-   * @param {*} v Raw coordinate value.
-   * @param {number} [d=5] Decimal precision.
-   * @returns {string} Formatted coordinate string.
-   */
-  function fmtCoords(v, d = 5) {
-    if (v == null || v === '') return "";
-    const n = Number(v);
-    return Number.isFinite(n) ? n.toFixed(d) : "";
-  }
-
-  /**
-   * Format SNR readings with a ``dB`` suffix.
-   *
-   * @param {*} value Raw SNR value.
-   * @returns {string} Formatted SNR string.
-   */
-  function formatSnrDisplay(value) {
-    if (value == null || value === '') return '';
-    const n = Number(value);
-    if (!Number.isFinite(n)) return '';
-    return `${n.toFixed(1)} dB`;
-  }
-
-  /**
-   * Determine whether a long name link should trigger the overlay behaviour.
-   *
-   * @param {?Element} link Anchor element.
-   * @returns {boolean} ``true`` when the link participates in overlays.
-   */
-  function shouldHandleNodeLongLink(link) {
-    if (!link || !link.dataset) return false;
-    if ('nodeDetailLink' in link.dataset && link.dataset.nodeDetailLink === 'false') {
-      return false;
-    }
-    return true;
-  }
-
-  /**
-   * Extract the canonical node identifier from the provided link element.
-   *
-   * @param {?Element} link Anchor element.
-   * @returns {string} Canonical node identifier or ``''`` when unavailable.
-   */
-  function getNodeIdentifierFromLink(link) {
-    if (!link) return '';
-    const datasetIdentifier = link.dataset && typeof link.dataset.nodeId === 'string'
-      ? canonicalNodeIdentifier(link.dataset.nodeId)
-      : null;
-    if (datasetIdentifier) {
-      return datasetIdentifier;
-    }
-    if (typeof link.getAttribute === 'function') {
-      const attrHref = link.getAttribute('href');
-      const canonicalFromAttr = extractIdentifierFromHref(attrHref);
-      if (canonicalFromAttr) {
-        return canonicalFromAttr;
-      }
-    }
-    if (typeof link.href === 'string') {
-      const canonicalFromProperty = extractIdentifierFromHref(link.href);
-      if (canonicalFromProperty) {
-        return canonicalFromProperty;
-      }
-    }
-    return '';
-  }
-
-  /**
-   * Extract the canonical identifier from a node detail hyperlink.
-   *
-   * @param {string} href Link href attribute.
-   * @returns {string} Canonical identifier or ``''``.
-   */
-  function extractIdentifierFromHref(href) {
-    if (typeof href !== 'string' || href.length === 0) {
-      return '';
-    }
-    const match = href.match(/\/nodes\/(![^/?#]+)/i);
-    if (!match || !match[1]) {
-      return '';
-    }
-    try {
-      const decoded = decodeURIComponent(match[1]);
-      return canonicalNodeIdentifier(decoded) ?? '';
-    } catch {
-      return canonicalNodeIdentifier(match[1]) ?? '';
-    }
-  }
-
-  /**
-   * Determine the preferred display name for overlay content.
-   *
-   * @param {Object} node Node payload.
-   * @returns {string} Friendly display name.
-   */
-  function getNodeDisplayNameForOverlay(node) {
-    if (!node || typeof node !== 'object') return '';
-    return (
-      normalizeNodeNameValue(node.long_name ?? node.longName) ||
-      normalizeNodeNameValue(node.short_name ?? node.shortName) ||
-      (typeof node.node_id === 'string' ? node.node_id : '')
-    );
-  }
-
-  /**
-   * Populate missing node name fields with sensible defaults.
-   *
-   * @param {Object} node Node payload.
-   * @returns {Object} Updated node reference.
-   */
-  function applyNodeNameFallback(node) {
-    if (!node || typeof node !== 'object') return;
-    const short = normalizeNodeNameValue(node.short_name ?? node.shortName);
-    const long = normalizeNodeNameValue(node.long_name ?? node.longName);
-    if (short || long) return;
-    const nodeId = normalizeNodeNameValue(node.node_id ?? node.nodeId);
-    if (!nodeId) return;
-    const fallbackShort = nodeId.slice(-4);
-    const fallbackLong = `Meshtastic ${nodeId}`;
-    node.short_name = fallbackShort;
-    node.long_name = fallbackLong;
-    if ('shortName' in node) node.shortName = fallbackShort;
-    if ('longName' in node) node.longName = fallbackLong;
-  }
-
-  /**
-   * Convert a duration in seconds into a human readable string.
-   *
-   * @param {number} unixSec Duration in seconds.
-   * @returns {string} Human readable representation.
-   */
-  function timeHum(unixSec) {
-    if (!unixSec) return "";
-    if (unixSec < 0) return "0s";
-    if (unixSec < 60) return `${unixSec}s`;
-    if (unixSec < 3600) return `${Math.floor(unixSec/60)}m ${Math.floor((unixSec%60))}s`;
-    if (unixSec < 86400) return `${Math.floor(unixSec/3600)}h ${Math.floor((unixSec%3600)/60)}m`;
-    return `${Math.floor(unixSec/86400)}d ${Math.floor((unixSec%86400)/3600)}h`;
-  }
-
-  /**
-   * Return a relative time string describing how long ago an event occurred.
-   *
-   * @param {number} unixSec Timestamp in seconds.
-   * @param {number} [nowSec] Reference timestamp.
-   * @returns {string} Human readable relative time.
-   */
-  function timeAgo(unixSec, nowSec = Date.now()/1000) {
-    if (!unixSec) return "";
-    const diff = Math.floor(nowSec - Number(unixSec));
-    if (diff < 0) return "0s";
-    if (diff < 60) return `${diff}s`;
-    if (diff < 3600) return `${Math.floor(diff/60)}m ${Math.floor((diff%60))}s`;
-    if (diff < 86400) return `${Math.floor(diff/3600)}h ${Math.floor((diff%3600)/60)}m`;
-    return `${Math.floor(diff/86400)}d ${Math.floor((diff%86400)/3600)}h`;
-  }
-
-  /**
-   * Determine how many snapshots should be requested from the API to build a
-   * richer aggregate.
-   *
-   * @param {number} requestedLimit Desired number of unique entities.
-   * @param {number} [maxLimit=NODE_LIMIT] Maximum rows accepted by the API.
-   * @returns {number} Effective request limit honouring {@link SNAPSHOT_LIMIT}.
-   */
-  function resolveSnapshotLimit(requestedLimit, maxLimit = NODE_LIMIT) {
-    const base = Number.isFinite(requestedLimit) && requestedLimit > 0
-      ? Math.floor(requestedLimit)
-      : maxLimit;
-    const expanded = base * SNAPSHOT_LIMIT;
-    const candidate = expanded > base ? expanded : base;
-    return Math.min(candidate, maxLimit);
-  }
-
-  /**
-   * Fetch the latest nodes from the JSON API.
-   *
-   * @param {number} [limit=NODE_LIMIT] Maximum number of records.
-   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
-   * @returns {Promise<Array<Object>>} Parsed node payloads.
-   */
-  async function fetchNodes(limit = NODE_LIMIT, since = 0) {
-    const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    let url = `/api/nodes?limit=${effectiveLimit}`;
-    if (since > 0) url += `&since=${since}`;
-    const r = await fetch(url, { cache: 'default' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }
-
-  /**
-   * Retrieve a single node record by identifier from the API.
-   *
-   * @param {string} nodeId Canonical node identifier.
-   * @returns {Promise<Object|null>} Parsed node payload or null when absent.
-   */
-  async function fetchNodeById(nodeId) {
-    if (typeof nodeId !== 'string') return null;
-    const trimmed = nodeId.trim();
-    if (trimmed.length === 0) return null;
-    const r = await fetch(`/api/nodes/${encodeURIComponent(trimmed)}`, { cache: 'default' });
-    if (r.status === 404) return null;
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }
-
-  /**
-   * Fetch recent messages from the JSON API.
-   *
-   * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
+   * @param {number} [limit=MESSAGE_LIMIT] Requested limit.
    * @param {{ encrypted?: boolean, since?: number }} [options] Optional retrieval flags.
-   * @returns {Promise<Array<Object>>} Parsed message payloads.
+   * @returns {Promise<Array<Object>>} Message payloads.
    */
-  async function fetchMessages(limit = MESSAGE_LIMIT, options = {}) {
-    if (!CHAT_ENABLED) return [];
-    const safeLimit = normaliseMessageLimit(limit);
-    const params = new URLSearchParams({ limit: String(safeLimit) });
-    if (options && options.encrypted) {
-      params.set('encrypted', 'true');
-    }
-    if (options && options.since > 0) {
-      params.set('since', String(options.since));
-    }
-    const query = params.toString();
-    const r = await fetch(`/api/messages?${query}`, { cache: 'default' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }
-
-  /**
-   * Fetch neighbour information from the JSON API.
-   *
-   * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
-   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
-   * @returns {Promise<Array<Object>>} Parsed neighbour payloads.
-   */
-  async function fetchNeighbors(limit = NODE_LIMIT, since = 0) {
-    const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    let url = `/api/neighbors?limit=${effectiveLimit}`;
-    if (since > 0) url += `&since=${since}`;
-    const r = await fetch(url, { cache: 'default' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }
-
-  /**
-   * Fetch traceroute observations from the JSON API.
-   *
-   * @param {number} [limit=TRACE_LIMIT] Maximum number of records.
-   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
-   * @returns {Promise<Array<Object>>} Parsed trace payloads.
-   */
-  async function fetchTraces(limit = TRACE_LIMIT, since = 0) {
-    const safeLimit = Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : TRACE_LIMIT;
-    const effectiveLimit = Math.min(safeLimit, NODE_LIMIT);
-    let url = `/api/traces?limit=${effectiveLimit}`;
-    if (since > 0) url += `&since=${since}`;
-    const r = await fetch(url, { cache: 'default' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const traces = await r.json();
-    return filterRecentTraces(traces, TRACE_MAX_AGE_SECONDS);
-  }
-
-  /**
-   * Fetch telemetry entries from the JSON API.
-   *
-   * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
-   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
-   * @returns {Promise<Array<Object>>} Parsed telemetry payloads.
-   */
-  async function fetchTelemetry(limit = NODE_LIMIT, since = 0) {
-    const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    let url = `/api/telemetry?limit=${effectiveLimit}`;
-    if (since > 0) url += `&since=${since}`;
-    const r = await fetch(url, { cache: 'default' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }
-
-  /**
-   * Fetch position packets from the JSON API.
-   *
-   * @param {number} [limit=NODE_LIMIT] Maximum number of rows.
-   * @param {number} [since=0] Unix timestamp; only rows newer than this are returned.
-   * @returns {Promise<Array<Object>>} Parsed position payloads.
-   */
-  async function fetchPositions(limit = NODE_LIMIT, since = 0) {
-    const effectiveLimit = resolveSnapshotLimit(limit, NODE_LIMIT);
-    let url = `/api/positions?limit=${effectiveLimit}`;
-    if (since > 0) url += `&since=${since}`;
-    const r = await fetch(url, { cache: 'default' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return r.json();
-  }
-
-  /**
-   * Convert arbitrary values to finite numbers when possible.
-   *
-   * @param {*} value Raw value.
-   * @returns {number|null} Finite number or null when conversion fails.
-   */
-  function toFiniteNumber(value) {
-    if (value == null || value === '') return null;
-    const num = typeof value === 'number' ? value : Number(value);
-    return Number.isFinite(num) ? num : null;
-  }
-
-
-  /**
-   * Determine the best-effort timestamp in seconds from numeric or ISO values.
-   *
-   * @param {*} numeric Numeric timestamp.
-   * @param {*} isoString ISO formatted timestamp.
-   * @returns {number|null} Timestamp in seconds.
-   */
-  function resolveTimestampSeconds(numeric, isoString) {
-    const parsedNumeric = toFiniteNumber(numeric);
-    if (parsedNumeric != null) return parsedNumeric;
-    if (typeof isoString === 'string' && isoString.length) {
-      const parsedIso = Date.parse(isoString);
-      if (Number.isFinite(parsedIso)) {
-        return parsedIso / 1000;
-      }
-    }
-    return null;
-  }
-
-  /**
-   * Filter trace entries to discard packets older than the configured window.
-   *
-   * @param {Array<Object>} traces Trace payloads.
-   * @param {number} [maxAgeSeconds=TRACE_MAX_AGE_SECONDS] Maximum allowed age in seconds.
-   * @returns {Array<Object>} Recent trace entries.
-   */
-  function filterRecentTraces(traces, maxAgeSeconds = TRACE_MAX_AGE_SECONDS) {
-    if (!Array.isArray(traces)) {
-      return [];
-    }
-    if (!Number.isFinite(maxAgeSeconds) || maxAgeSeconds <= 0) {
-      return [...traces];
-    }
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    const cutoff = nowSeconds - maxAgeSeconds;
-    return traces.filter(trace => {
-      const rxTime = resolveTimestampSeconds(trace?.rx_time ?? trace?.rxTime, trace?.rx_iso ?? trace?.rxIso);
-      return rxTime != null && rxTime >= cutoff;
+  function fetchMessages(limit = MESSAGE_LIMIT, options = {}) {
+    return fetchMessagesImpl(limit, {
+      ...options,
+      chatEnabled: CHAT_ENABLED,
+      normaliseMessageLimit,
     });
-  }
-
-  /**
-   * Merge recent position packets into the node list.
-   *
-   * @param {Array<Object>} nodes Node payloads.
-   * @param {Array<Object>} positions Position entries.
-   * @returns {Array<Object>} Updated node collection.
-   */
-  function mergePositionsIntoNodes(nodes, positions) {
-    if (!Array.isArray(nodes) || !Array.isArray(positions) || nodes.length === 0) return;
-
-    const nodesById = new Map();
-    for (const node of nodes) {
-      if (!node || typeof node !== 'object') continue;
-      const key = typeof node.node_id === 'string' ? node.node_id : null;
-      if (key) nodesById.set(key, node);
-    }
-
-    if (nodesById.size === 0) return;
-
-    const updated = new Set();
-    for (const pos of positions) {
-      if (!pos || typeof pos !== 'object') continue;
-      const nodeId = typeof pos.node_id === 'string' ? pos.node_id : null;
-      if (!nodeId || updated.has(nodeId)) continue;
-      const node = nodesById.get(nodeId);
-      if (!node) continue;
-
-      const lat = toFiniteNumber(pos.latitude);
-      const lon = toFiniteNumber(pos.longitude);
-      if (lat == null || lon == null) continue;
-
-      const currentTimestamp = resolveTimestampSeconds(node.position_time, node.pos_time_iso);
-      const incomingTimestamp = resolveTimestampSeconds(pos.position_time, pos.position_time_iso);
-      if (currentTimestamp != null) {
-        if (incomingTimestamp == null || incomingTimestamp <= currentTimestamp) {
-          continue;
-        }
-      }
-
-      updated.add(nodeId);
-      node.latitude = lat;
-      node.longitude = lon;
-
-      const alt = toFiniteNumber(pos.altitude);
-      if (alt != null) node.altitude = alt;
-
-      const posTime = toFiniteNumber(pos.position_time);
-      if (posTime != null) {
-        node.position_time = posTime;
-        node.pos_time_iso = typeof pos.position_time_iso === 'string' && pos.position_time_iso.length
-          ? pos.position_time_iso
-          : new Date(posTime * 1000).toISOString();
-      } else if (typeof pos.position_time_iso === 'string' && pos.position_time_iso.length) {
-        node.pos_time_iso = pos.position_time_iso;
-      }
-
-      if (pos.location_source != null && pos.location_source !== '') {
-        node.location_source = pos.location_source;
-      }
-
-      const precision = toFiniteNumber(pos.precision_bits);
-      if (precision != null) node.precision_bits = precision;
-    }
-  }
-
-  /**
-   * Build a lookup table of telemetry entries keyed by node identifier.
-   *
-   * @param {Array<Object>} entries Telemetry payloads.
-   * @returns {Map<string, Object>} Indexed telemetry data.
-   */
-  function buildTelemetryIndex(entries) {
-    const byNodeId = new Map();
-    const byNodeNum = new Map();
-    if (!Array.isArray(entries)) {
-      return { byNodeId, byNodeNum };
-    }
-    for (const entry of entries) {
-      if (!entry || typeof entry !== 'object') continue;
-      const nodeId = typeof entry.node_id === 'string' ? entry.node_id : (typeof entry.nodeId === 'string' ? entry.nodeId : null);
-      const nodeNumRaw = entry.node_num ?? entry.nodeNum;
-      const nodeNum = typeof nodeNumRaw === 'number' ? nodeNumRaw : Number(nodeNumRaw);
-      const rxTime = toFiniteNumber(entry.rx_time ?? entry.rxTime);
-      const telemetryTime = toFiniteNumber(entry.telemetry_time ?? entry.telemetryTime);
-      const timestamp = rxTime != null ? rxTime : telemetryTime != null ? telemetryTime : Number.NEGATIVE_INFINITY;
-      if (nodeId) {
-        const existing = byNodeId.get(nodeId);
-        if (!existing || timestamp > existing.timestamp) {
-          byNodeId.set(nodeId, { entry, timestamp });
-        }
-      }
-      if (Number.isFinite(nodeNum)) {
-        const existing = byNodeNum.get(nodeNum);
-        if (!existing || timestamp > existing.timestamp) {
-          byNodeNum.set(nodeNum, { entry, timestamp });
-        }
-      }
-    }
-    return { byNodeId, byNodeNum };
-  }
-
-  /**
-   * Merge telemetry metrics into the node list.
-   *
-   * @param {Array<Object>} nodes Node payloads.
-   * @param {Array<Object>} telemetryEntries Telemetry data.
-   * @returns {Array<Object>} Updated node collection.
-   */
-  function mergeTelemetryIntoNodes(nodes, telemetryEntries) {
-    if (!Array.isArray(nodes) || !nodes.length) return;
-    const { byNodeId, byNodeNum } = buildTelemetryIndex(telemetryEntries);
-    for (const node of nodes) {
-      if (!node || typeof node !== 'object') continue;
-      const nodeId = typeof node.node_id === 'string' ? node.node_id : (typeof node.nodeId === 'string' ? node.nodeId : null);
-      const nodeNumRaw = node.num ?? node.node_num ?? node.nodeNum;
-      const nodeNum = typeof nodeNumRaw === 'number' ? nodeNumRaw : Number(nodeNumRaw);
-      let telemetryEntry = null;
-      if (nodeId && byNodeId.has(nodeId)) {
-        telemetryEntry = byNodeId.get(nodeId).entry;
-      } else if (Number.isFinite(nodeNum) && byNodeNum.has(nodeNum)) {
-        telemetryEntry = byNodeNum.get(nodeNum).entry;
-      }
-      if (!telemetryEntry || typeof telemetryEntry !== 'object') continue;
-      const metrics = {
-        battery_level: toFiniteNumber(telemetryEntry.battery_level ?? telemetryEntry.batteryLevel),
-        voltage: toFiniteNumber(telemetryEntry.voltage),
-        uptime_seconds: toFiniteNumber(telemetryEntry.uptime_seconds ?? telemetryEntry.uptimeSeconds),
-        channel_utilization: toFiniteNumber(telemetryEntry.channel_utilization ?? telemetryEntry.channelUtilization),
-        air_util_tx: toFiniteNumber(telemetryEntry.air_util_tx ?? telemetryEntry.airUtilTx),
-        temperature: toFiniteNumber(telemetryEntry.temperature),
-        relative_humidity: toFiniteNumber(telemetryEntry.relative_humidity ?? telemetryEntry.relativeHumidity),
-        barometric_pressure: toFiniteNumber(telemetryEntry.barometric_pressure ?? telemetryEntry.barometricPressure),
-      };
-      for (const [key, value] of Object.entries(metrics)) {
-        if (value == null) continue;
-        node[key] = value;
-      }
-      const telemetryTime = toFiniteNumber(telemetryEntry.telemetry_time ?? telemetryEntry.telemetryTime);
-      if (telemetryTime != null) {
-        node.telemetry_time = telemetryTime;
-      }
-      const rxTime = toFiniteNumber(telemetryEntry.rx_time ?? telemetryEntry.rxTime);
-      if (rxTime != null) {
-        node.telemetry_rx_time = rxTime;
-      }
-    }
   }
 
   /**
@@ -4078,6 +3188,138 @@ export function initializeApp(config) {
   }
 
   /**
+   * Classify the current zoom level relative to ``COLOCATED_HUB_MIN_ZOOM``.
+   *
+   * Returns ``'low'`` when the user is zoomed out far enough that the
+   * collapsed-hub representation should not be drawn (markers stack at the
+   * shared coordinate instead) and ``'high'`` otherwise.  Defaults to
+   * ``'high'`` when the map is missing or its ``getZoom`` returns a
+   * non-finite value, which preserves the pre-feature behaviour during
+   * early init / tests where the projection is not yet available.
+   *
+   * @returns {'low'|'high'} Bucket name for the current zoom level.
+   */
+  function currentZoomBucket() {
+    if (!map || typeof map.getZoom !== 'function') return 'high';
+    const zoom = map.getZoom();
+    if (!Number.isFinite(zoom)) return 'high';
+    return zoom < COLOCATED_HUB_MIN_ZOOM ? 'low' : 'high';
+  }
+
+  /**
+   * Wired to the map's ``zoomend`` event in addition to the spider
+   * re-projection.  When the user crosses the
+   * ``COLOCATED_HUB_MIN_ZOOM`` threshold in either direction we forget the
+   * previously-expanded hub state and trigger a full re-render through
+   * {@link applyFilter}, since the marker representation switches between
+   * "flat overlap" and "hub badge" modes.
+   *
+   * @returns {void}
+   */
+  function handleZoomEndForColocatedHubs() {
+    refreshColocatedSpiderState();
+    const bucket = currentZoomBucket();
+    if (bucket !== lastRenderedZoomBucket) {
+      expandedColocatedKeys.clear();
+      // Bucket flips only swap the marker representation; the node table,
+      // chat log, and active-stats counts are unaffected, so we re-render
+      // just the map rather than running the full applyFilter pipeline.
+      rerenderMapForFiltering();
+    }
+  }
+
+  /**
+   * Build the small "asterisk + count" hub badge that represents a collapsed
+   * (or expanded-but-still-visible) co-located group.  The badge is a
+   * Leaflet ``L.marker`` backed by an ``L.divIcon`` so the visual is HTML/CSS
+   * (themable via ``var(--fg)`` / ``var(--bg)``) rather than the SVG
+   * ``L.circleMarker`` used for node points.
+   *
+   * Clicking the hub toggles ``expandedColocatedKeys`` for ``groupKey`` and
+   * triggers a full re-render via {@link applyFilter}.  The hub deliberately
+   * does NOT participate in the node-info overlay — it is a control rather
+   * than a node anchor — so the click handler stops propagation to keep the
+   * ``overlayStack`` close path from also firing.
+   *
+   * @param {string} groupKey Bucket key from {@link computeColocatedOffsets}.
+   * @param {number} groupSize Number of (visible) nodes in the group.
+   * @param {number} lat Latitude of the shared centre.
+   * @param {number} lon Longitude of the shared centre.
+   * @returns {Object} The created Leaflet marker, already added to the layer.
+   */
+  function createColocatedHubMarker(groupKey, groupSize, lat, lon) {
+    // ``bubblingMouseEvents: false`` keeps Leaflet's internal event system
+    // from forwarding the click to the map and any registered map-level
+    // ``click`` handlers (e.g. overlay close).  ``riseOnHover`` is omitted
+    // intentionally — it is documented for the default raster icon's
+    // z-index handling and behaves inconsistently with ``divIcon`` across
+    // Leaflet versions; layer ordering (``colocatedHubsLayer`` is added
+    // *after* ``markersLayer``) keeps the hub on top reliably.
+    const marker = L.marker([lat, lon], {
+      icon: getColocatedHubIcon(groupSize),
+      keyboard: false,
+      bubblingMouseEvents: false
+    });
+    marker.on('click', event => {
+      // Stop the Leaflet event from bubbling to the map's own click handlers
+      // and stop the raw DOM event so the ``overlayStack`` close path does
+      // not also fire.  We use the Leaflet helper rather than only the raw
+      // DOM stopPropagation because Leaflet routes events through its own
+      // pipeline before the browser does.
+      if (event && L && L.DomEvent && typeof L.DomEvent.stopPropagation === 'function') {
+        L.DomEvent.stopPropagation(event);
+      }
+      if (event && event.originalEvent && typeof event.originalEvent.stopPropagation === 'function') {
+        event.originalEvent.stopPropagation();
+      }
+      if (expandedColocatedKeys.has(groupKey)) {
+        expandedColocatedKeys.delete(groupKey);
+      } else {
+        expandedColocatedKeys.add(groupKey);
+      }
+      // Surgical re-render: only the map's marker representation changed.
+      // The table, chat log, and active-stats counts stay valid, so we skip
+      // the full applyFilter pipeline (and its ``/api/stats`` fetch) — that
+      // saves a round-trip per click and keeps rapid expand/collapse cheap.
+      rerenderMapForFiltering();
+    });
+    marker.addTo(colocatedHubsLayer);
+    return marker;
+  }
+
+  /**
+   * Lookup or lazily create the divIcon used to render a hub badge for a
+   * group of ``groupSize`` co-located nodes.  Icons are cached because
+   * Leaflet allows the same icon instance to be shared across markers, the
+   * underlying DOM element is cloned per marker, and ``L.divIcon`` itself
+   * is non-trivially expensive at the volumes this feature can produce
+   * (every render creates one icon per multi-node group).  The cache is
+   * keyed by ``groupSize`` because the html string is the only thing that
+   * varies between groups; it is bounded in practice (typical group sizes
+   * are small single digits) so it never grows large enough to warrant
+   * eviction.
+   *
+   * Theme changes do not invalidate the cache: the icon's html only carries
+   * the static text label and class hooks; all colour / border styling
+   * comes from CSS variables that resolve at paint time.
+   *
+   * @param {number} groupSize Number of visible nodes in the group.
+   * @returns {Object} Cached or freshly-created Leaflet divIcon.
+   */
+  function getColocatedHubIcon(groupSize) {
+    const cached = colocatedHubIconCache.get(groupSize);
+    if (cached) return cached;
+    const icon = L.divIcon({
+      html: '<span class="colocated-spider-hub__glyph">*' + groupSize + '</span>',
+      className: 'colocated-spider-hub',
+      iconSize: [16, 16],
+      iconAnchor: [8, 8]
+    });
+    colocatedHubIconCache.set(groupSize, icon);
+    return icon;
+  }
+
+  /**
    * Render the Leaflet map markers and neighbour connections.
    *
    * @param {Array<Object>} nodes Node payloads.
@@ -4097,9 +3339,15 @@ export function initializeApp(config) {
     if (spiderLinesLayer) {
       spiderLinesLayer.clearLayers();
     }
+    if (colocatedHubsLayer) {
+      colocatedHubsLayer.clearLayers();
+    }
     // Drop the previous render's spider records before populating them again
     // so the zoom handler does not try to reposition stale Leaflet objects.
     colocatedSpiderState = [];
+    // Capture the zoom bucket the upcoming render targets so the zoomend
+    // handler can detect threshold crossings on the next zoom event.
+    lastRenderedZoomBucket = currentZoomBucket();
     markersLayer.clearLayers();
     const pts = [];
     const nodesById = new Map();
@@ -4320,19 +3568,73 @@ export function initializeApp(config) {
     });
 
     const offsets = computeColocatedOffsets(renderableEntries);
-    for (const { entry, dx, dy } of offsets) {
+
+    // Build the set of bucket keys that currently host more than one visible
+    // node so we can drop stale entries from ``expandedColocatedKeys`` (a
+    // group that lost members to the distance filter, an upstream delete,
+    // etc.).  Keys whose group has shrunk to a singleton are pruned here so
+    // the remaining slot renders as a normal marker rather than carrying an
+    // orphaned "expanded" flag.
+    const visibleMultiGroupKeys = new Set();
+    for (const slot of offsets) {
+      if (slot && slot.groupSize >= 2) visibleMultiGroupKeys.add(slot.groupKey);
+    }
+    // Snapshot the keys before mutating the live set: ``Set`` iteration
+    // during ``delete`` is technically safe per spec, but copying first
+    // makes the intent explicit and keeps the loop body straightforward
+    // for future maintainers.
+    for (const key of Array.from(expandedColocatedKeys)) {
+      if (!visibleMultiGroupKeys.has(key)) expandedColocatedKeys.delete(key);
+    }
+
+    const zoomBucket = currentZoomBucket();
+    // Each multi-node group emits a single hub badge.  Track which keys we
+    // have already drawn so we create the hub once even though the offsets
+    // array yields one slot per member.
+    const renderedHubKeys = new Set();
+
+    for (const slot of offsets) {
+      const { entry, dx, dy, groupKey, groupSize } = slot;
       const n = entry.node;
       const { lat, lon } = entry;
+
+      const isMulti = groupSize >= 2;
+      const lowZoom = zoomBucket === 'low';
+      const isExpanded = isMulti && !lowZoom && expandedColocatedKeys.has(groupKey);
+      // Hub badges represent multi-node groups at zoom levels where the
+      // collapsed control is meaningful; below the threshold they would just
+      // sit in a sea of overlapping markers without conveying useful info.
+      const showHub = isMulti && !lowZoom;
+      // Singletons always render their marker; multi-node groups render
+      // member markers only when the user has expanded the hub (or when the
+      // zoom is below the threshold and we fall back to flat overlap).
+      const showMarker = !isMulti || lowZoom || isExpanded;
+      // Use the helper-level significance test (rather than strict !== 0)
+      // because trig at angles like π produces values around 1e-15 which
+      // would otherwise pass the strict check and cause us to draw
+      // zero-length spider lines.
+      const useOffset = isExpanded && isOffsetSignificant(dx, dy);
+
+      if (showHub && !renderedHubKeys.has(groupKey)) {
+        createColocatedHubMarker(groupKey, groupSize, lat, lon);
+        renderedHubKeys.add(groupKey);
+      }
+
+      // Auto-fit bounds always use the original coordinate so the
+      // collapse/expand state cannot widen or narrow the fit window.  Push
+      // here even when the underlying marker is suppressed so a fully
+      // collapsed group still contributes to the bounds.
+      pts.push([lat, lon]);
+
+      if (!showMarker) {
+        continue;
+      }
 
       // Translate the pixel-space offset into the LatLng to render at.  The
       // baked-in LatLng is correct for the current zoom only; the zoom event
       // handlers re-project on zoom/zoomend/viewreset to keep the gap
-      // visually constant when the user changes zoom.  Use the helper-level
-      // significance test (rather than strict !== 0) because trig at angles
-      // like π produces values around 1e-15 which would otherwise pass the
-      // strict check and cause us to draw zero-length spider lines.
-      const markerLatLng = projectColocatedOffsetLatLng(lat, lon, dx, dy);
-      const isOffset = isOffsetSignificant(dx, dy);
+      // visually constant when the user changes zoom.
+      const markerLatLng = useOffset ? projectColocatedOffsetLatLng(lat, lon, dx, dy) : [lat, lon];
 
       const color = getRoleColor(n.role, n.protocol);
       const marker = L.circleMarker(markerLatLng, {
@@ -4344,14 +3646,14 @@ export function initializeApp(config) {
         opacity: 0.7
       });
 
-      // Draw a faint dotted leader line from each co-located marker back to
+      // Draw a faint dotted leader line from each fanned-out marker back to
       // the shared physical location so the spider hub is visually obvious.
-      // Singleton markers (no offset) get no line.  Stroke colour, dash,
-      // weight and opacity all live in `.colocated-spider-line` so the line
-      // can pick up theme-aware tokens (var(--fg)) and stay legible on both
-      // light and dark basemaps without code changes here.
+      // Singleton / collapsed / low-zoom markers get no line.  Stroke
+      // colour, dash, weight and opacity all live in `.colocated-spider-line`
+      // so the line can pick up theme-aware tokens (var(--fg)) and stay
+      // legible on both light and dark basemaps without code changes here.
       let spiderLine = null;
-      if (isOffset && spiderLinesLayer) {
+      if (useOffset && spiderLinesLayer) {
         spiderLine = L.polyline([[lat, lon], markerLatLng], {
           interactive: false,
           className: 'colocated-spider-line'
@@ -4362,14 +3664,12 @@ export function initializeApp(config) {
       let markerToken = 0;
       marker.addTo(markersLayer);
       // Track every offset marker so the zoomend handler can reposition the
-      // marker + leader line in lock-step.  Singletons skip the record since
-      // their position never changes between zooms.
-      if (isOffset) {
+      // marker + leader line in lock-step.  Markers rendered at the shared
+      // centre (singletons / low-zoom overlap / collapsed-group fallback)
+      // skip the record since their position never changes between zooms.
+      if (useOffset) {
         colocatedSpiderState.push({ marker, line: spiderLine, lat, lon, dx, dy });
       }
-      // Use the original coordinates for fitBounds so sub-pixel display
-      // offsets cannot widen the auto-fit window.
-      pts.push([lat, lon]);
 
       attachNodeInfoRefreshToMarker({
         marker,
@@ -4506,6 +3806,37 @@ export function initializeApp(config) {
   }
 
   /**
+   * Re-run the active text/role/protocol filter pipeline over ``allNodes``
+   * and return the nodes that should currently render on the map and table.
+   * Pulled out of {@link applyFilter} so the colocated-hub click handler and
+   * the zoom-bucket-crossing handler can call it without paying for the
+   * table re-render, chat-log re-render, or stats fetch — none of which are
+   * affected by either of those events.
+   *
+   * @returns {Array<Object>} Filtered + sorted node list.
+   */
+  function getFilteredSortedNodes() {
+    const filterQuery = filterInput ? filterInput.value : '';
+    const q = normaliseChatFilterQuery(filterQuery);
+    const filteredNodes = allNodes.filter(n => matchesTextFilter(n, q) && matchesRoleFilter(n) && matchesProtocolFilter(n));
+    return sortNodes(filteredNodes);
+  }
+
+  /**
+   * Re-render only the map markers (hub badges, member markers, leader
+   * lines) without touching the node table, chat log, page title, or the
+   * ``/api/stats`` fetch.  Used for events that only affect the marker
+   * representation — currently the colocated-hub expand/collapse click and
+   * the zoom-bucket threshold crossing — so we avoid the full
+   * {@link applyFilter} pipeline that those events would otherwise trigger.
+   *
+   * @returns {void}
+   */
+  function rerenderMapForFiltering() {
+    renderMap(getFilteredSortedNodes(), Date.now() / 1000);
+  }
+
+  /**
    * Apply text and role filters to the node list and re-render outputs.
    *
    * @returns {void}
@@ -4513,14 +3844,10 @@ export function initializeApp(config) {
   function applyFilter() {
     updateFilterClearVisibility();
     const filterQuery = filterInput ? filterInput.value : '';
-    // Normalise query so empty strings and whitespace-only input are treated
-    // identically and comparisons are case-insensitive.
-    const q = normaliseChatFilterQuery(filterQuery);
     // Text and role filters apply only to the node table and map; the chat log
     // always receives the full node collection so reply-thread lookups succeed
     // even for nodes that are currently hidden by the active filter.
-    const filteredNodes = allNodes.filter(n => matchesTextFilter(n, q) && matchesRoleFilter(n) && matchesProtocolFilter(n));
-    const sortedNodes = sortNodes(filteredNodes);
+    const sortedNodes = getFilteredSortedNodes();
     const nowSec = Date.now()/1000;
     renderTable(sortedNodes, nowSec);
     renderMap(sortedNodes, nowSec);
@@ -4910,6 +4237,22 @@ export function initializeApp(config) {
       refreshColocatedSpiderState,
       /** rAF-throttled wrapper around the spider refresh. */
       scheduleColocatedSpiderRefresh,
+      /** ``zoomend`` handler that also detects co-located zoom-bucket crossings. */
+      handleZoomEndForColocatedHubs,
+      /** Build the asterisk + count hub badge for a co-located group. */
+      createColocatedHubMarker,
+      /** Lazily look up or create the divIcon for a hub of a given size. */
+      getColocatedHubIcon,
+      /** Render the map (test use only). */
+      renderMap,
+      /** Re-render only the map (skips the table / chat log / stats pipeline). */
+      rerenderMapForFiltering,
+      /** Classify the current zoom level as ``'low'`` or ``'high'``. */
+      _currentZoomBucketForTests: currentZoomBucket,
+      /** Inspect the live divIcon cache (test use only). */
+      _getColocatedHubIconCacheForTests() {
+        return colocatedHubIconCache;
+      },
       /** Replace the recorded spider state for tests; returns the previous value. */
       _setColocatedSpiderStateForTests(next) {
         const previous = colocatedSpiderState;
@@ -4919,6 +4262,35 @@ export function initializeApp(config) {
       /** Inspect the recorded spider state (test use only). */
       _getColocatedSpiderStateForTests() {
         return colocatedSpiderState;
+      },
+      /** Replace the expanded-group key set for tests; returns the previous value. */
+      _setExpandedColocatedKeysForTests(next) {
+        const previous = expandedColocatedKeys;
+        expandedColocatedKeys = next instanceof Set ? next : new Set();
+        return previous;
+      },
+      /** Inspect the live expanded-group key set (test use only). */
+      _getExpandedColocatedKeysForTests() {
+        return expandedColocatedKeys;
+      },
+      /** Inject a stub hub layer for tests; returns the previous value. */
+      _setColocatedHubsLayerForTests(next) {
+        const previous = colocatedHubsLayer;
+        colocatedHubsLayer = next;
+        return previous;
+      },
+      /** Inspect the hub layer (test use only). */
+      _getColocatedHubsLayerForTests() {
+        return colocatedHubsLayer;
+      },
+      /** Read or override the cached zoom bucket from the previous render. */
+      _setLastRenderedZoomBucketForTests(next) {
+        const previous = lastRenderedZoomBucket;
+        lastRenderedZoomBucket = next;
+        return previous;
+      },
+      _getLastRenderedZoomBucketForTests() {
+        return lastRenderedZoomBucket;
       },
       /** Inject a stub Leaflet map for tests that need to drive the projection. */
       _setMapForTests(stub) {
