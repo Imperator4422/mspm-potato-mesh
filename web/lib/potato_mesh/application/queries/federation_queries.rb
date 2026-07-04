@@ -22,8 +22,10 @@ module PotatoMesh
       # @param limit [Integer] maximum number of rows to return.
       # @param node_ref [String, Integer, nil] optional node reference to scope results.
       # @param since [Integer] unix timestamp threshold applied in addition to the rolling window.
+      # @param before [Integer, nil] inclusive upper-bound +rx_time+ cursor for
+      #   backward pagination (SPEC BP1); rows newer than this are excluded.
       # @return [Array<Hash>] compacted position rows suitable for API responses.
-      def query_positions(limit, node_ref: nil, since: 0, protocol: nil)
+      def query_positions(limit, node_ref: nil, since: 0, before: nil, protocol: nil)
         limit = coerce_query_limit(limit)
         db = open_database(readonly: true)
         db.results_as_hash = true
@@ -44,6 +46,11 @@ module PotatoMesh
           params.concat(clause.last)
         end
 
+        # Inclusive upper-bound cursor for backward pagination (SPEC BP1);
+        # bounds the +rx_time+ sort column.
+        append_before_filter(where_clauses, params, before, column: "rx_time")
+
+        append_opt_out_filter(where_clauses, params, opt_out_node_id_filter("node_id"))
         append_protocol_filter(where_clauses, params, protocol)
 
         sql = <<~SQL
@@ -64,10 +71,9 @@ module PotatoMesh
           node_num = coerce_integer(r["node_num"])
           r["node_num"] = node_num if node_num
 
-          position_time = coerce_integer(r["position_time"])
-          position_time = nil if position_time && position_time > now
+          position_time = coerce_positive_or_nil(r["position_time"], ceiling: now)
           r["position_time"] = position_time
-          r["position_time_iso"] = Time.at(position_time).utc.iso8601 if position_time
+          # I2: only position_time (unix int) is emitted; no ISO twin.
 
           r["precision_bits"] = coerce_integer(r["precision_bits"])
           r["sats_in_view"] = coerce_integer(r["sats_in_view"])
@@ -84,8 +90,10 @@ module PotatoMesh
       # @param limit [Integer] maximum number of rows to return.
       # @param node_ref [String, Integer, nil] optional node reference to scope results.
       # @param since [Integer] unix timestamp threshold applied in addition to the rolling window for collections.
+      # @param before [Integer, nil] inclusive upper-bound +rx_time+ cursor for
+      #   backward pagination (SPEC BP1); rows newer than this are excluded.
       # @return [Array<Hash>] compacted neighbor rows suitable for API responses.
-      def query_neighbors(limit, node_ref: nil, since: 0, protocol: nil)
+      def query_neighbors(limit, node_ref: nil, since: 0, before: nil, protocol: nil)
         limit = coerce_query_limit(limit)
         db = open_database(readonly: true)
         db.results_as_hash = true
@@ -107,6 +115,15 @@ module PotatoMesh
           params.concat(clause.last)
         end
 
+        # Either endpoint of the neighbour relationship may carry the
+        # opt-out marker — filter both so a silenced node never appears as
+        # a source or destination of an RF link.
+        # Inclusive upper-bound cursor for backward pagination (SPEC BP1);
+        # bounds the +rx_time+ sort column.
+        append_before_filter(where_clauses, params, before, column: "rx_time")
+
+        append_opt_out_filter(where_clauses, params, opt_out_node_id_filter("node_id"))
+        append_opt_out_filter(where_clauses, params, opt_out_node_id_filter("neighbor_id"))
         append_protocol_filter(where_clauses, params, protocol)
 
         sql = <<~SQL
@@ -136,8 +153,10 @@ module PotatoMesh
       # @param limit [Integer] maximum number of rows to return.
       # @param node_ref [String, Integer, nil] optional node reference to scope results.
       # @param since [Integer] unix timestamp threshold applied in addition to the rolling window.
+      # @param before [Integer, nil] inclusive upper-bound +rx_time+ cursor for
+      #   backward pagination (SPEC BP1); rows newer than this are excluded.
       # @return [Array<Hash>] compacted trace rows suitable for API responses.
-      def query_traces(limit, node_ref: nil, since: 0, protocol: nil)
+      def query_traces(limit, node_ref: nil, since: 0, before: nil, protocol: nil)
         limit = coerce_query_limit(limit)
         db = open_database(readonly: true)
         db.results_as_hash = true
@@ -164,6 +183,16 @@ module PotatoMesh
           3.times { params.concat(numeric_values) }
         end
 
+        # Drop traces whose endpoints carry the opt-out marker.  Hops are
+        # filtered separately at hydration time so a trace that only relays
+        # through a silenced node still surfaces with the offending hop
+        # removed.
+        # Inclusive upper-bound cursor for backward pagination (SPEC BP1);
+        # bounds the +rx_time+ sort column.
+        append_before_filter(where_clauses, params, before, column: "rx_time")
+
+        append_opt_out_filter(where_clauses, params, opt_out_node_num_filter("src"))
+        append_opt_out_filter(where_clauses, params, opt_out_node_num_filter("dest"))
         append_protocol_filter(where_clauses, params, protocol)
 
         sql = <<~SQL
@@ -182,10 +211,15 @@ module PotatoMesh
         hops_by_trace = Hash.new { |hash, key| hash[key] = [] }
         unless trace_ids.empty?
           placeholders = Array.new(trace_ids.length, "?").join(", ")
+          # Hide opted-out intermediate hops too — otherwise a single trace
+          # could expose a silenced node's numeric ID via the relay chain.
+          hop_filter = opt_out_node_num_filter("th.node_id")
           hop_rows =
             db.execute(
-              "SELECT trace_id, hop_index, node_id FROM trace_hops WHERE trace_id IN (#{placeholders}) ORDER BY trace_id, hop_index",
-              trace_ids,
+              "SELECT th.trace_id, th.hop_index, th.node_id FROM trace_hops th " \
+              "WHERE th.trace_id IN (#{placeholders}) AND #{hop_filter} " \
+              "ORDER BY th.trace_id, th.hop_index",
+              trace_ids + opt_out_marker_params,
             )
           hop_rows.each do |hop|
             trace_id = coerce_integer(hop["trace_id"])

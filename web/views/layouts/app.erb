@@ -16,7 +16,7 @@
 -->
 <html lang="en" data-theme="dark">
 <head>
-  <meta name="color-scheme" content="dark light">
+  <meta name="color-scheme" content="dark">
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <% meta_title_html = Rack::Utils.escape_html(meta_title) %>
@@ -71,9 +71,27 @@
         }) %>
   </script>
   <% end %>
-  <link rel="stylesheet" href="/assets/styles/base.css" />
-  <script src="/assets/js/theme.js" defer></script>
-  <script src="/assets/js/background.js" defer></script>
+  <%# Import map versions the entire served JS module graph (SPEC AV3); must
+      precede any module load so relative imports resolve to the busted URLs. %>
+  <script type="importmap"><%= asset_import_map_json %></script>
+  <%# Preload the whole ES-module graph in parallel so the browser fetches it in
+      one round trip instead of discovering it import-tier by import-tier; this
+      removes the waterfall that delayed the first /api data paint. Same set the
+      import map versions; emitted after it so module URLs resolve to the busted
+      targets. A module absent here still loads normally on demand. %>
+  <%= asset_modulepreload_tags %>
+  <%# Cold-load data prefetch: an early async module fires the first-load API
+      requests in parallel with the module graph so data paints without waiting
+      for the whole bundle to boot. Runs only on cold loads (the cache module
+      maintains a localStorage marker); data-pm-chat=false suppresses the message
+      requests in private mode (mirrors the /api/messages 404). The app consumes
+      the in-flight responses on its first refresh; if anything is unavailable it
+      simply fetches normally. %>
+  <script type="module" async src="<%= asset_url("/assets/js/app/main/boot-prefetch.js") %>"
+          data-pm-prefetch data-pm-chat="<%= private_mode ? "false" : "true" %>"></script>
+  <link rel="stylesheet" href="<%= asset_url("/assets/styles/base.css") %>" />
+  <script src="<%= asset_url("/assets/js/theme.js") %>" defer></script>
+  <script src="<%= asset_url("/assets/js/background.js") %>" defer></script>
 
   <!-- Leaflet CSS/JS -->
   <link
@@ -206,9 +224,7 @@
           <img src="/assets/img/meshtastic.svg" alt="" width="20" height="20" aria-hidden="true" class="protocol-toggle-icon" loading="lazy" decoding="async" />
         </button>
         <span id="footerActiveNodes" class="meta-active-nodes"></span>
-        <button id="refreshBtn" type="button" title="Fetch latest data now">Refresh</button>
         <button id="autorefreshToggle" type="button" aria-label="Pause auto-refresh" aria-pressed="false" title="Pause or resume automatic data refresh">⏸</button>
-        <span id="status" class="refresh-timestamp" aria-live="polite"></span>
       </div>
     <% end %>
 
@@ -242,6 +258,6 @@
     const CHAT_ENABLED = <%= private_mode ? "false" : "true" %>;
     const current_view_mode = '<%= view_mode %>';
   </script>
-  <script type="module" src="/assets/js/app/index.js"></script>
+  <script type="module" src="<%= asset_url("/assets/js/app/index.js") %>"></script>
 </body>
 </html>

@@ -57,6 +57,18 @@ RSpec.describe PotatoMesh::App::Federation do
           @warn_messages = []
         end
 
+        def info_messages
+          @info_messages ||= []
+        end
+
+        def info_log(message, **metadata)
+          info_messages << [message, metadata]
+        end
+
+        def reset_info_messages
+          @info_messages = []
+        end
+
         def settings
           @settings ||= Struct.new(
             :federation_thread,
@@ -84,6 +96,7 @@ RSpec.describe PotatoMesh::App::Federation do
     federation_helpers.instance_variable_set(:@remote_instance_verify_callback, nil)
     federation_helpers.reset_debug_messages
     federation_helpers.reset_warn_messages
+    federation_helpers.reset_info_messages
     federation_helpers.clear_federation_crawl_state!
     federation_helpers.shutdown_federation_worker_pool!
   end
@@ -505,6 +518,33 @@ RSpec.describe PotatoMesh::App::Federation do
         [attributes_list[2][:domain], NODES_API_PATH],
       )
       expect(attributes_list.map { |attrs| attrs[:nodes_count] }).to all(eq(5))
+    end
+
+    it "reads the 0.7.0 stats shape for total and per-protocol counts" do
+      now = Time.at(1_700_000_000)
+      configure_remote_node_window(now)
+
+      new_shape = {
+        "total" => { "nodes" => { "hour" => 5, "day" => 7, "week" => 9, "month" => 11 } },
+        "meshcore" => { "nodes" => { "hour" => 1, "day" => 2, "week" => 3, "month" => 4 } },
+        "meshtastic" => { "nodes" => { "hour" => 4, "day" => 5, "week" => 6, "month" => 7 } },
+        "reticulum" => { "nodes" => { "hour" => 0, "day" => 0, "week" => 0, "month" => 0 } },
+        "sampled" => false,
+      }
+      mapping = stats_mapping(
+        now:,
+        stats_response: [new_shape, :stats],
+        full_nodes_response: [node_payload, :nodes],
+      )
+      stub_ingest_fetches(mapping)
+
+      federation_helpers.ingest_known_instances_from!(db, seed_domain)
+
+      # nodes_count comes from total.nodes (the 900s max age selects the hour window).
+      expect(attributes_list.map { |attrs| attrs[:nodes_count] }).to all(eq(5))
+      # Per-protocol 24h counts come from <protocol>.nodes.day.
+      expect(attributes_list.map { |attrs| attrs[:meshcore_nodes_count] }).to all(eq(2))
+      expect(attributes_list.map { |attrs| attrs[:meshtastic_nodes_count] }).to all(eq(5))
     end
 
     it "prefers recent node window counts when /api/stats is unavailable" do
@@ -1079,6 +1119,20 @@ RSpec.describe PotatoMesh::App::Federation do
         federation_helpers.send(:perform_instance_http_request, uri)
       end.to raise_error(PotatoMesh::App::InstanceFetchError, "ArgumentError: restricted domain")
     end
+
+    it "wraps DNS resolution failures so a peer with an unresolvable domain does not 500" do
+      # Addrinfo.getaddrinfo raises Socket::ResolutionError (a SocketError) when
+      # the peer domain does not resolve.  It must be wrapped as
+      # InstanceFetchError — like the restricted-address ArgumentError above — so
+      # the fetch path rejects the peer gracefully instead of bubbling a raw
+      # SocketError up to a 500 response.
+      allow(Addrinfo).to receive(:getaddrinfo)
+                           .and_raise(Socket::ResolutionError.new("getaddrinfo: Name or service not known"))
+
+      expect do
+        federation_helpers.send(:perform_instance_http_request, uri)
+      end.to raise_error(PotatoMesh::App::InstanceFetchError, /Name or service not known/)
+    end
   end
 
   describe ".federation_sleep_with_shutdown" do
@@ -1124,11 +1178,17 @@ RSpec.describe PotatoMesh::App::Federation do
         nodes_count: 42,
         meshcore_nodes_count: 30,
         meshtastic_nodes_count: 12,
+        reticulum_nodes_count: 0,
       }
       payload = federation_helpers.instance_announcement_payload(attributes, "sig")
-      expect(payload["nodesCount"]).to eq(42)
-      expect(payload["meshcoreNodesCount"]).to eq(30)
-      expect(payload["meshtasticNodesCount"]).to eq(12)
+      expect(payload["nodes_count"]).to eq(42)
+      expect(payload["meshcore_nodes_count"]).to eq(30)
+      expect(payload["meshtastic_nodes_count"]).to eq(12)
+      # v2 wire is snake_case with a forward-compat reticulum count + version marker.
+      expect(payload["reticulum_nodes_count"]).to eq(0)
+      expect(payload["public_key"]).to eq("key")
+      expect(payload["signature_version"]).to eq(2)
+      expect(payload).not_to have_key("nodesCount")
     end
 
     it "omits node count fields when nil" do
@@ -1279,6 +1339,21 @@ RSpec.describe PotatoMesh::App::Federation do
       expect(result).to be(true)
       expect(federation_helpers.debug_messages).to include("Published federation announcement")
     end
+
+    it "does not fall back to HTTP after HTTPS returned an HTTP response" do
+      bad_response = Net::HTTPBadRequest.new("1.1", "400", "Bad Request")
+      allow(bad_response).to receive(:code).and_return("400")
+      expect(federation_helpers).to receive(:perform_announce_request)
+                                      .with(https_uri, payload)
+                                      .and_return(bad_response)
+      expect(federation_helpers).not_to receive(:perform_announce_request)
+                                          .with(http_uri, payload)
+
+      result = federation_helpers.announce_instance_to_domain("remote.mesh", payload)
+
+      expect(result).to be(false)
+      expect(federation_helpers.warn_messages).to be_empty
+    end
   end
 
   describe ".ensure_federation_worker_pool!" do
@@ -1387,6 +1462,19 @@ RSpec.describe PotatoMesh::App::Federation do
 
       expect(federation_helpers.warn_messages.last).to include("Failed to shut down federation worker pool")
       expect(federation_helpers.send(:settings).federation_worker_pool).to be_nil
+    end
+
+    it "uses federation_shutdown_timeout_seconds (not the task timeout) and arms force_kill_after" do
+      pool = instance_double(PotatoMesh::App::WorkerPool)
+      allow(PotatoMesh::Config).to receive(:federation_shutdown_timeout_seconds).and_return(3)
+      allow(PotatoMesh::Config).to receive(:federation_task_timeout_seconds).and_return(120)
+      expect(pool).to receive(:shutdown).with(
+        timeout: 3,
+        force_kill_after: 3,
+      )
+
+      federation_helpers.set(:federation_worker_pool, pool)
+      federation_helpers.shutdown_federation_worker_pool!
     end
   end
 
@@ -1670,6 +1758,59 @@ RSpec.describe PotatoMesh::App::Federation do
       expect(calls).to eq(1)
       expect(metadata.first).to include("boom")
     end
+
+    it "returns [nil, errors] instead of raising when the peer domain fails DNS resolution" do
+      # Regression for the production 500: a registering/crawled peer whose
+      # domain does not resolve must surface as a recorded fetch error (so the
+      # caller can reject it with a 4xx), never escape as an unhandled SocketError.
+      allow(Addrinfo).to receive(:getaddrinfo)
+                           .and_raise(Socket::ResolutionError.new("getaddrinfo: Name or service not known"))
+
+      payload, metadata = federation_helpers.fetch_instance_json("does-not-resolve.invalid", NODES_API_PATH)
+
+      expect(payload).to be_nil
+      expect(metadata).not_to be_empty
+      expect(metadata.join("; ")).to include("Name or service not known")
+    end
+
+    it "does not fall back to HTTP after HTTPS returned an HTTP response" do
+      calls = []
+      allow(federation_helpers).to receive(:instance_uri_candidates).and_return([
+        URI.parse("https://remote.mesh/api/nodes"),
+        URI.parse("http://remote.mesh/api/nodes"),
+      ])
+      allow(federation_helpers).to receive(:perform_instance_http_request) do |uri|
+        calls << uri.scheme
+        raise PotatoMesh::App::InstanceHttpResponseError, "unexpected response 404"
+      end
+
+      payload, metadata = federation_helpers.fetch_instance_json("remote.mesh", NODES_API_PATH)
+
+      expect(payload).to be_nil
+      expect(calls).to eq(["https"])
+      expect(metadata.first).to include("unexpected response 404")
+    end
+
+    it "still falls back to HTTP when HTTPS connection itself fails" do
+      calls = []
+      allow(federation_helpers).to receive(:instance_uri_candidates).and_return([
+        URI.parse("https://remote.mesh/api/nodes"),
+        URI.parse("http://remote.mesh/api/nodes"),
+      ])
+      allow(federation_helpers).to receive(:perform_instance_http_request) do |uri|
+        calls << uri.scheme
+        if uri.scheme == "https"
+          raise PotatoMesh::App::InstanceFetchError, "Errno::ECONNREFUSED: refused"
+        else
+          '{"ok":true}'
+        end
+      end
+
+      payload, _ = federation_helpers.fetch_instance_json("remote.mesh", NODES_API_PATH)
+
+      expect(payload).to eq({ "ok" => true })
+      expect(calls).to eq(["https", "http"])
+    end
   end
 
   describe ".claim_federation_crawl_slot" do
@@ -1800,6 +1941,27 @@ RSpec.describe PotatoMesh::App::Federation do
       expect(federation_helpers).to receive(:announce_instance_to_domain).with("beta.mesh", "payload-json")
 
       federation_helpers.announce_instance_to_all_domains
+    end
+
+    it "logs cycle start and end at info level with target and result counts" do
+      allow(federation_helpers).to receive(:federation_worker_pool).and_return(nil)
+      allow(federation_helpers).to receive(:announce_instance_to_domain)
+                                     .with("alpha.mesh", "payload-json").and_return(true)
+      allow(federation_helpers).to receive(:announce_instance_to_domain)
+                                     .with("beta.mesh", "payload-json").and_return(false)
+
+      federation_helpers.announce_instance_to_all_domains
+
+      messages = federation_helpers.info_messages
+      start_entry = messages.find { |(msg, _)| msg.include?("cycle started") }
+      end_entry = messages.find { |(msg, _)| msg.include?("cycle complete") }
+
+      expect(start_entry).not_to be_nil
+      expect(start_entry.last[:target_count]).to eq(2)
+
+      expect(end_entry).not_to be_nil
+      expect(end_entry.last[:success_count]).to eq(1)
+      expect(end_entry.last[:failure_count]).to eq(1)
     end
   end
 
@@ -2104,6 +2266,40 @@ RSpec.describe PotatoMesh::App::Federation do
       window = PotatoMesh::Config.week_seconds + 60
       expect(federation_helpers.remote_active_node_count_from_stats(payload, max_age_seconds: window)).to eq(4)
     end
+
+    it "reads the 0.7.0 total.nodes shape" do
+      payload = { "total" => { "nodes" => active } }
+      expect(federation_helpers.remote_active_node_count_from_stats(payload, max_age_seconds: 7_200)).to eq(2)
+    end
+
+    it "prefers the new shape over a legacy active_nodes block" do
+      payload = {
+        "total" => { "nodes" => { "hour" => 1, "day" => 8, "week" => 9, "month" => 10 } },
+        "active_nodes" => active,
+      }
+      expect(federation_helpers.remote_active_node_count_from_stats(payload, max_age_seconds: 7_200)).to eq(8)
+    end
+
+    it "returns nil when neither stats shape is present" do
+      payload = { "sampled" => false }
+      expect(federation_helpers.remote_active_node_count_from_stats(payload, max_age_seconds: 7_200)).to be_nil
+    end
+  end
+
+  describe ".remote_stats_protocol_day" do
+    it "reads the 0.7.0 nodes sub-hash" do
+      payload = { "meshcore" => { "nodes" => { "day" => 9 } } }
+      expect(federation_helpers.remote_stats_protocol_day(payload, "meshcore")).to eq(9)
+    end
+
+    it "falls back to the legacy flat day count" do
+      payload = { "meshtastic" => { "day" => 4 } }
+      expect(federation_helpers.remote_stats_protocol_day(payload, "meshtastic")).to eq(4)
+    end
+
+    it "returns nil when neither shape carries the protocol" do
+      expect(federation_helpers.remote_stats_protocol_day({}, "meshcore")).to be_nil
+    end
   end
 
   describe ".remote_instance_attributes_from_payload (extra branches)" do
@@ -2259,6 +2455,59 @@ RSpec.describe PotatoMesh::App::Federation do
     end
   end
 
+  describe "federation counts honour the opt-out marker" do
+    around do |example|
+      Dir.mktmpdir("federation-optout-") do |dir|
+        db_path = File.join(dir, "mesh.db")
+        RSpec::Mocks.with_temporary_scope do
+          allow(PotatoMesh::Config).to receive(:db_path).and_return(db_path)
+          allow(PotatoMesh::Config).to receive(:db_busy_timeout_ms).and_return(5000)
+          db_helper = Object.new.extend(PotatoMesh::App::Database)
+          db_helper.init_db
+          db_helper.ensure_schema_upgrades
+          example.run
+        end
+      end
+    end
+
+    let(:marker) { PotatoMesh::Config.node_opt_out_marker }
+    let(:now) { Time.now.to_i }
+
+    it "excludes opted-out nodes from active_node_count_since" do
+      db = SQLite3::Database.new(PotatoMesh::Config.db_path)
+      db.execute(
+        "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role, protocol) " \
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ["!visnode1", 0x10000001, "VN", "Visible", now, now, "CLIENT", "meshtastic"],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role, protocol) " \
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ["!hidnode1", 0x10000002, "HN", "Hidden #{marker}", now, now, "CLIENT", "meshtastic"],
+      )
+      db.close
+
+      expect(federation_helpers.active_node_count_since(now - 60)).to eq(1)
+    end
+
+    it "excludes opted-out nodes from active_node_count_since_for_protocol" do
+      db = SQLite3::Database.new(PotatoMesh::Config.db_path)
+      db.execute(
+        "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role, protocol) " \
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ["!mcvisible", 0x20000001, "MV", "MC Visible", now, now, "COMPANION", "meshcore"],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role, protocol) " \
+        "VALUES (?,?,?,?,?,?,?,?)",
+        ["!mchidden", 0x20000002, "MH", "MC #{marker} Hidden", now, now, "COMPANION", "meshcore"],
+      )
+      db.close
+
+      expect(federation_helpers.active_node_count_since_for_protocol(now - 60, "meshcore")).to eq(1)
+    end
+  end
+
   describe ".federation_worker_pool" do
     it "delegates to ensure_federation_worker_pool!" do
       sentinel = Object.new
@@ -2411,6 +2660,54 @@ RSpec.describe PotatoMesh::App::Federation do
       )
 
       expect(result).to be(false)
+    end
+  end
+
+  describe "instance signature v2 migration (FS1-FS4)" do
+    let(:application_class) { PotatoMesh::Application }
+    let(:keypair) { OpenSSL::PKey::RSA.new(2048) }
+    let(:pubkey_pem) { keypair.public_key.to_pem }
+    let(:attributes) do
+      {
+        id: "inst-1", domain: "a.mesh", pubkey: pubkey_pem, name: "A",
+        version: "0.7.0", channel: "#x", frequency: "915MHz",
+        latitude: 1.0, longitude: 2.0, last_update_time: 1_700_000_000,
+        is_private: false, contact_link: "#a:x", nodes_count: 7,
+        meshcore_nodes_count: 3, meshtastic_nodes_count: 4, reticulum_nodes_count: 0,
+      }
+    end
+
+    def sign_canonical(canonical)
+      Base64.strict_encode64(keypair.sign(OpenSSL::Digest::SHA256.new, canonical))
+    end
+
+    it "signs the v2 (snake_case) canonical with a signature_version marker and signed counts" do
+      parsed = JSON.parse(application_class.canonical_instance_payload(attributes))
+      expect(parsed).to include(
+        "public_key", "last_update", "is_private", "contact_link",
+        "nodes_count", "meshcore_nodes_count", "meshtastic_nodes_count",
+        "reticulum_nodes_count", "signature_version"
+      )
+      expect(parsed["signature_version"]).to eq(2)
+      expect(parsed).not_to have_key("publicKey")
+      expect(parsed).not_to have_key("lastUpdateTime")
+      expect(parsed).not_to have_key("isPrivate")
+    end
+
+    it "verifies a v2 signature" do
+      sig = sign_canonical(application_class.canonical_instance_payload_v2(attributes))
+      expect(application_class.verify_instance_signature(attributes, sig, pubkey_pem)).to be(true)
+    end
+
+    it "still verifies a legacy v1 (camelCase) signature — backward accept" do
+      sig = sign_canonical(application_class.canonical_instance_payload_v1(attributes))
+      expect(application_class.verify_instance_signature(attributes, sig, pubkey_pem)).to be(true)
+    end
+
+    it "rejects a tampered node count (counts are signed in v2)" do
+      sig = sign_canonical(application_class.canonical_instance_payload_v2(attributes))
+      tampered = attributes.merge(nodes_count: 999)
+      expect(application_class.verify_instance_signature(tampered, sig, pubkey_pem)).to be(false)
     end
   end
 

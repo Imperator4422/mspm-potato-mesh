@@ -25,8 +25,43 @@ module PotatoMesh
     DEFAULT_DB_BUSY_RETRY_DELAY = 0.05
     DEFAULT_MAX_JSON_BODY_BYTES = 1_048_576
     DEFAULT_REFRESH_INTERVAL_SECONDS = 60
-    DEFAULT_TILE_FILTER_LIGHT = "grayscale(1) saturate(0) brightness(0.92) contrast(1.05)"
-    DEFAULT_TILE_FILTER_DARK = "grayscale(1) invert(1) brightness(0.9) contrast(1.08)"
+    # Slow safety-poll cadence used by the dashboard when live SSE updates are
+    # active (PS5): the only timer-driven fetch path while pushes flow, a
+    # fallback that converges the UI if events are missed.
+    DEFAULT_LIVE_SAFETY_POLL_SECONDS = 300
+    # Interval at which the SSE route emits a heartbeat comment so dead
+    # connections are detected and intermediaries do not buffer the stream.
+    DEFAULT_SSE_HEARTBEAT_SECONDS = 15
+    # Maximum lifetime of a single SSE connection before the server closes it,
+    # prompting the client to reconnect (and resync). Bounds per-connection
+    # thread occupancy and gives graceful shutdown a hard ceiling.
+    DEFAULT_SSE_MAX_LIFETIME_SECONDS = 600
+
+    # Default per-collection SSE publish cooldown (seconds). A burst of writes
+    # to one collection within this settle window coalesces into a single
+    # client event so N ingestors relaying one packet do not stampede
+    # subscribers (SPEC LV6).
+    DEFAULT_SSE_PUBLISH_COOLDOWN_SECONDS = 1.0
+
+    # Seconds Puma waits for in-flight requests (e.g. an open SSE stream)
+    # before force-terminating them during shutdown, so Ctrl+C reaps promptly
+    # instead of blocking on a long-lived /api/events connection. Backstop to
+    # the graceful subscriber-close performed by the shutdown signal handler.
+    DEFAULT_PUMA_FORCE_SHUTDOWN_SECONDS = 3
+
+    # Default Puma worker-thread pool bounds. The pool must stay larger than the
+    # SSE subscriber cap ({PotatoMesh::App::PubSub::MAX_SUBSCRIBERS}) by at least
+    # {DEFAULT_SSE_THREAD_RESERVE}, so a flood of long-lived +/api/events+
+    # streams (each pins one request thread for its lifetime) can never occupy
+    # every worker thread and starve API/ingest/federation traffic (SPEC
+    # PS8/PS9). Puma's own MRI default is only 5, which is why the floor is
+    # raised here in code rather than left to the deployment environment.
+    DEFAULT_PUMA_MIN_THREADS = 16
+    DEFAULT_PUMA_MAX_THREADS = 96
+    # Request threads kept in reserve for non-SSE traffic even when every SSE
+    # subscriber slot is occupied. With the defaults this reconciles the SSE cap
+    # back to its historical value (96 - 32 = 64).
+    DEFAULT_SSE_THREAD_RESERVE = 32
     DEFAULT_MAP_CENTER_LAT = 38.761944
     DEFAULT_MAP_CENTER_LON = -27.090833
     DEFAULT_MAP_CENTER = "#{DEFAULT_MAP_CENTER_LAT},#{DEFAULT_MAP_CENTER_LON}"
@@ -201,11 +236,65 @@ module PotatoMesh
     # fragile (traces, neighbors, ingestors) and as the floor for every
     # +/api/.../:id+ lookup so callers can backfill historical records that
     # would otherwise fall outside the seven-day default applied to bulk
-    # endpoints.
+    # endpoints.  This is also the absolute API-level visibility cap: no
+    # request may return data older than this window regardless of the
+    # +since+ or +windowSeconds+ parameters submitted.
     #
     # @return [Integer] seconds in twenty-eight days.
     def four_weeks_seconds
       28 * 24 * 60 * 60
+    end
+
+    # Hard retention window applied by the periodic purge job.  Rows whose
+    # most recent activity timestamp is older than this duration are deleted
+    # from the database.  The 28-day API visibility floor is enforced
+    # separately via {#four_weeks_seconds}, so the gap between the two
+    # windows preserves recoverable history without ever exposing it to API
+    # consumers.
+    #
+    # @return [Integer] seconds in 365 days.
+    def year_seconds
+      365 * 24 * 60 * 60
+    end
+
+    # Interval between consecutive retention purge passes.
+    #
+    # The retention worker wakes once per day to delete rows older than
+    # {#year_seconds}.  A daily cadence keeps the working set bounded
+    # without holding write locks for long stretches.
+    #
+    # @return [Integer] seconds between purge cycles.
+    def retention_purge_interval_seconds
+      24 * 60 * 60
+    end
+
+    # Grace period applied before the first retention purge runs after boot.
+    #
+    # Mirrors the federation-announcer pattern: the daemon yields the
+    # request thread for a short delay so initial schema migrations and
+    # federation handshakes complete before a potentially long-running
+    # +DELETE+ ties up the database.
+    #
+    # @return [Integer] seconds to wait before the first purge.
+    def initial_retention_delay_seconds
+      30
+    end
+
+    # Substring marker that signals a node has opted out of being displayed
+    # in any user-facing surface.  Operators include the marker anywhere in
+    # the node's short or long name; the API filters out any node whose
+    # display name contains this exact character (a single grapheme).  Data
+    # is still ingested so deduplication and routing continue to work.
+    #
+    # @return [String] frozen single-character opt-out marker.
+    NODE_OPT_OUT_MARKER = "\u{1F6D1}".freeze
+
+    # Expose {NODE_OPT_OUT_MARKER} via a method so callers that prefer the
+    # module-function style stay consistent with the rest of the module.
+    #
+    # @return [String] frozen opt-out marker character.
+    def node_opt_out_marker
+      NODE_OPT_OUT_MARKER
     end
 
     # Default upper bound for accepted JSON payload sizes.
@@ -224,9 +313,14 @@ module PotatoMesh
 
     # Provide the fallback version string when git metadata is unavailable.
     #
+    # 0.7.0 introduced the breaking /api/stats response-shape change
+    # (SPEC S1); 0.7.1 is the current patch release, kept in lockstep with
+    # the other language manifests. The matching +git tag v0.7.1+ is the
+    # maintainer release step.
+    #
     # @return [String] semantic version identifier.
     def version_fallback
-      "0.6.4"
+      "0.7.1"
     end
 
     # Default refresh interval for frontend polling routines.
@@ -243,28 +337,89 @@ module PotatoMesh
       default_refresh_interval_seconds
     end
 
-    # Retrieve the CSS filter used for light themed maps.
+    # Determine whether live SSE updates are offered to clients.
     #
-    # @return [String] CSS filter string.
-    def map_tile_filter_light
-      DEFAULT_TILE_FILTER_LIGHT
+    # Disabled by setting +EVENTS=0+; clients then fall back to the polling
+    # cadence ({#refresh_interval_seconds}) exactly as before (PS5/PS8).
+    #
+    # @return [Boolean] true when the +GET /api/events+ stream is served.
+    def live_updates_enabled?
+      ENV.fetch("EVENTS", "1").to_s.strip != "0"
     end
 
-    # Retrieve the CSS filter used for dark themed maps.
+    # Slow safety-poll cadence (seconds) used while live updates are active.
     #
-    # @return [String] CSS filter string for dark tiles.
-    def map_tile_filter_dark
-      DEFAULT_TILE_FILTER_DARK
+    # @return [Integer] positive interval, overridable via +LIVE_SAFETY_POLL_SECONDS+.
+    def live_safety_poll_seconds
+      fetch_positive_integer("LIVE_SAFETY_POLL_SECONDS", DEFAULT_LIVE_SAFETY_POLL_SECONDS)
     end
 
-    # Provide a simple hash of tile filters for template use.
+    # Heartbeat cadence (seconds) for the SSE stream.
     #
-    # @return [Hash] frozen mapping of themes to CSS filters.
-    def tile_filters
-      {
-        light: map_tile_filter_light,
-        dark: map_tile_filter_dark,
-      }.freeze
+    # @return [Integer] positive interval, overridable via +SSE_HEARTBEAT_SECONDS+.
+    def sse_heartbeat_seconds
+      fetch_positive_integer("SSE_HEARTBEAT_SECONDS", DEFAULT_SSE_HEARTBEAT_SECONDS)
+    end
+
+    # Maximum lifetime (seconds) of a single SSE connection.
+    #
+    # @return [Integer] positive ceiling, overridable via +SSE_MAX_LIFETIME_SECONDS+.
+    def sse_max_lifetime_seconds
+      fetch_positive_integer("SSE_MAX_LIFETIME_SECONDS", DEFAULT_SSE_MAX_LIFETIME_SECONDS)
+    end
+
+    # Per-collection SSE publish cooldown (seconds). Within this settle window
+    # a burst of writes to one collection coalesces into a single emitted
+    # event (SPEC LV6). Zero disables the cooldown (emit as soon as a change
+    # lands).
+    #
+    # @return [Float] non-negative cooldown, overridable via +SSE_PUBLISH_COOLDOWN+.
+    def sse_publish_cooldown_seconds
+      fetch_nonnegative_float("SSE_PUBLISH_COOLDOWN", DEFAULT_SSE_PUBLISH_COOLDOWN_SECONDS)
+    end
+
+    # Seconds Puma waits before force-terminating in-flight requests on
+    # shutdown (e.g. an open SSE stream), so Ctrl+C is not blocked by it.
+    #
+    # @return [Integer] positive timeout, overridable via +PUMA_FORCE_SHUTDOWN+.
+    def puma_force_shutdown_seconds
+      fetch_positive_integer("PUMA_FORCE_SHUTDOWN", DEFAULT_PUMA_FORCE_SHUTDOWN_SECONDS)
+    end
+
+    # Minimum Puma worker threads kept warm.
+    #
+    # @return [Integer] positive minimum, overridable via +MIN_THREADS+.
+    def puma_min_threads
+      fetch_positive_integer("MIN_THREADS", DEFAULT_PUMA_MIN_THREADS)
+    end
+
+    # Maximum Puma worker threads. Sized above the SSE subscriber cap plus
+    # {#sse_thread_reserve} so long-lived +/api/events+ streams cannot occupy
+    # every request thread and starve other traffic (SPEC PS9).
+    #
+    # @return [Integer] positive maximum, overridable via +MAX_THREADS+.
+    def puma_max_threads
+      fetch_positive_integer("MAX_THREADS", DEFAULT_PUMA_MAX_THREADS)
+    end
+
+    # Request threads reserved for non-SSE traffic even when every SSE
+    # subscriber slot is taken, so live updates are never load-bearing
+    # (SPEC PS8/PS9).
+    #
+    # @return [Integer] positive reserve, overridable via +SSE_THREAD_RESERVE+.
+    def sse_thread_reserve
+      fetch_positive_integer("SSE_THREAD_RESERVE", DEFAULT_SSE_THREAD_RESERVE)
+    end
+
+    # Build Puma's +Threads+ "min:max" pool spec. The minimum is clamped to the
+    # maximum so an out-of-order override (+MIN_THREADS+ > +MAX_THREADS+) cannot
+    # break the boot.
+    #
+    # @return [String] the +"min:max"+ thread-pool spec passed to Puma.
+    def puma_threads_setting
+      max = puma_max_threads
+      min = [puma_min_threads, max].min
+      "#{min}:#{max}"
     end
 
     # Retrieve the raw comma separated Prometheus report identifiers.
@@ -364,6 +519,16 @@ module PotatoMesh
     # @return [String] RFC-compliant algorithm label.
     def instance_signature_algorithm
       "rsa-sha256"
+    end
+
+    # Current federation signature/canonical format version (SPEC FS3).  Stamped
+    # inside every signed payload (instance announcement + well-known) so the
+    # format cannot be silently downgraded; verifiers accept this version and the
+    # legacy unmarked v1 form.
+    #
+    # @return [Integer] the current signature format version.
+    def federation_signature_version
+      2
     end
 
     # Connection timeout used when establishing federation HTTP sockets.
@@ -754,6 +919,25 @@ module PotatoMesh
       end
 
       parsed.positive? ? parsed : default
+    end
+
+    # Fetch a non-negative float from the environment, falling back to
+    # +default+ when unset, blank, unparseable, or negative.
+    #
+    # @param key [String] environment variable name.
+    # @param default [Float] fallback value.
+    # @return [Float] the parsed non-negative float, or +default+.
+    def fetch_nonnegative_float(key, default)
+      value = ENV[key]
+      return default if value.nil?
+
+      trimmed = value.strip
+      return default if trimmed.empty?
+
+      parsed = Float(trimmed, exception: false)
+      return default if parsed.nil? || parsed.negative?
+
+      parsed
     end
 
     # Resolve the effective XDG directory honoring environment overrides.

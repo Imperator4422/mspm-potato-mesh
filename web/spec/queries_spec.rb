@@ -151,6 +151,53 @@ RSpec.describe PotatoMesh::App::Queries do
   end
 
   # ---------------------------------------------------------------------------
+  # coerce_positive_or_nil — read-side guard against truthy-zero ISO emission
+  # (issue #782).  Every branch is exercised: nil, non-positive, future-clamped,
+  # numeric-string, non-numeric, and the happy path.
+  # ---------------------------------------------------------------------------
+  describe "#coerce_positive_or_nil" do
+    it "returns nil when value is nil" do
+      expect(queries.coerce_positive_or_nil(nil)).to be_nil
+    end
+
+    it "returns nil for zero (the truthy-zero case)" do
+      expect(queries.coerce_positive_or_nil(0)).to be_nil
+    end
+
+    it "returns nil for negative integers" do
+      expect(queries.coerce_positive_or_nil(-1)).to be_nil
+    end
+
+    it "returns the integer for positive integers" do
+      expect(queries.coerce_positive_or_nil(42)).to eq(42)
+    end
+
+    it "coerces numeric strings to integers" do
+      expect(queries.coerce_positive_or_nil("123")).to eq(123)
+    end
+
+    it "returns nil for the literal string '0'" do
+      expect(queries.coerce_positive_or_nil("0")).to be_nil
+    end
+
+    it "returns nil for non-numeric strings" do
+      expect(queries.coerce_positive_or_nil("not-a-number")).to be_nil
+    end
+
+    it "returns nil for values exceeding the ceiling" do
+      expect(queries.coerce_positive_or_nil(100, ceiling: 50)).to be_nil
+    end
+
+    it "returns the value when equal to the ceiling (inclusive)" do
+      expect(queries.coerce_positive_or_nil(50, ceiling: 50)).to eq(50)
+    end
+
+    it "ignores the ceiling when nil" do
+      expect(queries.coerce_positive_or_nil(1_000_000)).to eq(1_000_000)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # append_protocol_filter
   # ---------------------------------------------------------------------------
   describe "#append_protocol_filter" do
@@ -419,6 +466,41 @@ RSpec.describe PotatoMesh::App::Queries do
       expect(rows).to be_empty
     end
 
+    # Regression for issue #782: a stored `position_time = 0` historically
+    # bypassed the `if pt` ISO guard because Ruby treats `0` as truthy, leaking
+    # "1970-01-01T00:00:00Z" into API responses.  `coerce_positive_or_nil`
+    # normalises the value to nil so neither the column nor its ISO sibling
+    # surface in the row.
+    it "strips position_time = 0 sentinels and emits no epoch ISO" do
+      with_db do |db|
+        db.execute(
+          "UPDATE nodes SET position_time = ?, latitude = ?, longitude = ? WHERE node_id = ?",
+          [0, 0.0, 0.0, "!aabbccdd"],
+        )
+      end
+      rows = queries.query_nodes(10, node_ref: "!aabbccdd")
+      row = rows.find { |r| r["node_id"] == "!aabbccdd" }
+      expect(row).not_to be_nil
+      expect(row).not_to have_key("position_time")
+      expect(row).not_to have_key("pos_time_iso")
+      expect(row.values).not_to include("1970-01-01T00:00:00Z")
+    end
+
+    it "strips last_heard = 0 sentinels and emits no epoch ISO" do
+      with_db do |db|
+        db.execute(
+          "UPDATE nodes SET last_heard = ? WHERE node_id = ?",
+          [0, "!aabbccdd"],
+        )
+      end
+      rows = queries.query_nodes(10, node_ref: "!aabbccdd")
+      row = rows.find { |r| r["node_id"] == "!aabbccdd" }
+      expect(row).not_to be_nil
+      expect(row).not_to have_key("last_heard")
+      expect(row).not_to have_key("last_seen_iso")
+      expect(row.values).not_to include("1970-01-01T00:00:00Z")
+    end
+
     context "COMPANION short name enrichment" do
       it "derives a two-initial short name for a COMPANION node with a two-word long name" do
         with_db do |db|
@@ -595,6 +677,30 @@ RSpec.describe PotatoMesh::App::Queries do
       expect(scoped_ids).to include(101)
       expect(scoped_ids).to include(102)
     end
+
+    it "applies an inclusive before cursor and ignores a non-positive one (issue #796)" do
+      with_db do |db|
+        [10, 20, 30].each do |offset|
+          rx = now - offset
+          db.execute(
+            "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES (?,?,?,?,?,?,?)",
+            [200 + offset, rx, Time.at(rx).utc.iso8601, "!aabbccdd", "!ffffffff", 0, "m#{offset}"],
+          )
+        end
+      end
+
+      # Inclusive ceiling: the row exactly at the cursor stays; newer rows drop.
+      # This is what lets the client page backward by feeding the oldest rx_time
+      # of each page as the next cursor without skipping boundary-second rows.
+      paged = queries.query_messages(10, before: now - 20).map { |r| r["id"] }
+      expect(paged).to include(220, 230)
+      expect(paged).not_to include(210) # newer than the cursor
+      expect(paged).not_to include(1)   # base row at `now` is newer than the cursor
+
+      # A non-positive cursor is treated as "no cursor" — the default window.
+      unbounded = queries.query_messages(10, before: 0).map { |r| r["id"] }
+      expect(unbounded).to include(1, 210, 220, 230)
+    end
   end
 
   describe "#query_telemetry" do
@@ -640,6 +746,25 @@ RSpec.describe PotatoMesh::App::Queries do
     it "filters by node_ref" do
       rows = queries.query_positions(10, node_ref: "!aabbccdd")
       expect(rows.length).to be >= 1
+    end
+
+    # Regression for issue #782: legacy rows seeded with `position_time = 0`
+    # must not surface "1970-01-01T00:00:00Z" via the `position_time_iso`
+    # output.  See `coerce_positive_or_nil` in queries/common.rb.
+    it "strips position_time = 0 sentinels from position rows" do
+      with_db do |db|
+        rx_iso = Time.at(now).utc.iso8601
+        db.execute(
+          "INSERT INTO positions(id, rx_time, rx_iso, node_id, latitude, longitude, position_time) " \
+          "VALUES (?,?,?,?,?,?,?)",
+          [2, now, rx_iso, "!aabbccdd", 52.0, 13.0, 0],
+        )
+      end
+      row = queries.query_positions(10).find { |r| r["id"] == 2 }
+      expect(row).not_to be_nil
+      expect(row).not_to have_key("position_time")
+      expect(row).not_to have_key("position_time_iso")
+      expect(row.values).not_to include("1970-01-01T00:00:00Z")
     end
   end
 
@@ -775,6 +900,383 @@ RSpec.describe PotatoMesh::App::Queries do
       expect(clause).not_to be_nil
       sql_fragment, _params = clause
       expect(sql_fragment).to include("OR")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # opt-out helpers (🛑 in long/short name)
+  # ---------------------------------------------------------------------------
+  describe "#opt_out_marker_params" do
+    it "returns the marker twice so each LIKE expression has a bound value" do
+      params = queries.opt_out_marker_params
+      expect(params.length).to eq(2)
+      expect(params).to all(eq(PotatoMesh::Config.node_opt_out_marker))
+    end
+  end
+
+  describe "#opt_out_self_filter" do
+    it "is a negation of the OR-of-LIKE name predicate" do
+      fragment = queries.opt_out_self_filter
+      expect(fragment).to start_with("NOT ")
+      expect(fragment).to include("COALESCE(long_name")
+      expect(fragment).to include("COALESCE(short_name")
+    end
+  end
+
+  describe "#opt_out_node_id_filter" do
+    it "wraps the column lookup with NULL passthrough" do
+      fragment = queries.opt_out_node_id_filter("m.from_id")
+      expect(fragment).to include("m.from_id IS NULL")
+      expect(fragment).to include("m.from_id NOT IN")
+      expect(fragment).to include("SELECT node_id FROM nodes")
+    end
+
+    it "guards the inner subquery against NULL node_id values" do
+      # SQLite's `NOT IN (subquery returning NULL)` evaluates to UNKNOWN and
+      # would silently drop every row.  The subquery must reject NULL ids.
+      fragment = queries.opt_out_node_id_filter("from_id")
+      expect(fragment).to include("node_id IS NOT NULL")
+    end
+
+    it "rejects column identifiers containing unsafe characters" do
+      expect { queries.opt_out_node_id_filter("from_id; DROP TABLE nodes--") }.to raise_error(ArgumentError, /unsafe column identifier/)
+      expect { queries.opt_out_node_id_filter("") }.to raise_error(ArgumentError, /unsafe column identifier/)
+      expect { queries.opt_out_node_id_filter(nil) }.to raise_error(ArgumentError, /unsafe column identifier/)
+    end
+  end
+
+  describe "#opt_out_node_num_filter" do
+    it "guards against NULL numeric IDs and skips nodes without num" do
+      fragment = queries.opt_out_node_num_filter("src")
+      expect(fragment).to include("src IS NULL")
+      expect(fragment).to include("src NOT IN")
+      expect(fragment).to include("num IS NOT NULL")
+    end
+
+    it "rejects column identifiers containing unsafe characters" do
+      expect { queries.opt_out_node_num_filter("src OR 1=1") }.to raise_error(ArgumentError, /unsafe column identifier/)
+    end
+  end
+
+  describe "#assert_safe_column_identifier!" do
+    it "accepts bare identifiers and dotted qualifiers" do
+      expect(queries.assert_safe_column_identifier!("node_id")).to eq("node_id")
+      expect(queries.assert_safe_column_identifier!("m.from_id")).to eq("m.from_id")
+    end
+
+    it "rejects anything else" do
+      ["1bad", "a.b.c", "name`", "name with space", nil, 42].each do |bad|
+        expect { queries.assert_safe_column_identifier!(bad) }.to raise_error(ArgumentError, /unsafe column identifier/)
+      end
+    end
+  end
+
+  describe "#append_opt_out_filter" do
+    it "appends the SQL fragment and its two marker bind values" do
+      clauses = []
+      params = []
+      queries.append_opt_out_filter(clauses, params, queries.opt_out_self_filter)
+      expect(clauses.length).to eq(1)
+      expect(params.length).to eq(2)
+    end
+  end
+
+  describe "#clamp_window_seconds" do
+    it "returns nil for non-positive or nil input" do
+      expect(queries.clamp_window_seconds(nil)).to be_nil
+      expect(queries.clamp_window_seconds(0)).to be_nil
+      expect(queries.clamp_window_seconds(-1)).to be_nil
+    end
+
+    it "passes positive values through when within the 28-day cap" do
+      expect(queries.clamp_window_seconds(60)).to eq(60)
+    end
+
+    it "clamps oversized windows to four_weeks_seconds" do
+      huge = PotatoMesh::Config.four_weeks_seconds * 10
+      expect(queries.clamp_window_seconds(huge)).to eq(PotatoMesh::Config.four_weeks_seconds)
+    end
+  end
+
+  describe "opt-out filtering in read queries" do
+    let(:marker) { PotatoMesh::Config.node_opt_out_marker }
+
+    # Seed a visible node and an opted-out node sharing similar telemetry,
+    # message, position, neighbor, and trace footprints so each query helper
+    # can be checked for opt-out compliance from one fixture.
+    before do
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role) " \
+          "VALUES (?,?,?,?,?,?,?)",
+          ["!visible0", 0x00bb0001, "VIS", "Visible Node", now, now, "CLIENT"],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role) " \
+          "VALUES (?,?,?,?,?,?,?)",
+          ["!optout01", 0x00bb0002, "OUT", "Hidden #{marker} Node", now, now, "CLIENT"],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role) " \
+          "VALUES (?,?,?,?,?,?,?)",
+          ["!optshort", 0x00bb0003, "S#{marker}X", "Short Marker", now, now, "CLIENT"],
+        )
+
+        rx_iso = Time.at(now).utc.iso8601
+        db.execute(
+          "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES (?,?,?,?,?,?,?)",
+          [10, now, rx_iso, "!visible0", "!ffffffff", 0, "from-visible"],
+        )
+        db.execute(
+          "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES (?,?,?,?,?,?,?)",
+          [11, now, rx_iso, "!optout01", "!ffffffff", 0, "from-optout"],
+        )
+        db.execute(
+          "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES (?,?,?,?,?,?,?)",
+          [12, now, rx_iso, "!visible0", "!optout01", 0, "to-optout"],
+        )
+
+        db.execute(
+          "INSERT INTO positions(id, rx_time, rx_iso, node_id, latitude, longitude) VALUES (?,?,?,?,?,?)",
+          [10, now, rx_iso, "!visible0", 52.0, 13.0],
+        )
+        db.execute(
+          "INSERT INTO positions(id, rx_time, rx_iso, node_id, latitude, longitude) VALUES (?,?,?,?,?,?)",
+          [11, now, rx_iso, "!optout01", 53.0, 14.0],
+        )
+
+        db.execute(
+          "INSERT INTO telemetry(id, rx_time, rx_iso, node_id, telemetry_type) VALUES (?,?,?,?,?)",
+          [10, now, rx_iso, "!visible0", "device"],
+        )
+        db.execute(
+          "INSERT INTO telemetry(id, rx_time, rx_iso, node_id, telemetry_type) VALUES (?,?,?,?,?)",
+          [11, now, rx_iso, "!optout01", "device"],
+        )
+
+        db.execute(
+          "INSERT INTO neighbors(node_id, neighbor_id, snr, rx_time) VALUES (?,?,?,?)",
+          ["!visible0", "!optout01", 5.0, now],
+        )
+
+        db.execute(
+          "INSERT INTO traces(id, rx_time, rx_iso, src, dest) VALUES (?,?,?,?,?)",
+          [10, now, rx_iso, 0x00bb0001, 0xdeadbeef],
+        )
+        db.execute(
+          "INSERT INTO traces(id, rx_time, rx_iso, src, dest) VALUES (?,?,?,?,?)",
+          [11, now, rx_iso, 0x00bb0002, 0xdeadbeef],
+        )
+        db.execute(
+          "INSERT INTO trace_hops(trace_id, hop_index, node_id) VALUES (?,?,?)",
+          [10, 0, 0x00bb0002],
+        )
+
+        db.execute(
+          "INSERT INTO ingestors(node_id, start_time, last_seen_time, version) VALUES (?,?,?,?)",
+          ["!visible0", now, now, "1.0"],
+        )
+        db.execute(
+          "INSERT INTO ingestors(node_id, start_time, last_seen_time, version) VALUES (?,?,?,?)",
+          ["!optout01", now, now, "1.0"],
+        )
+      end
+    end
+
+    it "excludes opted-out nodes from query_nodes by long_name marker" do
+      ids = queries.query_nodes(50).map { |row| row["node_id"] }
+      expect(ids).to include("!visible0")
+      expect(ids).not_to include("!optout01")
+    end
+
+    it "excludes opted-out nodes from query_nodes by short_name marker" do
+      ids = queries.query_nodes(50).map { |row| row["node_id"] }
+      expect(ids).not_to include("!optshort")
+    end
+
+    it "returns no row when querying a single opted-out node by id" do
+      rows = queries.query_nodes(10, node_ref: "!optout01")
+      expect(rows).to be_empty
+    end
+
+    it "drops chat lines whose sender or recipient is opted out" do
+      texts = queries.query_messages(50, include_encrypted: true).map { |r| r["text"] }
+      expect(texts).to include("from-visible")
+      expect(texts).not_to include("from-optout")
+      expect(texts).not_to include("to-optout")
+    end
+
+    it "hides position rows for opted-out nodes" do
+      ids = queries.query_positions(50).map { |r| r["node_id"] }
+      expect(ids).to include("!visible0")
+      expect(ids).not_to include("!optout01")
+    end
+
+    it "hides telemetry rows for opted-out nodes" do
+      ids = queries.query_telemetry(50).map { |r| r["node_id"] }
+      expect(ids).to include("!visible0")
+      expect(ids).not_to include("!optout01")
+    end
+
+    it "hides neighbour relationships involving opted-out nodes" do
+      rows = queries.query_neighbors(50)
+      expect(rows).to be_empty
+    end
+
+    it "hides traces whose src or dest is opted out" do
+      ids = queries.query_traces(50).map { |r| r["id"] }
+      expect(ids).to include(10)
+      expect(ids).not_to include(11)
+    end
+
+    it "scrubs opted-out hop ids from surviving traces" do
+      rows = queries.query_traces(50)
+      trace_10 = rows.find { |r| r["id"] == 10 }
+      expect(trace_10).not_to be_nil
+      # Hop 0x00bb0002 belongs to the opted-out node and must be filtered out
+      # of the hop list even though the parent trace is visible.
+      expect(trace_10["hops"]).to be_nil
+    end
+
+    it "hides ingestor heartbeats for opted-out nodes" do
+      ids = queries.query_ingestors(50).map { |r| r["node_id"] }
+      expect(ids).to include("!visible0")
+      expect(ids).not_to include("!optout01")
+    end
+
+    it "excludes opted-out nodes from active stats counters" do
+      stats = queries.query_active_node_stats(now: now)
+      # Only "!visible0" is visible — opted-out and short-marker nodes are dropped
+      # from node, message, and telemetry counts alike.
+      expect(stats["total"]["nodes"]["day"]).to eq(1)
+      expect(stats["total"]["nodes"]["month"]).to eq(1)
+      # Message id 11 (from opt-out) and id 12 (to opt-out) drop; only the
+      # visible → broadcast line survives.
+      expect(stats["total"]["messages"]["day"]).to eq(1)
+      # Telemetry umbrella = positions(1) + telemetry(1) + neighbors(0, peer
+      # opted out) + traces(1, the opted-out src dropped).
+      expect(stats["total"]["telemetry"]["day"]).to eq(3)
+    end
+  end
+
+  describe "#query_active_node_stats" do
+    it "returns the full scope × metric × window tree" do
+      stats = queries.query_active_node_stats(now: now)
+      %w[total meshcore meshtastic reticulum].each do |scope|
+        expect(stats).to have_key(scope)
+        %w[nodes messages telemetry].each do |metric|
+          expect(stats[scope][metric].keys).to contain_exactly("hour", "day", "week", "month")
+          stats[scope][metric].each_value { |count| expect(count).to be_a(Integer) }
+        end
+      end
+      # The pre-0.7.0 flat keys are gone (intended breaking change).
+      expect(stats).not_to have_key("active_nodes")
+      expect(stats).not_to have_key("hour")
+    end
+
+    it "counts total across all protocols with per-protocol subsets" do
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, num, last_heard, first_heard, role, protocol) VALUES (?,?,?,?,?,?)",
+          ["!core0001", 0xC0000001, now, now, "CLIENT", "meshcore"],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, num, last_heard, first_heard, role, protocol) VALUES (?,?,?,?,?,?)",
+          ["!tastic01", 0x70000001, now, now, "CLIENT", "meshtastic"],
+        )
+      end
+      stats = queries.query_active_node_stats(now: now)
+      expect(stats["meshcore"]["nodes"]["day"]).to eq(1)
+      expect(stats["meshtastic"]["nodes"]["day"]).to eq(1)
+      expect(stats["total"]["nodes"]["day"]).to eq(2)
+      expect(stats["total"]["nodes"]["day"]).to eq(
+        stats["meshcore"]["nodes"]["day"] + stats["meshtastic"]["nodes"]["day"],
+      )
+    end
+
+    it "aggregates positions, telemetry, neighbors, and traces into the telemetry umbrella" do
+      with_db do |db|
+        rx_iso = Time.at(now).utc.iso8601
+        db.execute("INSERT INTO positions(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!feed0001"])
+        db.execute("INSERT INTO telemetry(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!feed0001"])
+        db.execute("INSERT INTO neighbors(node_id, neighbor_id, rx_time) VALUES (?,?,?)", ["!feed0001", "!feed0002", now])
+        db.execute("INSERT INTO traces(id, rx_time, rx_iso, src, dest) VALUES (?,?,?,?,?)", [1, now, rx_iso, 0x11, 0x22])
+      end
+      stats = queries.query_active_node_stats(now: now)
+      # One row in each of the four umbrella tables → 4.
+      expect(stats["total"]["telemetry"]["hour"]).to eq(4)
+    end
+
+    it "caps the node month bucket at four_weeks_seconds (28 days)" do
+      twenty_nine_days_ago = now - (29 * 24 * 60 * 60)
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, num, short_name, last_heard, first_heard, role) VALUES (?,?,?,?,?,?)",
+          ["!29dayago", 0x29000001, "OLD", twenty_nine_days_ago, twenty_nine_days_ago, "CLIENT"],
+        )
+      end
+      stats = queries.query_active_node_stats(now: now)
+      # 28-day cap means this 29-day-old row falls outside the "month" bucket.
+      expect(stats["total"]["nodes"]["month"]).to eq(0)
+    end
+
+    it "caps the telemetry umbrella month bucket at the visibility floor" do
+      old = now - (29 * 24 * 60 * 60)
+      with_db do |db|
+        db.execute("INSERT INTO positions(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, old, Time.at(old).utc.iso8601, "!feed0001"])
+        db.execute("INSERT INTO positions(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [2, now, Time.at(now).utc.iso8601, "!feed0001"])
+      end
+      stats = queries.query_active_node_stats(now: now)
+      # Only the recent row falls inside the month window (28-day floor; the spec
+      # stubs four_weeks_seconds to 7 days, so the 29-day-old row is excluded).
+      expect(stats["total"]["telemetry"]["month"]).to eq(1)
+    end
+
+    it "emits reticulum as an all-zero stub" do
+      with_db do |db|
+        db.execute("INSERT INTO nodes(node_id, num, last_heard, first_heard, role) VALUES (?,?,?,?,?)", ["!any00001", 1, now, now, "CLIENT"])
+      end
+      stats = queries.query_active_node_stats(now: now)
+      stats["reticulum"].each_value do |windows|
+        windows.each_value { |count| expect(count).to eq(0) }
+      end
+    end
+
+    it "zeroes message counts in private mode but keeps nodes and telemetry" do
+      private_queries = Class.new(harness_class) do
+        def private_mode?
+          true
+        end
+      end.new
+      with_db do |db|
+        rx_iso = Time.at(now).utc.iso8601
+        db.execute("INSERT INTO nodes(node_id, num, last_heard, first_heard, role) VALUES (?,?,?,?,?)", ["!priv0001", 1, now, now, "CLIENT"])
+        db.execute("INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES (?,?,?,?,?,?,?)", [1, now, rx_iso, "!priv0001", "!ffffffff", 0, "hi"])
+        db.execute("INSERT INTO positions(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!priv0001"])
+      end
+      stats = private_queries.query_active_node_stats(now: now)
+      expect(stats["total"]["messages"]["day"]).to eq(0)
+      expect(stats["meshtastic"]["messages"]["day"]).to eq(0)
+      # Non-message metrics are unaffected by privacy mode.
+      expect(stats["total"]["nodes"]["day"]).to eq(1)
+      expect(stats["total"]["telemetry"]["day"]).to eq(1)
+    end
+  end
+
+  describe "#query_telemetry_buckets" do
+    it "clamps oversized window_seconds to the 28-day visibility cap" do
+      huge_window = PotatoMesh::Config.four_weeks_seconds * 50
+      rows = queries.query_telemetry_buckets(
+        window_seconds: huge_window,
+        bucket_seconds: PotatoMesh::App::Queries::DEFAULT_TELEMETRY_BUCKET_SECONDS,
+      )
+      # Even with a 50× window the implementation must not look beyond 28 days;
+      # the returned bucket set therefore matches a 28-day query exactly.
+      reference = queries.query_telemetry_buckets(
+        window_seconds: PotatoMesh::Config.four_weeks_seconds,
+        bucket_seconds: PotatoMesh::App::Queries::DEFAULT_TELEMETRY_BUCKET_SECONDS,
+      )
+      expect(rows.length).to eq(reference.length)
     end
   end
 end

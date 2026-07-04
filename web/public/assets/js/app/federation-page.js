@@ -24,6 +24,7 @@ import { resolveLegendVisibility } from './map-legend-visibility.js';
 import { mergeConfig } from './settings.js';
 import { roleColors } from './role-helpers.js';
 import { meshcoreIconHtml, meshtasticIconHtml } from './protocol-helpers.js';
+import { TILE_LAYER_URL, TILE_LAYER_OPTIONS } from './basemap-config.js';
 
 /**
  * Escape HTML special characters to prevent XSS.
@@ -333,8 +334,6 @@ function toggleLegendHiddenClass(container, hidden) {
   }
 }
 
-const TILE_LAYER_URL = 'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png';
-
 /**
  * Initialize the federation page by fetching instances, rendering the map,
  * and populating the table.
@@ -368,7 +367,6 @@ export async function initializeFederationPage(options = {}) {
 
   let map = null;
   let markersLayer = null;
-  let tileLayer = null;
   let legendContainer = null;
   let legendToggleButton = null;
   let legendVisible = true;
@@ -384,7 +382,7 @@ export async function initializeFederationPage(options = {}) {
       defaultDirection: 'asc'
     },
     domain: { getValue: inst => inst.domain ?? '', compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
-    contact: { getValue: inst => inst.contactLink ?? '', compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
+    contact: { getValue: inst => (inst.contact_link ?? inst.contactLink) ?? '', compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
     version: { getValue: inst => inst.version ?? '', compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
     channel: { getValue: inst => inst.channel ?? '', compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
     frequency: { getValue: inst => inst.frequency ?? '', compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
@@ -395,13 +393,13 @@ export async function initializeFederationPage(options = {}) {
       defaultDirection: 'desc'
     },
     meshcoreNodesCount: {
-      getValue: inst => toFiniteNumber(inst.meshcoreNodesCount),
+      getValue: inst => toFiniteNumber(inst.meshcore_nodes_count ?? inst.meshcoreNodesCount),
       compare: compareNumber,
       hasValue: hasNumberValue,
       defaultDirection: 'desc'
     },
     meshtasticNodesCount: {
-      getValue: inst => toFiniteNumber(inst.meshtasticNodesCount),
+      getValue: inst => toFiniteNumber(inst.meshtastic_nodes_count ?? inst.meshtasticNodesCount),
       compare: compareNumber,
       hasValue: hasNumberValue,
       defaultDirection: 'desc'
@@ -409,7 +407,7 @@ export async function initializeFederationPage(options = {}) {
     latitude: { getValue: inst => toFiniteNumber(inst.latitude), compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'asc' },
     longitude: { getValue: inst => toFiniteNumber(inst.longitude), compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'asc' },
     lastUpdateTime: {
-      getValue: inst => toFiniteNumber(inst.lastUpdateTime),
+      getValue: inst => toFiniteNumber(inst.last_update ?? inst.lastUpdateTime),
       compare: compareNumber,
       hasValue: hasNumberValue,
       defaultDirection: 'desc'
@@ -488,12 +486,12 @@ export async function initializeFederationPage(options = {}) {
       const domainHtml = url
         ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener">${escapeHtml(instance.domain || '')}</a>`
         : escapeHtml(instance.domain || '');
-      const contactHtml = renderContactHtml(instance.contactLink);
-      const nodesCountValue = toFiniteNumber(instance.nodesCount ?? instance.nodes_count);
+      const contactHtml = renderContactHtml(instance.contact_link ?? instance.contactLink);
+      const nodesCountValue = toFiniteNumber(instance.nodes_count ?? instance.nodesCount);
       const nodesCountText = nodesCountValue == null ? '<em>—</em>' : escapeHtml(String(nodesCountValue));
-      const mcNodesVal = toFiniteNumber(instance.meshcoreNodesCount);
+      const mcNodesVal = toFiniteNumber(instance.meshcore_nodes_count ?? instance.meshcoreNodesCount);
       const mcNodesText = mcNodesVal == null ? '<em>—</em>' : `${meshcoreIconHtml()} ${escapeHtml(String(mcNodesVal))}`;
-      const mtNodesVal = toFiniteNumber(instance.meshtasticNodesCount);
+      const mtNodesVal = toFiniteNumber(instance.meshtastic_nodes_count ?? instance.meshtasticNodesCount);
       const mtNodesText = mtNodesVal == null ? '<em>—</em>' : `${meshtasticIconHtml()} ${escapeHtml(String(mtNodesVal))}`;
 
       tr.innerHTML = `
@@ -508,7 +506,7 @@ export async function initializeFederationPage(options = {}) {
         <td class="instances-col instances-col--meshtastic-nodes mono">${mtNodesText}</td>
         <td class="instances-col instances-col--latitude mono">${fmtCoords(instance.latitude)}</td>
         <td class="instances-col instances-col--longitude mono">${fmtCoords(instance.longitude)}</td>
-        <td class="instances-col instances-col--last-update mono">${timeAgo(instance.lastUpdateTime, nowSec)}</td>
+        <td class="instances-col instances-col--last-update mono">${timeAgo(instance.last_update ?? instance.lastUpdateTime, nowSec)}</td>
       `;
 
       frag.appendChild(tr);
@@ -580,71 +578,14 @@ export async function initializeFederationPage(options = {}) {
     });
   };
 
-  /**
-   * Resolve the active theme based on the DOM state.
-   *
-   * @returns {'dark' | 'light'}
-   */
-  const resolveTheme = () => {
-    if (document.body && document.body.classList.contains('dark')) return 'dark';
-    const htmlTheme = document.documentElement?.getAttribute('data-theme');
-    if (htmlTheme === 'dark' || htmlTheme === 'light') return htmlTheme;
-    return 'dark';
-  };
-
-  /**
-   * Apply the configured CSS filter to the active tile container.
-   *
-   * @returns {void}
-   */
-  const applyTileFilter = () => {
-    if (!tileLayer) return;
-    const theme = resolveTheme();
-    const filterValue = theme === 'dark' ? config.tileFilters.dark : config.tileFilters.light;
-    const container =
-      typeof tileLayer.getContainer === 'function' ? tileLayer.getContainer() : null;
-    if (container && container.style) {
-      container.style.filter = filterValue;
-      container.style.webkitFilter = filterValue;
-    }
-    const tilePane = map && typeof map.getPane === 'function' ? map.getPane('tilePane') : null;
-    if (tilePane && tilePane.style) {
-      tilePane.style.filter = filterValue;
-      tilePane.style.webkitFilter = filterValue;
-    }
-    const tileNodes = [];
-    if (container && typeof container.querySelectorAll === 'function') {
-      tileNodes.push(...container.querySelectorAll('.leaflet-tile'));
-    }
-    if (tilePane && typeof tilePane.querySelectorAll === 'function') {
-      tileNodes.push(...tilePane.querySelectorAll('.leaflet-tile'));
-    }
-    tileNodes.forEach(tile => {
-      if (tile && tile.style) {
-        tile.style.filter = filterValue;
-        tile.style.webkitFilter = filterValue;
-      }
-    });
-  };
-
   // Initialize the map if Leaflet is available
   if (hasLeaflet && mapContainer) {
     const initialZoom = Number.isFinite(config.mapZoom) ? config.mapZoom : 5;
     map = leaflet.map(mapContainer, { worldCopyJump: true, attributionControl: false });
     map.setView([config.mapCenter.lat, config.mapCenter.lon], initialZoom);
 
-    tileLayer = leaflet
-      .tileLayer(TILE_LAYER_URL, {
-        maxZoom: 19,
-        className: 'map-tiles',
-        crossOrigin: 'anonymous'
-      })
-      .addTo(map);
+    leaflet.tileLayer(TILE_LAYER_URL, TILE_LAYER_OPTIONS).addTo(map);
 
-    tileLayer.on?.('load', applyTileFilter);
-    applyTileFilter();
-
-    window.addEventListener('themechange', applyTileFilter);
     markersLayer = leaflet.layerGroup().addTo(map);
   }
 

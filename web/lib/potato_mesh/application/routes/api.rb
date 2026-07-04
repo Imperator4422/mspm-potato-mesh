@@ -56,21 +56,21 @@ module PotatoMesh
             payload = {
               name: sanitized_site_name,
               version: app_constant(:APP_VERSION),
-              lastNodeUpdate: last_update,
+              last_node_update: last_update,
               config: {
-                siteName: sanitized_site_name,
+                site_name: sanitized_site_name,
                 channel: sanitized_channel,
                 frequency: sanitized_frequency,
-                contactLink: sanitized_contact_link,
-                contactLinkUrl: sanitized_contact_link_url,
-                refreshIntervalSeconds: PotatoMesh::Config.refresh_interval_seconds,
-                mapCenter: {
+                contact_link: sanitized_contact_link,
+                contact_link_url: sanitized_contact_link_url,
+                refresh_interval_seconds: PotatoMesh::Config.refresh_interval_seconds,
+                map_center: {
                   lat: PotatoMesh::Config.map_center_lat,
                   lon: PotatoMesh::Config.map_center_lon,
                 },
-                maxDistanceKm: PotatoMesh::Config.max_distance_km,
-                instanceDomain: app_constant(:INSTANCE_DOMAIN),
-                privateMode: private_mode?,
+                max_distance_km: PotatoMesh::Config.max_distance_km,
+                instance_domain: app_constant(:INSTANCE_DOMAIN),
+                private_mode: private_mode?,
               },
             }
             payload.to_json
@@ -89,10 +89,15 @@ module PotatoMesh
             since = params["since"]
             protocol = sanitize_protocol(params["protocol"])
             since_val = coerce_integer(since) || 0
+            # Inclusive upper-bound cursor for backward pagination (SPEC BP1).  A
+            # request carrying +before+ is a history page, so — like a +since+
+            # query — it bypasses the shared cache (which only memoises the
+            # default newest-page feed).
+            before = coerce_positive_or_nil(params["before"])
             priv = private_mode? ? 1 : 0
 
-            if since_val > 0
-              json_body = query_nodes(limit, since: since, protocol: protocol).to_json
+            if since_val > 0 || before
+              json_body = query_nodes(limit, since: since, before: before, protocol: protocol).to_json
               etag Digest::MD5.hexdigest(json_body), kind: :weak
               api_cache_control
               json_body
@@ -110,16 +115,9 @@ module PotatoMesh
             content_type :json
             priv = private_mode? ? 1 : 0
             cached = PotatoMesh::App::ApiCache.fetch("api:stats:#{priv}", ttl_seconds: 15) do
-              stats = query_active_node_stats
-              {
-                active_nodes: {
-                  "hour" => stats["hour"], "day" => stats["day"],
-                  "week" => stats["week"], "month" => stats["month"],
-                },
-                meshcore: stats["meshcore"],
-                meshtastic: stats["meshtastic"],
-                sampled: false,
-              }.to_json
+              # Scope → metric → window tree (SPEC S1). +sampled+ stays last and
+              # +false+ for backward continuity with the prior payload.
+              query_active_node_stats.merge("sampled" => false).to_json
             end
 
             etag cached[:etag], kind: :weak
@@ -146,9 +144,11 @@ module PotatoMesh
             protocol = sanitize_protocol(params["protocol"])
             since = params["since"]
             since_val = coerce_integer(since) || 0
+            # Backward-pagination cursor (SPEC BP1); bypasses the cache like +since+.
+            before = coerce_positive_or_nil(params["before"])
 
-            if since_val > 0
-              json_body = query_ingestors(limit, since: since, protocol: protocol).to_json
+            if since_val > 0 || before
+              json_body = query_ingestors(limit, since: since, before: before, protocol: protocol).to_json
               etag Digest::MD5.hexdigest(json_body), kind: :weak
               api_cache_control
               json_body
@@ -168,11 +168,15 @@ module PotatoMesh
             include_encrypted = coerce_boolean(params["encrypted"]) || false
             since = coerce_integer(params["since"])
             since = 0 if since.nil? || since.negative?
+            # Upper-bound cursor for backward pagination (issue #796).  A request
+            # carrying +before+ is a history page, so it bypasses the shared
+            # response cache (which only memoises the default newest-page feed).
+            before = coerce_positive_or_nil(params["before"])
             protocol = sanitize_protocol(params["protocol"])
             enc_key = include_encrypted ? "1" : "0"
 
-            if since > 0
-              json_body = query_messages(limit, include_encrypted: include_encrypted, since: since, protocol: protocol).to_json
+            if since > 0 || before
+              json_body = query_messages(limit, include_encrypted: include_encrypted, since: since, before: before, protocol: protocol).to_json
               etag Digest::MD5.hexdigest(json_body), kind: :weak
               api_cache_control
               json_body
@@ -212,9 +216,11 @@ module PotatoMesh
             since = params["since"]
             protocol = sanitize_protocol(params["protocol"])
             since_val = coerce_integer(since) || 0
+            # Backward-pagination cursor (SPEC BP1); bypasses the cache like +since+.
+            before = coerce_positive_or_nil(params["before"])
 
-            if since_val > 0
-              json_body = query_positions(limit, since: since, protocol: protocol).to_json
+            if since_val > 0 || before
+              json_body = query_positions(limit, since: since, before: before, protocol: protocol).to_json
               etag Digest::MD5.hexdigest(json_body), kind: :weak
               api_cache_control
               json_body
@@ -245,9 +251,11 @@ module PotatoMesh
             since = params["since"]
             protocol = sanitize_protocol(params["protocol"])
             since_val = coerce_integer(since) || 0
+            # Backward-pagination cursor (SPEC BP1); bypasses the cache like +since+.
+            before = coerce_positive_or_nil(params["before"])
 
-            if since_val > 0
-              json_body = query_neighbors(limit, since: since, protocol: protocol).to_json
+            if since_val > 0 || before
+              json_body = query_neighbors(limit, since: since, before: before, protocol: protocol).to_json
               etag Digest::MD5.hexdigest(json_body), kind: :weak
               api_cache_control
               json_body
@@ -278,9 +286,11 @@ module PotatoMesh
             since = params["since"]
             protocol = sanitize_protocol(params["protocol"])
             since_val = coerce_integer(since) || 0
+            # Backward-pagination cursor (SPEC BP1); bypasses the cache like +since+.
+            before = coerce_positive_or_nil(params["before"])
 
-            if since_val > 0
-              json_body = query_telemetry(limit, since: since, protocol: protocol).to_json
+            if since_val > 0 || before
+              json_body = query_telemetry(limit, since: since, before: before, protocol: protocol).to_json
               etag Digest::MD5.hexdigest(json_body), kind: :weak
               api_cache_control
               json_body
@@ -316,6 +326,12 @@ module PotatoMesh
             if bucket_seconds.nil? || bucket_seconds <= 0
               halt 400, { error: "bucketSeconds must be positive" }.to_json
             end
+
+            # Clamp the requested window to the 28-day data-retention floor
+            # so no caller can reach beyond the API visibility cap by passing
+            # an oversized +windowSeconds+.  The query layer repeats this
+            # clamp for defence in depth.
+            window_seconds = clamp_window_seconds(window_seconds)
 
             bucket_count = (window_seconds.to_f / bucket_seconds).ceil
             if bucket_count > PotatoMesh::App::Queries::MAX_QUERY_LIMIT
@@ -358,9 +374,11 @@ module PotatoMesh
             since = params["since"]
             protocol = sanitize_protocol(params["protocol"])
             since_val = coerce_integer(since) || 0
+            # Backward-pagination cursor (SPEC BP1); bypasses the cache like +since+.
+            before = coerce_positive_or_nil(params["before"])
 
-            if since_val > 0
-              json_body = query_traces(limit, since: since, protocol: protocol).to_json
+            if since_val > 0 || before
+              json_body = query_traces(limit, since: since, before: before, protocol: protocol).to_json
               etag Digest::MD5.hexdigest(json_body), kind: :weak
               api_cache_control
               json_body

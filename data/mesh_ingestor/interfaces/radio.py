@@ -222,11 +222,49 @@ def _camelcase_enum_name(name: str | None) -> str | None:
     return "".join(camel_parts)
 
 
+def _custom_preset_label(lora_message: Any) -> str | None:
+    """Return a compact custom-radio label when ``use_preset`` is disabled.
+
+    Reads ``spread_factor``, ``bandwidth``, and ``coding_rate`` from
+    *lora_message* and renders them in the **same bare ``SF/BW/CR`` form** that
+    MeshCore's ``_derive_modem_preset`` emits (e.g. ``"SF8/BW62/CR6"``), so one
+    radio configuration shows a single spelling across protocols (SPEC
+    Invariant IV — protocol parity).  When any parameter is absent or zero the
+    configuration is unknown, so — matching MeshCore — this returns ``None``
+    rather than inventing a label.
+
+    Args:
+        lora_message: A LoRa config protobuf message or compatible object.
+
+    Returns:
+        A ``"SF{sf}/BW{bw}/CR{cr}"`` string, or ``None`` when any parameter is
+        absent or zero.
+    """
+    sf = getattr(lora_message, "spread_factor", None) or None
+    bw = getattr(lora_message, "bandwidth", None) or None
+    cr = getattr(lora_message, "coding_rate", None) or None
+    if sf and bw and cr:
+        return f"SF{int(sf)}/BW{int(bw)}/CR{int(cr)}"
+    return None
+
+
 def _modem_preset(lora_message: Any) -> str | None:
-    """Return the CamelCase modem preset configured on ``lora_message``."""
+    """Return the CamelCase modem preset configured on ``lora_message``.
+
+    When ``lora_message.use_preset`` is explicitly ``False``, the device is
+    using raw radio parameters instead of a named preset.  In that case the
+    enum value (which defaults to 0 / LongFast even in custom mode) is
+    ignored and :func:`_custom_preset_label` is returned instead.
+    """
 
     if lora_message is None:
         return None
+    # use_preset=False means the device is in custom-parameter mode.  The
+    # modem_preset enum field defaults to 0 (LongFast) even then, so we must
+    # check this flag before reading the enum.  `is False` (identity check)
+    # avoids false positives when the attribute is absent (returns None).
+    if getattr(lora_message, "use_preset", None) is False:
+        return _custom_preset_label(lora_message)
     descriptor = getattr(lora_message, "DESCRIPTOR", None)
     fields_by_name = getattr(descriptor, "fields_by_name", {}) if descriptor else {}
     if "modem_preset" in fields_by_name:

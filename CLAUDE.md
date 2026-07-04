@@ -3,6 +3,21 @@
 
 # Repository Guidelines
 
+## Project Charter (read first)
+
+This repository is governed by [`SPEC.md`](SPEC.md) (product & engineering charter)
+and [`ACCEPTANCE.md`](ACCEPTANCE.md) (command-backed pass/fail criteria). Before
+changing behavior, confirm the change honors the four hard invariants and re-verify
+the numbered decisions in `SPEC.md §6`:
+
+1. **Local LoRa only — never MQTT/cloud (apex).** No code path, dependency, or
+   feature may connect to or ingest from an MQTT broker or cloud message bus.
+2. **Privacy & consent first** (`PRIVATE`, node opt-out marker, retention).
+3. **Decentralized, opt-in federation** (no central authority; `PRIVATE` > `FEDERATION`).
+4. **Protocol parity & pluggability** (Meshtastic/MeshCore equal; new protocols via `MeshProtocol`).
+
+A change is not "done" until it passes `ACCEPTANCE.md`.
+
 Keep code as modular as possible to reduce duplication and improve reusability and readability — this applies to tests as well as production code. If a module grows large, split it into a submodule structure. Prefer composing small, single-purpose units over monolithic files.
 
 Make sure all tests pass for Python (`pytest`), Ruby (`rspec`), and JavaScript (`npm test`).
@@ -23,7 +38,7 @@ The repository splits runtime and ingestion logic. `web/` holds the Sinatra dash
 `matrix/` contains the Rust Matrix bridge; build with `cargo build --release` or `docker build -f matrix/Dockerfile .`, and keep bridge config under `matrix/Config.toml` when running locally.
 
 ## Build, Test, and Development Commands
-Run dependency installs inside `web/`: `bundle install` for gems and `npm ci` for JavaScript tooling. Start the app with `cd web && API_TOKEN=dev ./app.sh` for local work or `bundle exec rackup -p 41447` when integrating elsewhere.
+Run dependency installs inside `web/`: `bundle install` for gems and `npm ci` for JavaScript tooling. Start the app with `cd web && API_TOKEN=dev ./app.sh` for local work or `bundle exec ruby app.rb -p 41447` when integrating elsewhere.
 
 Prep ingestion with `python -m venv .venv && pip install -r data/requirements.txt`; `./data/mesh.sh` streams from live radios. `docker-compose -f docker-compose.dev.yml up` brings up the full stack.
 

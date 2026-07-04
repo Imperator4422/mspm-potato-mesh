@@ -450,6 +450,238 @@ RSpec.describe PotatoMesh::Config do
     end
   end
 
+  describe ".live_updates_enabled?" do
+    it "is enabled when EVENTS is unset" do
+      within_env("EVENTS" => nil) do
+        expect(described_class.live_updates_enabled?).to be(true)
+      end
+    end
+
+    it "is disabled when EVENTS=0" do
+      within_env("EVENTS" => "0") do
+        expect(described_class.live_updates_enabled?).to be(false)
+      end
+    end
+
+    it "ignores surrounding whitespace" do
+      within_env("EVENTS" => " 0 ") do
+        expect(described_class.live_updates_enabled?).to be(false)
+      end
+    end
+  end
+
+  describe ".live_safety_poll_seconds" do
+    it "returns the baked-in cadence when unset" do
+      within_env("LIVE_SAFETY_POLL_SECONDS" => nil) do
+        expect(described_class.live_safety_poll_seconds).to eq(
+          PotatoMesh::Config::DEFAULT_LIVE_SAFETY_POLL_SECONDS,
+        )
+      end
+    end
+
+    it "accepts positive overrides" do
+      within_env("LIVE_SAFETY_POLL_SECONDS" => "120") do
+        expect(described_class.live_safety_poll_seconds).to eq(120)
+      end
+    end
+
+    it "rejects non-positive overrides" do
+      within_env("LIVE_SAFETY_POLL_SECONDS" => "0") do
+        expect(described_class.live_safety_poll_seconds).to eq(
+          PotatoMesh::Config::DEFAULT_LIVE_SAFETY_POLL_SECONDS,
+        )
+      end
+    end
+  end
+
+  describe ".sse_heartbeat_seconds" do
+    it "returns the baked-in heartbeat when unset" do
+      within_env("SSE_HEARTBEAT_SECONDS" => nil) do
+        expect(described_class.sse_heartbeat_seconds).to eq(
+          PotatoMesh::Config::DEFAULT_SSE_HEARTBEAT_SECONDS,
+        )
+      end
+    end
+
+    it "accepts positive overrides" do
+      within_env("SSE_HEARTBEAT_SECONDS" => "5") do
+        expect(described_class.sse_heartbeat_seconds).to eq(5)
+      end
+    end
+  end
+
+  describe ".sse_max_lifetime_seconds" do
+    it "returns the baked-in ceiling when unset" do
+      within_env("SSE_MAX_LIFETIME_SECONDS" => nil) do
+        expect(described_class.sse_max_lifetime_seconds).to eq(
+          PotatoMesh::Config::DEFAULT_SSE_MAX_LIFETIME_SECONDS,
+        )
+      end
+    end
+
+    it "accepts positive overrides" do
+      within_env("SSE_MAX_LIFETIME_SECONDS" => "90") do
+        expect(described_class.sse_max_lifetime_seconds).to eq(90)
+      end
+    end
+  end
+
+  describe ".puma_force_shutdown_seconds" do
+    it "returns the baked-in default when unset" do
+      within_env("PUMA_FORCE_SHUTDOWN" => nil) do
+        expect(described_class.puma_force_shutdown_seconds).to eq(
+          PotatoMesh::Config::DEFAULT_PUMA_FORCE_SHUTDOWN_SECONDS,
+        )
+      end
+    end
+
+    it "accepts a positive override" do
+      within_env("PUMA_FORCE_SHUTDOWN" => "10") do
+        expect(described_class.puma_force_shutdown_seconds).to eq(10)
+      end
+    end
+
+    it "falls back to the default for non-positive or invalid values" do
+      ["0", "-1", "abc", ""].each do |raw|
+        within_env("PUMA_FORCE_SHUTDOWN" => raw) do
+          expect(described_class.puma_force_shutdown_seconds).to eq(
+            PotatoMesh::Config::DEFAULT_PUMA_FORCE_SHUTDOWN_SECONDS,
+          )
+        end
+      end
+    end
+  end
+
+  describe "puma thread budget" do
+    describe ".puma_min_threads" do
+      it "returns the baked-in default when unset" do
+        within_env("MIN_THREADS" => nil) do
+          expect(described_class.puma_min_threads).to eq(
+            PotatoMesh::Config::DEFAULT_PUMA_MIN_THREADS,
+          )
+        end
+      end
+
+      it "accepts a positive override" do
+        within_env("MIN_THREADS" => "8") do
+          expect(described_class.puma_min_threads).to eq(8)
+        end
+      end
+
+      it "falls back to the default for non-positive or invalid values" do
+        ["0", "-3", "abc", ""].each do |raw|
+          within_env("MIN_THREADS" => raw) do
+            expect(described_class.puma_min_threads).to eq(
+              PotatoMesh::Config::DEFAULT_PUMA_MIN_THREADS,
+            )
+          end
+        end
+      end
+    end
+
+    describe ".puma_max_threads" do
+      it "returns the baked-in default when unset" do
+        within_env("MAX_THREADS" => nil) do
+          expect(described_class.puma_max_threads).to eq(
+            PotatoMesh::Config::DEFAULT_PUMA_MAX_THREADS,
+          )
+        end
+      end
+
+      it "accepts a positive override" do
+        within_env("MAX_THREADS" => "120") do
+          expect(described_class.puma_max_threads).to eq(120)
+        end
+      end
+
+      it "falls back to the default for non-positive or invalid values" do
+        ["0", "-1", "nope", ""].each do |raw|
+          within_env("MAX_THREADS" => raw) do
+            expect(described_class.puma_max_threads).to eq(
+              PotatoMesh::Config::DEFAULT_PUMA_MAX_THREADS,
+            )
+          end
+        end
+      end
+    end
+
+    describe ".sse_thread_reserve" do
+      it "returns the baked-in default when unset" do
+        within_env("SSE_THREAD_RESERVE" => nil) do
+          expect(described_class.sse_thread_reserve).to eq(
+            PotatoMesh::Config::DEFAULT_SSE_THREAD_RESERVE,
+          )
+        end
+      end
+
+      it "accepts a positive override" do
+        within_env("SSE_THREAD_RESERVE" => "12") do
+          expect(described_class.sse_thread_reserve).to eq(12)
+        end
+      end
+
+      it "falls back to the default for non-positive or invalid values" do
+        ["0", "-2", "xyz", ""].each do |raw|
+          within_env("SSE_THREAD_RESERVE" => raw) do
+            expect(described_class.sse_thread_reserve).to eq(
+              PotatoMesh::Config::DEFAULT_SSE_THREAD_RESERVE,
+            )
+          end
+        end
+      end
+    end
+
+    describe ".puma_threads_setting" do
+      it "formats the configured min and max as a Puma min:max spec" do
+        within_env("MIN_THREADS" => "16", "MAX_THREADS" => "96") do
+          expect(described_class.puma_threads_setting).to eq("16:96")
+        end
+      end
+
+      it "defaults to a pool larger than the SSE subscriber cap (PS9)" do
+        within_env("MIN_THREADS" => nil, "MAX_THREADS" => nil, "SSE_THREAD_RESERVE" => nil) do
+          _min, max = described_class.puma_threads_setting.split(":").map(&:to_i)
+          expect(max).to be > PotatoMesh::App::PubSub::MAX_SUBSCRIBERS
+        end
+      end
+
+      it "clamps the minimum to the maximum when misconfigured (min > max)" do
+        within_env("MIN_THREADS" => "200", "MAX_THREADS" => "32") do
+          expect(described_class.puma_threads_setting).to eq("32:32")
+        end
+      end
+    end
+  end
+
+  describe ".sse_publish_cooldown_seconds" do
+    it "returns the baked-in default when unset" do
+      within_env("SSE_PUBLISH_COOLDOWN" => nil) do
+        expect(described_class.sse_publish_cooldown_seconds).to eq(
+          PotatoMesh::Config::DEFAULT_SSE_PUBLISH_COOLDOWN_SECONDS,
+        )
+      end
+    end
+
+    it "accepts a non-negative float override (including 0 to disable)" do
+      within_env("SSE_PUBLISH_COOLDOWN" => "0.5") do
+        expect(described_class.sse_publish_cooldown_seconds).to eq(0.5)
+      end
+      within_env("SSE_PUBLISH_COOLDOWN" => "0") do
+        expect(described_class.sse_publish_cooldown_seconds).to eq(0.0)
+      end
+    end
+
+    it "falls back to the default for blank, unparseable, or negative values" do
+      ["", "  ", "abc", "-2"].each do |raw|
+        within_env("SSE_PUBLISH_COOLDOWN" => raw) do
+          expect(described_class.sse_publish_cooldown_seconds).to eq(
+            PotatoMesh::Config::DEFAULT_SSE_PUBLISH_COOLDOWN_SECONDS,
+          )
+        end
+      end
+    end
+  end
+
   describe ".prom_report_id_list" do
     it "returns an empty collection when no identifiers are configured" do
       expect(described_class.prom_report_id_list).to eq([])
@@ -618,15 +850,6 @@ RSpec.describe PotatoMesh::Config do
     end
   end
 
-  describe ".tile_filters" do
-    it "returns a frozen mapping" do
-      filters = described_class.tile_filters
-
-      expect(filters).to match(light: String, dark: String)
-      expect(filters).to be_frozen
-    end
-  end
-
   describe ".pages_directory" do
     it "defaults to pages/ under the web root" do
       within_env("PAGES_DIR" => nil) do
@@ -657,6 +880,40 @@ RSpec.describe PotatoMesh::Config do
   # @param values [Hash{String=>String, nil}] key/value pairs to set in ENV.
   # @yield [] block executed while the overrides are active.
   # @return [void]
+  describe ".year_seconds" do
+    it "matches 365 days expressed in seconds" do
+      expect(described_class.year_seconds).to eq(365 * 24 * 60 * 60)
+    end
+
+    it "is strictly larger than the 28-day visibility window" do
+      expect(described_class.year_seconds).to be > described_class.four_weeks_seconds
+    end
+  end
+
+  describe ".retention_purge_interval_seconds" do
+    it "defaults to running daily" do
+      expect(described_class.retention_purge_interval_seconds).to eq(24 * 60 * 60)
+    end
+  end
+
+  describe ".initial_retention_delay_seconds" do
+    it "yields long enough for boot work to finish without blocking startup" do
+      delay = described_class.initial_retention_delay_seconds
+      expect(delay).to be > 0
+      expect(delay).to be < described_class.retention_purge_interval_seconds
+    end
+  end
+
+  describe ".node_opt_out_marker" do
+    it "is the U+1F6D1 stop sign emoji" do
+      expect(described_class.node_opt_out_marker).to eq("\u{1F6D1}")
+    end
+
+    it "is exposed as a frozen constant" do
+      expect(described_class::NODE_OPT_OUT_MARKER).to be_frozen
+    end
+  end
+
   def within_env(values)
     original = {}
     values.each do |key, value|

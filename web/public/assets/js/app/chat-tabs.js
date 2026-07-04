@@ -15,6 +15,64 @@
  */
 
 /**
+ * Slack (px) within which the active panel counts as scrolled to the bottom.
+ * A reader inside this band is treated as "pinned" and kept pinned across a
+ * passive re-render (tail-follow); anyone scrolled further up keeps their exact
+ * position. Small enough to ignore sub-pixel rounding, large enough to survive a
+ * one-line layout jitter.
+ * @type {number}
+ */
+const SCROLL_PIN_TOLERANCE_PX = 4;
+
+/**
+ * Capture the active panel's vertical scroll state before the subtree rebuild,
+ * so a passive re-render can restore it instead of yanking the reader to the
+ * bottom on every live update (bugfix B). ``renderChatTabs`` replaces the whole
+ * panel subtree, so the post-render panel is a fresh element with ``scrollTop``
+ * 0; without this capture the reader's position is lost on every refresh.
+ *
+ * @param {HTMLElement} container Chat container holding the *previous* render.
+ * @returns {?{ top: number, pinned: boolean }} The active panel's scroll offset
+ *   and whether it was at the bottom, or ``null`` when there is no prior panel
+ *   (initial render) — in which case the caller pins to the bottom.
+ */
+function capturePreviousActivePanelScroll(container) {
+  const panelWrapper = container && container.children && container.children[1];
+  const panels = panelWrapper && panelWrapper.children;
+  if (!panels) {
+    return null;
+  }
+  for (const panel of panels) {
+    if (!panel || panel.hidden !== false) continue;
+    const distanceFromBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight;
+    return { top: panel.scrollTop, pinned: distanceFromBottom <= SCROLL_PIN_TOLERANCE_PX };
+  }
+  return null;
+}
+
+/**
+ * Apply the captured vertical scroll to the freshly-rendered active panel.
+ * A reader that was pinned to the bottom (or an initial render with no prior
+ * panel, ``previous == null``) is scrolled to the new bottom so freshly-arrived
+ * entries stay visible (tail-follow); otherwise the reader's exact offset is
+ * restored (bugfix B).
+ *
+ * @param {?HTMLElement} panel The active panel after the rebuild.
+ * @param {?{ top: number, pinned: boolean }} previous Captured scroll state.
+ * @returns {void}
+ */
+function applyActivePanelScroll(panel, previous) {
+  if (!panel) {
+    return;
+  }
+  if (!previous || previous.pinned) {
+    panel.scrollTop = panel.scrollHeight;
+  } else {
+    panel.scrollTop = previous.top;
+  }
+}
+
+/**
  * Render an accessible tab interface within ``container``.
  *
  * When a tab carries an ``iconSrc`` URL the icon is rendered as an
@@ -81,6 +139,13 @@ export function renderChatTabs({
   nextBtn.textContent = '▶';
   nextBtn.hidden = true;
 
+  // Channel dropdown selector (LV8): a native <select> listing every tab so
+  // the user can jump to a channel regardless of the horizontal scroll
+  // position (the native control supplies the downward-triangle affordance).
+  const tabSelect = document.createElement('select');
+  tabSelect.className = 'chat-tab-select';
+  tabSelect.setAttribute('aria-label', 'Jump to channel');
+
   const tabList = document.createElement('div');
   tabList.className = 'chat-tablist';
   tabList.setAttribute('role', 'tablist');
@@ -88,6 +153,7 @@ export function renderChatTabs({
   tabListWrapper.appendChild(prevBtn);
   tabListWrapper.appendChild(tabList);
   tabListWrapper.appendChild(nextBtn);
+  tabListWrapper.appendChild(tabSelect);
 
   const panelWrapper = document.createElement('div');
   panelWrapper.className = 'chat-tabpanels';
@@ -97,6 +163,25 @@ export function renderChatTabs({
 
   const tabElements = [];
   const existingActive = container.dataset?.activeTab || null;
+  // Preserve the channel-tab list's horizontal scroll across the full-subtree
+  // rebuild below (item 5): without this, every live refresh resets scrollLeft
+  // to 0 and yanks the user back to the first tab. The previous render's tab
+  // list is the second child of the first wrapper (see the structure built
+  // below); guard defensively in case the container held no prior tab list.
+  const previousTabListWrapper = container.children && container.children[0];
+  const previousTabList =
+    previousTabListWrapper && previousTabListWrapper.children
+      ? previousTabListWrapper.children[1]
+      : null;
+  const previousScrollLeft =
+    previousTabList &&
+    previousTabList.className === 'chat-tablist' &&
+    typeof previousTabList.scrollLeft === 'number'
+      ? previousTabList.scrollLeft
+      : 0;
+  // Capture the active panel's VERTICAL scroll before the rebuild so a passive
+  // refresh restores it rather than snapping the reader to the bottom (bugfix B).
+  const previousActivePanelScroll = capturePreviousActivePanelScroll(container);
   const activeCandidateOrder = [existingActive, previousActiveTabId, defaultActiveTabId];
   let activeTabId = null;
 
@@ -149,6 +234,10 @@ export function renderChatTabs({
 
     tabList.appendChild(button);
     panelWrapper.appendChild(panel);
+    const option = document.createElement('option');
+    option.value = uniqueId;
+    option.textContent = tab.label || uniqueId;
+    tabSelect.appendChild(option);
     tabElements.push({ id: uniqueId, button, panel });
   }
 
@@ -218,7 +307,7 @@ export function renderChatTabs({
   // Initial arrow state after the DOM is in place.
   updateArrows();
 
-  const setActiveTab = newId => {
+  const setActiveTab = (newId, { scrollActiveIntoView = false } = {}) => {
     if (!newId) return;
     let matched = false;
     for (const entry of tabElements) {
@@ -230,12 +319,18 @@ export function renderChatTabs({
         entry.panel.hidden = false;
         matched = true;
         container.dataset.activeTab = newId;
-        if (typeof entry.panel.scrollHeight === 'number' && typeof entry.panel.scrollTop === 'number') {
-          entry.panel.scrollTop = entry.panel.scrollHeight;
-        }
-        // Scroll the active tab button into view within the overflow tab list.
-        if (typeof entry.button.scrollIntoView === 'function') {
-          entry.button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        tabSelect.value = newId;
+        // An explicit tab switch (click / dropdown) jumps to the newest entry and
+        // scrolls the chosen tab into view. A passive re-render does NEITHER: the
+        // reader's vertical scroll is restored by the caller below, and the
+        // horizontal tab scroll is left untouched (bugfix B / LD-A2).
+        if (scrollActiveIntoView) {
+          if (typeof entry.panel.scrollHeight === 'number' && typeof entry.panel.scrollTop === 'number') {
+            entry.panel.scrollTop = entry.panel.scrollHeight;
+          }
+          if (typeof entry.button.scrollIntoView === 'function') {
+            entry.button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+          }
         }
       } else {
         entry.button.classList.remove('is-active');
@@ -249,11 +344,34 @@ export function renderChatTabs({
 
   setActiveTab(activeTabId);
 
+  // Restore the active panel's vertical scroll captured before the rebuild: a
+  // reader pinned to the bottom stays pinned (tail-follow), anyone scrolled up
+  // keeps their place, and an initial render (no prior panel) pins to the
+  // bottom so the newest entries show (bugfix B).
+  // ``activeTabId`` is always one of ``tabElements`` (chosen from them above), so
+  // the entry resolves; ``applyActivePanelScroll`` still guards a missing panel.
+  const restoredActiveEntry = tabElements.find(entry => entry.id === activeTabId);
+  applyActivePanelScroll(restoredActiveEntry.panel, previousActivePanelScroll);
+
+  // Restore the horizontal scroll captured before the rebuild so a live
+  // refresh does not reset the channel-tab list to the first tab (item 5).
+  // Applied after setActiveTab, which no longer force-scrolls on a passive
+  // render, so the restored position is authoritative.
+  if (previousScrollLeft > 0 && typeof tabList.scrollLeft === 'number') {
+    tabList.scrollLeft = previousScrollLeft;
+    updateArrows();
+  }
+
   for (const entry of tabElements) {
     entry.button.addEventListener('click', () => {
-      setActiveTab(entry.id);
+      setActiveTab(entry.id, { scrollActiveIntoView: true });
     });
   }
+
+  // Jump to the chosen channel when the dropdown selection changes (LV8).
+  tabSelect.addEventListener('change', () => {
+    setActiveTab(tabSelect.value, { scrollActiveIntoView: true });
+  });
 
   return container.dataset.activeTab || null;
 }
@@ -278,4 +396,9 @@ function createFragment(document) {
   };
 }
 
-export const __test__ = { createFragment };
+export const __test__ = {
+  createFragment,
+  SCROLL_PIN_TOLERANCE_PX,
+  capturePreviousActivePanelScroll,
+  applyActivePanelScroll
+};

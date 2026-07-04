@@ -70,8 +70,7 @@ test('mergeConfig applies default values when fields are missing', () => {
   const result = mergeConfig({});
   assert.deepEqual(result, {
     ...DEFAULT_CONFIG,
-    mapCenter: { ...DEFAULT_CONFIG.mapCenter },
-    tileFilters: { ...DEFAULT_CONFIG.tileFilters }
+    mapCenter: { ...DEFAULT_CONFIG.mapCenter }
   });
 });
 
@@ -80,7 +79,6 @@ test('mergeConfig coerces numeric values and nested objects', () => {
     refreshIntervalSeconds: '30',
     refreshMs: '45000',
     mapCenter: { lat: '10.5', lon: '20.1' },
-    tileFilters: { dark: 'contrast(2)' },
     mapZoom: '12',
     chatEnabled: 0,
     channel: '#Custom',
@@ -93,7 +91,6 @@ test('mergeConfig coerces numeric values and nested objects', () => {
   assert.equal(result.refreshIntervalSeconds, 30);
   assert.equal(result.refreshMs, 45000);
   assert.deepEqual(result.mapCenter, { lat: 10.5, lon: 20.1 });
-  assert.deepEqual(result.tileFilters, { light: DEFAULT_CONFIG.tileFilters.light, dark: 'contrast(2)' });
   assert.equal(result.mapZoom, 12);
   assert.equal(result.chatEnabled, false);
   assert.equal(result.channel, '#Custom');
@@ -120,6 +117,24 @@ test('mergeConfig falls back to defaults for invalid numeric values', () => {
 test('mergeConfig treats blank mapZoom as null', () => {
   const result = mergeConfig({ mapZoom: '' });
   assert.equal(result.mapZoom, null);
+});
+
+test('mergeConfig normalises live-update settings', () => {
+  const overridden = mergeConfig({
+    liveUpdatesEnabled: false,
+    liveUpdatesPath: '/custom/events',
+    safetyPollMs: '120000',
+  });
+  assert.equal(overridden.liveUpdatesEnabled, false);
+  assert.equal(overridden.liveUpdatesPath, '/custom/events');
+  assert.equal(overridden.safetyPollMs, 120000);
+
+  // Blank path and non-positive / non-finite poll fall back to defaults.
+  const defaulted = mergeConfig({ liveUpdatesPath: '', safetyPollMs: '-5' });
+  assert.equal(defaulted.liveUpdatesEnabled, true);
+  assert.equal(defaulted.liveUpdatesPath, DEFAULT_CONFIG.liveUpdatesPath);
+  assert.equal(defaulted.safetyPollMs, DEFAULT_CONFIG.safetyPollMs);
+  assert.equal(mergeConfig({ safetyPollMs: 'NaN' }).safetyPollMs, DEFAULT_CONFIG.safetyPollMs);
 });
 
 test('document stub returns null for unrelated selectors', () => {

@@ -180,7 +180,7 @@ module PotatoMesh
         reply_id = coerce_integer(message["reply_id"] || message["replyId"])
         emoji = string_or_nil(message["emoji"])
         ingestor = string_or_nil(message["ingestor"])
-        protocol = resolve_protocol(db, ingestor, cache: protocol_cache)
+        protocol = resolve_record_protocol(db, message, ingestor, cache: protocol_cache)
 
         row = [
           msg_id,
@@ -225,23 +225,28 @@ module PotatoMesh
           # ``db.transaction(:immediate)`` is a future tightening if the race
           # is ever observed in production.
           if protocol == "meshcore" && from_id && channel_index && text && !text.to_s.empty?
-            # ``channel = ?`` matches the ``channel_index`` bind cleanly
-            # because the guard above rejects nil; ``to_id`` may legitimately
-            # be nil (rare meshcore fallback), so it keeps ``IS ?`` for a
-            # NULL-safe compare.
+            # Match on the sender-stable ``channel_name`` (NULL-safe ``IS ?``)
+            # rather than the per-receiver ``channel`` slot index.  Two
+            # ingestors store the same logical channel at different local
+            # indices (e.g. ``#bot`` at slot 4 on one device, 6 on another), so
+            # keying the dedup on the index lets the same physical transmission
+            # through twice — the reported duplication.  The channel *name* is
+            # carried in the message text/contact roster identically across
+            # receivers, so it is the stable discriminator.  ``to_id`` is also
+            # ``IS ?`` (rare meshcore nil fallback).
             duplicate_id = db.get_first_value(
               <<~SQL,
               SELECT id FROM messages
                 WHERE protocol = 'meshcore'
                   AND from_id = ?
                   AND to_id IS ?
-                  AND channel = ?
+                  AND channel_name IS ?
                   AND text = ?
                   AND rx_time BETWEEN ? AND ?
                   AND id != ?
                 LIMIT 1
             SQL
-              [from_id, to_id, channel_index, text,
+              [from_id, to_id, channel_name, text,
                rx_time - MESHCORE_CONTENT_DEDUP_WINDOW_SECONDS,
                rx_time + MESHCORE_CONTENT_DEDUP_WINDOW_SECONDS, msg_id],
             )
@@ -464,7 +469,18 @@ module PotatoMesh
 
         should_touch_message = !stored_decrypted
         if should_touch_message
-          ensure_unknown_node(db, from_id || raw_from_id, message["from_num"], heard_time: rx_time, protocol: protocol)
+          # MeshCore channel messages name their sender (and quote/mention peers)
+          # in the text; synthesize/repair those placeholder nodes (issue #803)
+          # named from the text and flagged synthetic, so they reconcile with the
+          # real contact — instead of the generic "MeshCore <hex>" placeholder
+          # ensure_unknown_node would mint.  Falls through to ensure_unknown_node
+          # for non-MeshCore messages or when no sender prefix is present.
+          meshcore_sender_named =
+            protocol == "meshcore" &&
+            process_meshcore_chat_nodes(db, from_id || raw_from_id, to_id || raw_to_id, text, rx_time)
+          unless meshcore_sender_named
+            ensure_unknown_node(db, from_id || raw_from_id, message["from_num"], heard_time: rx_time, protocol: protocol)
+          end
           touch_node_last_seen(
             db,
             from_id || raw_from_id || message["from_num"],

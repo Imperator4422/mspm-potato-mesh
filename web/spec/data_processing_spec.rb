@@ -75,6 +75,88 @@ RSpec.describe PotatoMesh::App::DataProcessing do
   end
 
   # ---------------------------------------------------------------------------
+  # normalize_position_time — issue #782 write-side guard against sentinel 0
+  # ---------------------------------------------------------------------------
+  describe "#normalize_position_time" do
+    let(:now) { 1_700_000_000 }
+
+    it "returns nil for zero" do
+      expect(dp.normalize_position_time(0, now: now)).to be_nil
+    end
+
+    it "returns nil for negative values" do
+      expect(dp.normalize_position_time(-1, now: now)).to be_nil
+    end
+
+    it "returns nil for nil" do
+      expect(dp.normalize_position_time(nil, now: now)).to be_nil
+    end
+
+    it "returns nil for non-numeric input" do
+      expect(dp.normalize_position_time("not-a-time", now: now)).to be_nil
+    end
+
+    it "returns nil for future values beyond the ceiling" do
+      expect(dp.normalize_position_time(now + 1, now: now)).to be_nil
+    end
+
+    it "preserves a valid integer timestamp" do
+      expect(dp.normalize_position_time(now - 10, now: now)).to eq(now - 10)
+    end
+
+    it "coerces numeric strings" do
+      expect(dp.normalize_position_time("#{now - 5}", now: now)).to eq(now - 5)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # normalize_lat_lon — issue #782 paired-zero "Null Island" guard
+  # ---------------------------------------------------------------------------
+  describe "#normalize_lat_lon" do
+    it "collapses paired exact zeros to nil on both axes" do
+      expect(dp.normalize_lat_lon(0.0, 0.0)).to eq([nil, nil])
+    end
+
+    it "collapses paired integer zeros to nil on both axes" do
+      expect(dp.normalize_lat_lon(0, 0)).to eq([nil, nil])
+    end
+
+    it "preserves a legitimate equator fix (lat=0, lon!=0)" do
+      lat, lon = dp.normalize_lat_lon(0.0, 13.5)
+      expect(lat).to eq(0.0)
+      expect(lon).to be_within(1e-9).of(13.5)
+    end
+
+    it "preserves a legitimate prime-meridian fix (lat!=0, lon=0)" do
+      lat, lon = dp.normalize_lat_lon(52.5, 0.0)
+      expect(lat).to be_within(1e-9).of(52.5)
+      expect(lon).to eq(0.0)
+    end
+
+    it "passes through a real pair as floats" do
+      lat, lon = dp.normalize_lat_lon("52.5", "13.4")
+      expect(lat).to be_within(1e-9).of(52.5)
+      expect(lon).to be_within(1e-9).of(13.4)
+    end
+
+    it "returns nil on the axis that fails coercion" do
+      lat, lon = dp.normalize_lat_lon("garbage", 13.0)
+      expect(lat).to be_nil
+      expect(lon).to be_within(1e-9).of(13.0)
+    end
+
+    it "collapses a near-zero pair within epsilon" do
+      expect(dp.normalize_lat_lon(1e-12, -1e-12)).to eq([nil, nil])
+    end
+
+    it "preserves a pair just outside epsilon" do
+      lat, lon = dp.normalize_lat_lon(1e-6, 1e-6)
+      expect(lat).to be_within(1e-12).of(1e-6)
+      expect(lon).to be_within(1e-12).of(1e-6)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # resolve_node_num
   # ---------------------------------------------------------------------------
   describe "#resolve_node_num" do
@@ -275,6 +357,295 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       db.close
       # query_nodes applies a 7-day floor; the node must appear
       expect(dp.query_nodes(100).map { |n| n["node_id"] }).to include("!aabbccdd")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # upsert_node — issue #782: position sentinel handling
+  #
+  # Meshtastic firmware emits `(lat=0, lon=0)` and `position.time=0` whenever
+  # no GPS fix has been acquired.  Persisting those values as if they were a
+  # real fix drops a marker at Null Island and lets the read boundary leak
+  # `1970-01-01T00:00:00Z` ISO strings.  The write boundary normalises both
+  # forms to SQL `NULL` so neither downstream consumer sees the sentinel.
+  # ---------------------------------------------------------------------------
+  describe "#upsert_node — position sentinel handling" do
+    include_context "with isolated db"
+
+    it "stores position_time = 0 as SQL NULL" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "num" => 0xaabbccdd,
+        "position" => { "time" => 0, "latitude" => 52.5, "longitude" => 13.4 },
+      })
+      row = read_node(db)
+      db.close
+      expect(row["position_time"]).to be_nil
+      expect(row["latitude"]).to eq(52.5)
+      expect(row["longitude"]).to eq(13.4)
+    end
+
+    it "stores paired (lat=0, lon=0) as SQL NULL on both axes" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "num" => 0xaabbccdd,
+        "position" => {
+          "time" => now - 60,
+          "latitude" => 0.0,
+          "longitude" => 0.0,
+          "altitude" => 0,
+          "locationSource" => "LOC_MANUAL",
+        },
+      })
+      row = read_node(db)
+      db.close
+      expect(row["latitude"]).to be_nil
+      expect(row["longitude"]).to be_nil
+      expect(row["altitude"]).to be_nil
+      expect(row["location_source"]).to be_nil
+      # position_time is still real and survives.
+      expect(row["position_time"]).to eq(now - 60)
+    end
+
+    it "preserves an equator fix (lat=0, lon!=0)" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "num" => 0xaabbccdd,
+        "position" => {
+          "time" => now - 30,
+          "latitude" => 0.0,
+          "longitude" => 13.4,
+        },
+      })
+      row = read_node(db)
+      db.close
+      expect(row["latitude"]).to eq(0.0)
+      expect(row["longitude"]).to eq(13.4)
+    end
+
+    it "preserves a prime-meridian fix (lat!=0, lon=0)" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "num" => 0xaabbccdd,
+        "position" => {
+          "time" => now - 30,
+          "latitude" => 52.5,
+          "longitude" => 0.0,
+        },
+      })
+      row = read_node(db)
+      db.close
+      expect(row["latitude"]).to eq(52.5)
+      expect(row["longitude"]).to eq(0.0)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # update_node_from_position — issue #782: COALESCE-zero race fix
+  #
+  # The previous tie-break used `COALESCE(excluded.position_time, 0) >=
+  # COALESCE(nodes.position_time, 0)`, which evaluated `0 >= 0` as true and
+  # allowed a sentinel position to clobber a real fix.  After normalisation
+  # the excluded position_time collapses to `NULL` and the comparison now
+  # explicitly requires `excluded.position_time IS NOT NULL`, so a sentinel
+  # update never wins.
+  # ---------------------------------------------------------------------------
+  describe "#update_node_from_position — sentinel race fix" do
+    include_context "with isolated db"
+
+    it "does not overwrite a real position with a sentinel payload" do
+      db = open_db
+      # Seed a real fix via the upsert path so the row carries genuine data.
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now - 100,
+        "num" => 0xaabbccdd,
+        "position" => {
+          "time" => now - 100,
+          "latitude" => 52.5,
+          "longitude" => 13.4,
+          "altitude" => 100.0,
+          "locationSource" => "LOC_MANUAL",
+        },
+      })
+      # Replay a sentinel position update — should be a no-op for lat/lon.
+      dp.update_node_from_position(
+        db,
+        "!aabbccdd", 0xaabbccdd,
+        now, # rx_time
+        0,   # position_time sentinel
+        nil, nil, # location_source, precision_bits
+        0.0, 0.0, 0.0, # lat/lon/alt sentinel
+        nil,
+      )
+      row = read_node(db)
+      db.close
+      expect(row["latitude"]).to eq(52.5)
+      expect(row["longitude"]).to eq(13.4)
+      expect(row["altitude"]).to eq(100.0)
+      expect(row["position_time"]).to eq(now - 100)
+    end
+
+    it "stores a real position from update_node_from_position on a fresh node" do
+      db = open_db
+      dp.update_node_from_position(
+        db,
+        "!aabbccdd", 0xaabbccdd,
+        now,
+        now - 10,
+        "LOC_MANUAL", 16,
+        52.5, 13.4, 100.0,
+        4.2,
+      )
+      row = read_node(db)
+      db.close
+      expect(row["latitude"]).to eq(52.5)
+      expect(row["longitude"]).to eq(13.4)
+      expect(row["altitude"]).to eq(100.0)
+      expect(row["position_time"]).to eq(now - 10)
+    end
+
+    it "drops sentinel coordinates on insert without crashing" do
+      db = open_db
+      dp.update_node_from_position(
+        db,
+        "!aabbccdd", 0xaabbccdd,
+        now,
+        nil,
+        nil, nil,
+        0.0, 0.0, 0.0,
+        nil,
+      )
+      row = read_node(db)
+      db.close
+      expect(row["latitude"]).to be_nil
+      expect(row["longitude"]).to be_nil
+      expect(row["altitude"]).to be_nil
+      expect(row["position_time"]).to be_nil
+    end
+
+    # Pre-#782 behaviour relied on `COALESCE(excluded.position_time, 0) >=
+    # COALESCE(nodes.position_time, 0)` evaluating `0 >= 0` to TRUE when both
+    # sides were NULL, which accepted a coords-only update.  After the
+    # `IS NOT NULL` tightening that comparison rejects the row, so the writer
+    # falls back to +rx_time+ as the freshness anchor when usable coordinates
+    # arrive without a position_time — mirroring the MeshCore handler
+    # (`protocols/meshcore/position.py:65`).  This test pins both halves of
+    # that contract: the coords land, and the synthesised anchor is
+    # +rx_time+, not NULL.
+    it "uses rx_time as a freshness anchor when coords arrive without a position_time" do
+      db = open_db
+      dp.update_node_from_position(
+        db,
+        "!aabbccdd", 0xaabbccdd,
+        now,    # rx_time
+        nil,    # position_time missing — caller has no anchor of its own
+        "LOC_INTERNAL", 32,
+        52.5, 13.4, 100.0,
+        4.2,
+      )
+      row = read_node(db)
+      db.close
+      expect(row["latitude"]).to eq(52.5)
+      expect(row["longitude"]).to eq(13.4)
+      expect(row["altitude"]).to eq(100.0)
+      expect(row["position_time"]).to eq(now)
+      expect(row["location_source"]).to eq("LOC_INTERNAL")
+      expect(row["precision_bits"]).to eq(32)
+    end
+
+    it "does not synthesise a rx_time anchor for a no-op update without coords" do
+      db = open_db
+      dp.update_node_from_position(
+        db,
+        "!aabbccdd", 0xaabbccdd,
+        now,
+        nil, # position_time missing
+        nil, nil, # location/precision
+        nil, nil, nil, # coords missing entirely
+        nil,
+      )
+      row = read_node(db)
+      db.close
+      # No coordinates → no synthetic anchor; position_time stays NULL so the
+      # row remains transparent to anyone querying for real fixes.
+      expect(row["position_time"]).to be_nil
+      expect(row["latitude"]).to be_nil
+      expect(row["longitude"]).to be_nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # insert_position — issue #782: sentinel handling on the positions table
+  # ---------------------------------------------------------------------------
+  describe "#insert_position — sentinel handling" do
+    include_context "with isolated db"
+
+    def read_position(db, id)
+      db.execute("SELECT * FROM positions WHERE id = ?", [id]).first
+    end
+
+    it "stores paired (lat=0, lon=0) as SQL NULL on both axes" do
+      db = open_db
+      dp.insert_position(db, {
+        "id" => 9001,
+        "rx_time" => now,
+        "rx_iso" => Time.at(now).utc.iso8601,
+        "node_id" => "!aabbccdd",
+        "node_num" => 0xaabbccdd,
+        "latitude" => 0.0,
+        "longitude" => 0.0,
+        "altitude" => 0,
+        "position_time" => now - 30,
+        "location_source" => "LOC_MANUAL",
+      })
+      row = read_position(db, 9001)
+      db.close
+      expect(row["latitude"]).to be_nil
+      expect(row["longitude"]).to be_nil
+      expect(row["altitude"]).to be_nil
+      expect(row["location_source"]).to be_nil
+      expect(row["position_time"]).to eq(now - 30)
+    end
+
+    it "stores position_time = 0 as SQL NULL" do
+      db = open_db
+      dp.insert_position(db, {
+        "id" => 9002,
+        "rx_time" => now,
+        "rx_iso" => Time.at(now).utc.iso8601,
+        "node_id" => "!aabbccdd",
+        "node_num" => 0xaabbccdd,
+        "latitude" => 52.5,
+        "longitude" => 13.4,
+        "position_time" => 0,
+      })
+      row = read_position(db, 9002)
+      db.close
+      expect(row["position_time"]).to be_nil
+      expect(row["latitude"]).to eq(52.5)
+      expect(row["longitude"]).to eq(13.4)
+    end
+
+    it "preserves an equator fix" do
+      db = open_db
+      dp.insert_position(db, {
+        "id" => 9003,
+        "rx_time" => now,
+        "rx_iso" => Time.at(now).utc.iso8601,
+        "node_id" => "!aabbccdd",
+        "node_num" => 0xaabbccdd,
+        "latitude" => 0.0,
+        "longitude" => 13.4,
+        "position_time" => now - 10,
+      })
+      row = read_position(db, 9003)
+      db.close
+      expect(row["latitude"]).to eq(0.0)
+      expect(row["longitude"]).to eq(13.4)
     end
   end
 
@@ -706,6 +1077,27 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       expect(msg_from).to eq(synth_id)
       db.close
     end
+
+    # Regression: a chat-derived synthetic carries the most recent time the node
+    # was heard.  Absorbing it into the real contact must not discard that — the
+    # real node's last_heard advances to the synthetic's newer value.
+    it "carries a merged synthetic's newer last_heard onto the real node" do
+      db = open_db
+      real_id = "!reallhf1"
+      synth_id = "!synthlf1"
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [real_id, "Rupert", "meshcore", 0, now - 100, now - 100],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Rupert", "meshcore", 1, now, now],
+      )
+      dp.merge_synthetic_nodes(db, real_id, "Rupert")
+      expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [real_id])).to eq(now)
+    ensure
+      db&.close
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -800,6 +1192,45 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       # tell which Paul actually sent the chat.
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).not_to be_nil
       expect(db.execute("SELECT from_id FROM messages WHERE id = 82").first[0]).to eq(synth_id)
+    ensure
+      db&.close
+    end
+
+    # Regression: the reverse merge must carry the synthetic's last_heard onto
+    # the real node, so a node heard only via channel chat keeps a fresh "last
+    # seen" after its contact advertisement reconciles the placeholder.
+    it "carries the synthetic's newer last_heard onto the real node" do
+      db = open_db
+      real_id = "!reallhc1"
+      synth_id = "!synthlc1"
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [real_id, "Olivia", "meshcore", 0, now - 100, now - 100],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Olivia", "meshcore", 1, now, now],
+      )
+      dp.merge_into_real_node(db, synth_id, "Olivia")
+      expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [real_id])).to eq(now)
+    ensure
+      db&.close
+    end
+
+    it "never moves the real node's last_heard backward when the synthetic is older" do
+      db = open_db
+      real_id = "!reallhc2"
+      synth_id = "!synthlc2"
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [real_id, "Quinn", "meshcore", 0, now, now],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Quinn", "meshcore", 1, now - 300, now - 300],
+      )
+      dp.merge_into_real_node(db, synth_id, "Quinn")
+      expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [real_id])).to eq(now)
     ensure
       db&.close
     end
@@ -925,11 +1356,63 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       db&.close
     end
 
-    it "does not collapse two meshcore messages on different channels" do
+    it "does not collapse two meshcore messages on different named channels" do
+      # Genuinely distinct channels are now distinguished by the stable
+      # channel *name*, not the per-receiver local slot index.
       db = open_db
-      meshcore_harness.insert_message(db, base_message.merge("id" => 1_000_005, "channel" => 5))
-      meshcore_harness.insert_message(db, base_message.merge("id" => 1_000_006, "channel" => 6))
+      meshcore_harness.insert_message(
+        db, base_message.merge("id" => 1_000_005, "channel" => 5, "channel_name" => "#alpha"),
+      )
+      meshcore_harness.insert_message(
+        db, base_message.merge("id" => 1_000_006, "channel" => 6, "channel_name" => "#beta"),
+      )
       expect(message_count(db)).to eq(2)
+    ensure
+      db&.close
+    end
+
+    it "collapses the same meshcore channel message heard on different local channel indices" do
+      # One physical #bot transmission heard by two ingestors that store it at
+      # different LOCAL channel slots (4 vs 6) — so each computes a different
+      # fingerprint id. The channel *name* ("#bot") is identical across
+      # receivers, so the content-dedup must collapse it to a single row.
+      # Regression for the cross-ingestor duplication in the bug report.
+      db = open_db
+      meshcore_harness.insert_message(
+        db, base_message.merge("id" => 1_000_201, "channel" => 4, "channel_name" => "#bot"),
+      )
+      meshcore_harness.insert_message(
+        db, base_message.merge("id" => 1_000_202, "channel" => 6, "channel_name" => "#bot"),
+      )
+      expect(message_count(db)).to eq(1)
+    ensure
+      db&.close
+    end
+
+    it "collapses cross-ingestor copies separated by the observed inter-ingestor clock skew" do
+      # Production reproduction (potatomesh.net: 28% meshcore duplicate rate).
+      # Two ingestors whose host clocks differ by ~126 s store the same physical
+      # #ping transmission at different local channel slots (10 vs 18) with
+      # rx_times ~126 s apart. The 30 s window let both rows persist; the dedup
+      # window must span the real-world inter-ingestor skew (median 126 s, p90
+      # 133 s observed). A literal 126 s delta pins the behaviour independently
+      # of the window constant's exact value.
+      db = open_db
+      meshcore_harness.insert_message(
+        db,
+        base_message.merge(
+          "id" => 1_000_301, "channel" => 10, "channel_name" => "#ping",
+          "ingestor" => "!02294310",
+        ),
+      )
+      meshcore_harness.insert_message(
+        db,
+        base_message.merge(
+          "id" => 1_000_302, "rx_time" => base_rx_time + 126,
+          "channel" => 18, "channel_name" => "#ping", "ingestor" => "!930d4a21",
+        ),
+      )
+      expect(message_count(db)).to eq(1)
     ensure
       db&.close
     end
@@ -1620,6 +2103,380 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       expect(db.get_first_value("SELECT modem_preset FROM messages WHERE id = 9002")).to eq("MEDIUM_SLOW")
     ensure
       db&.close
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # #resolve_record_protocol / #normalize_protocol_value
+  # ---------------------------------------------------------------------------
+  # These helpers close the startup race where a MeshCore record is processed
+  # before the ingestor heartbeat has registered a protocol mapping, which
+  # would otherwise silently mislabel the placeholder as Meshtastic.
+  describe "#resolve_record_protocol" do
+    let(:warnings) { [] }
+
+    let(:dp_with_lookup) do
+      captured_warnings = warnings
+      cls = Class.new do
+        include PotatoMesh::App::DataProcessing
+        include PotatoMesh::App::Helpers
+
+        define_method(:warn_log) do |message, **fields|
+          captured_warnings << { message: message, **fields }
+        end
+
+        def debug_log(*); end
+      end
+      cls.new
+    end
+
+    let(:registered_db) do
+      db = SQLite3::Database.new(":memory:")
+      db.execute(
+        "CREATE TABLE ingestors(node_id TEXT PRIMARY KEY, protocol TEXT NOT NULL DEFAULT 'meshtastic')",
+      )
+      db.execute(
+        "INSERT INTO ingestors(node_id, protocol) VALUES(?,?)",
+        ["!mcingest1", "meshcore"],
+      )
+      db
+    end
+
+    after(:each) { registered_db.close }
+
+    it "returns the explicit protocol when the record stamps a whitelisted value" do
+      result = dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "meshcore" },
+        nil,
+      )
+      expect(result).to eq("meshcore")
+    end
+
+    it "normalises mixed-case whitespace in the explicit stamp" do
+      result = dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "  MESHCORE  " },
+        nil,
+      )
+      expect(result).to eq("meshcore")
+    end
+
+    it "ignores a malformed explicit stamp and falls back to ingestor lookup" do
+      result = dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "reticulum" },
+        "!mcingest1",
+      )
+      expect(result).to eq("meshcore")
+    end
+
+    it "ignores a non-Hash record and falls back to ingestor lookup" do
+      result = dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        "not-a-hash",
+        "!mcingest1",
+      )
+      expect(result).to eq("meshcore")
+    end
+
+    it "defaults to meshtastic when explicit is absent and ingestor unregistered" do
+      result = dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "" },
+        "!unregistered000",
+      )
+      expect(result).to eq("meshtastic")
+    end
+
+    it "honours an explicit stamp even when the ingestor is registered as a different protocol" do
+      result = dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "meshtastic" },
+        "!mcingest1",
+      )
+      expect(result).to eq("meshtastic")
+    end
+
+    it "logs a warning when the explicit stamp is rejected as malformed" do
+      dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "reticulum" },
+        "!mcingest1",
+      )
+      expect(warnings).not_to be_empty
+      log = warnings.first
+      expect(log[:message]).to match(/malformed protocol stamp/i)
+      expect(log[:value]).to eq("reticulum")
+      expect(log[:ingestor]).to eq("!mcingest1")
+    end
+
+    it "does not warn when the record carries no protocol stamp" do
+      dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        {},
+        "!mcingest1",
+      )
+      expect(warnings).to be_empty
+    end
+
+    it "does not warn when the protocol stamp is an empty string" do
+      dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "" },
+        "!mcingest1",
+      )
+      expect(warnings).to be_empty
+    end
+  end
+
+  describe "#normalize_protocol_value" do
+    let(:helper) do
+      cls = Class.new do
+        include PotatoMesh::App::DataProcessing
+      end
+      cls.new
+    end
+
+    it "returns the canonical lower-case string for whitelisted values" do
+      expect(helper.send(:normalize_protocol_value, "meshcore")).to eq("meshcore")
+      expect(helper.send(:normalize_protocol_value, "MESHTASTIC")).to eq("meshtastic")
+      expect(helper.send(:normalize_protocol_value, "  Meshcore  ")).to eq("meshcore")
+    end
+
+    it "returns nil for unknown or malformed values" do
+      expect(helper.send(:normalize_protocol_value, nil)).to be_nil
+      expect(helper.send(:normalize_protocol_value, "")).to be_nil
+      expect(helper.send(:normalize_protocol_value, "reticulum")).to be_nil
+      expect(helper.send(:normalize_protocol_value, 42)).to be_nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # insert_message — MeshCore synthetic chat nodes (issue #803).
+  #
+  # A MeshCore channel message encodes its sender as a "Name: body" text prefix
+  # (and quotes/mentions as @[Name]).  The sender's from_id is a name-derived
+  # synthetic id.  The placeholder node must be named from that text and marked
+  # synthetic so it (a) shows the real name and (b) reconciles with the real
+  # contact via the existing merge machinery — never a generic "Meshcore <hex>"
+  # stand-in that is mis-recorded as a real (synthetic=0) node.
+  # ---------------------------------------------------------------------------
+  describe "#insert_message — meshcore synthetic chat nodes (issue #803)" do
+    include_context "with isolated db"
+
+    # derive("DWeb 0229"): the same id the Python ingestor and JS frontend
+    # compute, so all three converge on one node row.
+    let(:sender_synth_id) { "!0f6de6b3" }
+
+    def node_for(db, id)
+      db.execute(
+        "SELECT node_id, long_name, synthetic FROM nodes WHERE node_id = ?",
+        [id],
+      ).first
+    end
+
+    def meshcore_channel_message(overrides = {})
+      {
+        "id" => 4242,
+        "rx_time" => now,
+        "from_id" => sender_synth_id,
+        "to_id" => "^all",
+        "channel" => 6,
+        "text" => "DWeb 0229: flashed DWeb 0229",
+        "portnum" => "TEXT_MESSAGE_APP",
+        "protocol" => "meshcore",
+        "ingestor" => "!634069bc",
+      }.merge(overrides)
+    end
+
+    it "names the sender placeholder from the chat prefix, not a generic Meshcore <hex>" do
+      db = open_db
+      dp.insert_message(db, meshcore_channel_message)
+      row = node_for(db, sender_synth_id)
+      expect(row["long_name"]).to eq("DWeb 0229")
+      expect(row["synthetic"]).to eq(1)
+    ensure
+      db&.close
+    end
+
+    it "links the message to an existing real node of the same name rather than synthesizing a duplicate" do
+      db = open_db
+      # The real contact is already on record under its pubkey-derived id.
+      dp.upsert_node(db, "!02294310", {
+        "lastHeard" => now - 10,
+        "user" => { "longName" => "DWeb 0229", "shortName" => "D0", "role" => "COMPANION" },
+      }, protocol: "meshcore")
+      dp.insert_message(db, meshcore_channel_message)
+      # The synthetic placeholder is merged away and the message redirected.
+      expect(node_for(db, sender_synth_id)).to be_nil
+      from_id = db.get_first_value("SELECT from_id FROM messages WHERE id = 4242")
+      expect(from_id).to eq("!02294310")
+    ensure
+      db&.close
+    end
+
+    it "advances the reconciled real node's last_heard when a chat message arrives" do
+      db = open_db
+      # The real contact is already on record, last heard before this message.
+      dp.upsert_node(db, "!02294310", {
+        "lastHeard" => now - 10,
+        "user" => { "longName" => "DWeb 0229", "shortName" => "D0", "role" => "COMPANION" },
+      }, protocol: "meshcore")
+      dp.insert_message(db, meshcore_channel_message) # rx_time => now
+      # The chat message reconciles the synthetic placeholder into the real node;
+      # the real node's last_heard must advance to the message rx_time, not stay
+      # pinned at its advertisement time.
+      expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = '!02294310'")).to eq(now)
+    ensure
+      db&.close
+    end
+
+    it "repairs a pre-existing generic 'Meshcore <hex>' placeholder once a message names the sender" do
+      db = open_db
+      # The broken state observed in production: a generic, synthetic=0 stand-in.
+      dp.upsert_node(db, sender_synth_id, {
+        "lastHeard" => now - 100,
+        "protocol" => "meshcore",
+        "user" => { "longName" => "Meshcore E6B3", "shortName" => "", "role" => "COMPANION" },
+      })
+      dp.insert_message(db, meshcore_channel_message)
+      row = node_for(db, sender_synth_id)
+      expect(row["long_name"]).to eq("DWeb 0229")
+      expect(row["synthetic"]).to eq(1)
+    ensure
+      db&.close
+    end
+
+    it "repairs a generic placeholder even when the naming message is older than it (out-of-order)" do
+      db = open_db
+      # The placeholder was last heard AFTER the naming message's rx_time — the
+      # rename must still land (not be gated by a last_heard guard) so the row is
+      # never left demoted-but-still-generically-named.
+      dp.upsert_node(db, sender_synth_id, {
+        "lastHeard" => now,
+        "user" => { "longName" => "Meshcore E6B3", "shortName" => "", "role" => "COMPANION" },
+      }, protocol: "meshcore")
+      dp.insert_message(db, meshcore_channel_message("rx_time" => now - 500))
+      row = node_for(db, sender_synth_id)
+      expect(row["long_name"]).to eq("DWeb 0229")
+      expect(row["synthetic"]).to eq(1)
+    ensure
+      db&.close
+    end
+
+    it "synthesizes a placeholder for a mention-only name that never sent a message" do
+      db = open_db
+      # derive("Silent Sweeper") == !8dbb4718 — mentioned, never a sender.
+      dp.insert_message(db, meshcore_channel_message(
+        "id" => 4243,
+        "from_id" => "!ebc4edf0",
+        "text" => "RS 26: @[Silent Sweeper] dann Grüße aus Hundshübel",
+      ))
+      row = node_for(db, "!8dbb4718")
+      expect(row).not_to be_nil
+      expect(row["long_name"]).to eq("Silent Sweeper")
+      expect(row["synthetic"]).to eq(1)
+    ensure
+      db&.close
+    end
+
+    it "falls back to the generic placeholder for a meshcore direct message (not channel chat)" do
+      db = open_db
+      # to_id is a host node, not "^all": a stray colon in the DM body must not
+      # be read as a sender prefix, so the generic placeholder path is used.
+      dp.insert_message(db, meshcore_channel_message(
+        "id" => 4244,
+        "from_id" => "!11112222",
+        "to_id" => "!aabbccdd",
+        "text" => "note: buy milk",
+      ))
+      row = node_for(db, "!11112222")
+      expect(dp.generic_fallback_name?(row["long_name"], "!11112222", "meshcore")).to be(true)
+      expect(row["synthetic"]).to eq(0)
+    ensure
+      db&.close
+    end
+
+    it "falls back to the generic placeholder when a channel message has no sender prefix" do
+      db = open_db
+      dp.insert_message(db, meshcore_channel_message(
+        "id" => 4245,
+        "from_id" => "!33334444",
+        "text" => "hello with no colon",
+      ))
+      row = node_for(db, "!33334444")
+      expect(dp.generic_fallback_name?(row["long_name"], "!33334444", "meshcore")).to be(true)
+      expect(row["synthetic"]).to eq(0)
+    ensure
+      db&.close
+    end
+
+    it "leaves a genuine real node untouched when its name is referenced" do
+      db = open_db
+      dp.upsert_node(db, "!55556666", {
+        "lastHeard" => now,
+        "user" => { "longName" => "Real Companion", "shortName" => "RC", "role" => "COMPANION" },
+      }, protocol: "meshcore")
+      dp.ensure_meshcore_chat_node(db, "!55556666", "Real Companion", now)
+      row = node_for(db, "!55556666")
+      expect(row["long_name"]).to eq("Real Companion")
+      expect(row["synthetic"]).to eq(0)
+    ensure
+      db&.close
+    end
+
+    it "is a no-op when the node id or name is missing" do
+      db = open_db
+      dp.ensure_meshcore_chat_node(db, nil, "Nobody", now)
+      dp.ensure_meshcore_chat_node(db, "!77778888", nil, now)
+      expect(db.get_first_value("SELECT COUNT(*) FROM nodes").to_i).to eq(0)
+    ensure
+      db&.close
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # MeshCore chat text parsing & id derivation (issue #803).
+  # ---------------------------------------------------------------------------
+  describe "meshcore chat text parsing" do
+    it "parses the sender name before the first colon" do
+      expect(dp.parse_meshcore_sender_name("DWeb 0229: flashed DWeb 0229")).to eq("DWeb 0229")
+      # Only the first colon splits; later colons stay in the body.
+      expect(dp.parse_meshcore_sender_name("RS 26: 12:34 done")).to eq("RS 26")
+    end
+
+    it "returns nil when there is no colon or the name is blank" do
+      expect(dp.parse_meshcore_sender_name("no colon here")).to be_nil
+      expect(dp.parse_meshcore_sender_name("   : body")).to be_nil
+      expect(dp.parse_meshcore_sender_name(nil)).to be_nil
+      expect(dp.parse_meshcore_sender_name(42)).to be_nil
+    end
+
+    it "extracts trimmed, de-duplicated @[Name] mentions in first-seen order" do
+      expect(
+        dp.extract_meshcore_mentions("RS 26: @[Silent Sweeper] hi @[ Lipoly ] @[Silent Sweeper]"),
+      ).to eq(["Silent Sweeper", "Lipoly"])
+      expect(dp.extract_meshcore_mentions("no mentions")).to eq([])
+      expect(dp.extract_meshcore_mentions(nil)).to eq([])
+    end
+
+    it "derives a deterministic id matching the ingestor and frontend" do
+      expect(dp.meshcore_synthetic_node_id("DWeb 0229")).to eq("!0f6de6b3")
+      expect(dp.meshcore_synthetic_node_id("Silent Sweeper")).to eq("!8dbb4718")
+      # Trimmed before hashing so padded references converge on one row.
+      expect(dp.meshcore_synthetic_node_id("  DWeb 0229  ")).to eq("!0f6de6b3")
+      expect(dp.meshcore_synthetic_node_id("   ")).to be_nil
+      expect(dp.meshcore_synthetic_node_id(nil)).to be_nil
     end
   end
 end

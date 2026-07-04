@@ -35,17 +35,26 @@ module PotatoMesh
             unless data.is_a?(Hash)
               halt 400, { error: "invalid payload" }.to_json
             end
-            node_count = data.count { |k, _| k != "ingestor" }
+            node_count = data.count { |k, _| k != "ingestor" && k != "protocol" }
             halt 400, { error: "too many nodes" }.to_json if node_count > 10000
             db = open_database
             ingestor_node_id = string_or_nil(data["ingestor"])
-            protocol = resolve_protocol(db, ingestor_node_id)
+            # Wrapper-level protocol is captured once and used as the
+            # per-node fallback.  An explicit per-node ``"protocol"`` stamp
+            # still wins so a future heterogeneous payload can mix protocols
+            # within a single POST.  Both checks honour the same
+            # KNOWN_PROTOCOLS whitelist.
+            batch_protocol = resolve_record_protocol(db, data, ingestor_node_id)
             data.each do |node_id, node|
               next if node_id == "ingestor"
-              upsert_node(db, node_id, node, protocol: protocol)
+              next if node_id == "protocol"
+              per_node = node.is_a?(Hash) ? normalize_protocol_value(node["protocol"]) : nil
+              upsert_node(db, node_id, node, protocol: per_node || batch_protocol)
             end
             PotatoMesh::App::Prometheus::NODES_GAUGE.set(query_nodes(10000).length)
             PotatoMesh::App::ApiCache.invalidate_prefix("api:nodes:", "api:stats:")
+            PotatoMesh::App::PubSub.publish("nodes", private_mode: private_mode?)
+            status 201
             { status: "ok" }.to_json
           ensure
             db&.close
@@ -59,6 +68,9 @@ module PotatoMesh
             rescue JSON::ParserError
               halt 400, { error: "invalid JSON" }.to_json
             end
+            unless data.is_a?(Array) || data.is_a?(Hash)
+              halt 400, { error: "invalid payload" }.to_json
+            end
             messages = data.is_a?(Array) ? data : [data]
             halt 400, { error: "too many messages" }.to_json if messages.size > 10000
             db = open_database
@@ -66,7 +78,14 @@ module PotatoMesh
             messages.each do |msg|
               insert_message(db, msg, protocol_cache: protocol_cache)
             end
-            PotatoMesh::App::ApiCache.invalidate_prefix("api:messages:", "api:stats:")
+            # A message ingest also touches the author node's last_heard (#822),
+            # so invalidate the nodes cache and publish a nodes change in addition
+            # to messages — the dashboard then refreshes (and flashes) that node.
+            # Mirrors how the positions route invalidates api:nodes:.
+            PotatoMesh::App::ApiCache.invalidate_prefix("api:messages:", "api:nodes:", "api:stats:")
+            PotatoMesh::App::PubSub.publish("messages", private_mode: private_mode?)
+            PotatoMesh::App::PubSub.publish("nodes", private_mode: private_mode?)
+            status 201
             { status: "ok" }.to_json
           ensure
             db&.close
@@ -87,6 +106,7 @@ module PotatoMesh
             stored = upsert_ingestor(db, payload)
             halt 400, { error: "invalid payload" }.to_json unless stored
             PotatoMesh::App::ApiCache.invalidate_prefix("api:ingestors:")
+            status 201
             { status: "ok" }.to_json
           ensure
             db&.close
@@ -129,21 +149,29 @@ module PotatoMesh
               )
               halt 400, { error: "invalid domain" }.to_json
             end
-            pubkey = sanitize_public_key_pem(payload["pubkey"])
+            pubkey = sanitize_public_key_pem(payload["public_key"] || payload["pubkey"])
             name = string_or_nil(payload["name"])
             version = string_or_nil(payload["version"])
             channel = string_or_nil(payload["channel"])
             frequency = string_or_nil(payload["frequency"])
             latitude = coerce_float(payload["latitude"])
             longitude = coerce_float(payload["longitude"])
-            last_update_time = coerce_integer(payload["last_update_time"] || payload["lastUpdateTime"])
-            raw_private = payload.key?("isPrivate") ? payload["isPrivate"] : payload["is_private"]
+            last_update_time = coerce_integer(payload["last_update"] || payload["last_update_time"] || payload["lastUpdateTime"])
+            raw_private = if payload.key?("is_private")
+                payload["is_private"]
+              elsif payload.key?("isPrivate")
+                payload["isPrivate"]
+              end
             is_private = coerce_boolean(raw_private)
             signature = string_or_nil(payload["signature"])
-            contact_link = string_or_nil(payload["contactLink"])
-            nodes_count = coerce_integer(payload["nodesCount"])
-            meshcore_nodes_count = coerce_integer(payload["meshcoreNodesCount"])
-            meshtastic_nodes_count = coerce_integer(payload["meshtasticNodesCount"])
+            # Accept both v2 (snake_case) and legacy v1 (camelCase) wire keys
+            # (SPEC FS4); the parsed counts (incl. reticulum) feed v2 signature
+            # verification before they are recomputed from the live node list.
+            contact_link = string_or_nil(payload["contactLink"] || payload["contact_link"])
+            nodes_count = coerce_integer(payload["nodes_count"] || payload["nodesCount"])
+            meshcore_nodes_count = coerce_integer(payload["meshcore_nodes_count"] || payload["meshcoreNodesCount"])
+            meshtastic_nodes_count = coerce_integer(payload["meshtastic_nodes_count"] || payload["meshtasticNodesCount"])
+            reticulum_nodes_count = coerce_integer(payload["reticulum_nodes_count"])
 
             attributes = {
               id: id,
@@ -161,6 +189,9 @@ module PotatoMesh
               nodes_count: nodes_count,
               meshcore_nodes_count: meshcore_nodes_count,
               meshtastic_nodes_count: meshtastic_nodes_count,
+              # Carried for v2 signature verification only (no DB column; always 0
+              # until a Reticulum ingestor exists).
+              reticulum_nodes_count: reticulum_nodes_count,
             }
 
             if [attributes[:id], attributes[:domain], attributes[:pubkey], signature, attributes[:last_update_time]].any?(&:nil?)
@@ -288,12 +319,12 @@ module PotatoMesh
               halt 400, { error: freshness_reason || "stale node data" }.to_json
             end
 
-            # Recompute node counts from the fetched node list so that
-            # nodes_count, meshcore_nodes_count, and meshtastic_nodes_count
-            # stay internally consistent.  The announcement payload may carry
-            # sender-asserted counts, but those are unsigned and could diverge
-            # from the actual node data — overwriting them here is intentional.
-            if remote_nodes.is_a?(Array)
+            # Node-count fallback only (SPEC FS2/(a)): v2 announcements carry
+            # SIGNED counts, which we keep verbatim so the stored — and later
+            # relayed — record stays signature-consistent (a re-verifying peer
+            # rebuilds the same canonical).  We derive counts from the fetched
+            # node list only when the announcement omits them.
+            if remote_nodes.is_a?(Array) && attributes[:nodes_count].nil?
               cutoff = Time.now.to_i - PotatoMesh::Config.remote_instance_max_node_age
               total = 0
               meshcore = 0
@@ -324,7 +355,7 @@ module PotatoMesh
               per_response_limit: PotatoMesh::Config.federation_max_instances_per_response,
               overall_limit: PotatoMesh::Config.federation_max_domains_per_crawl,
             )
-            debug_log(
+            info_log(
               "Registered remote instance",
               context: "ingest.register",
               domain: attributes[:domain],
@@ -345,6 +376,9 @@ module PotatoMesh
             rescue JSON::ParserError
               halt 400, { error: "invalid JSON" }.to_json
             end
+            unless data.is_a?(Array) || data.is_a?(Hash)
+              halt 400, { error: "invalid payload" }.to_json
+            end
             positions = data.is_a?(Array) ? data : [data]
             halt 400, { error: "too many positions" }.to_json if positions.size > 10000
             db = open_database
@@ -353,6 +387,13 @@ module PotatoMesh
               insert_position(db, pos, protocol_cache: protocol_cache)
             end
             PotatoMesh::App::ApiCache.invalidate_prefix("api:positions:", "api:nodes:", "api:stats:")
+            PotatoMesh::App::PubSub.publish("positions", private_mode: private_mode?)
+            # A position ingest also advances the node's last_heard
+            # (touch_node_last_seen), so publish a nodes change as well
+            # (mirrors the messages route, #822): the dashboard re-pulls and
+            # flashes that node with a freshly-updated "last seen".
+            PotatoMesh::App::PubSub.publish("nodes", private_mode: private_mode?)
+            status 201
             { status: "ok" }.to_json
           ensure
             db&.close
@@ -366,6 +407,9 @@ module PotatoMesh
             rescue JSON::ParserError
               halt 400, { error: "invalid JSON" }.to_json
             end
+            unless data.is_a?(Array) || data.is_a?(Hash)
+              halt 400, { error: "invalid payload" }.to_json
+            end
             neighbor_payloads = data.is_a?(Array) ? data : [data]
             halt 400, { error: "too many neighbor packets" }.to_json if neighbor_payloads.size > 10000
             db = open_database
@@ -374,6 +418,8 @@ module PotatoMesh
               insert_neighbors(db, packet, protocol_cache: protocol_cache)
             end
             PotatoMesh::App::ApiCache.invalidate_prefix("api:neighbors:", "api:stats:")
+            PotatoMesh::App::PubSub.publish("neighbors", private_mode: private_mode?)
+            status 201
             { status: "ok" }.to_json
           ensure
             db&.close
@@ -387,6 +433,9 @@ module PotatoMesh
             rescue JSON::ParserError
               halt 400, { error: "invalid JSON" }.to_json
             end
+            unless data.is_a?(Array) || data.is_a?(Hash)
+              halt 400, { error: "invalid payload" }.to_json
+            end
             telemetry_packets = data.is_a?(Array) ? data : [data]
             halt 400, { error: "too many telemetry packets" }.to_json if telemetry_packets.size > 10000
             db = open_database
@@ -394,7 +443,15 @@ module PotatoMesh
             telemetry_packets.each do |packet|
               insert_telemetry(db, packet, protocol_cache: protocol_cache)
             end
-            PotatoMesh::App::ApiCache.invalidate_prefix("api:telemetry:", "api:stats:")
+            # A telemetry ingest advances the node's last_heard
+            # (update_node_from_telemetry -> touch_node_last_seen), so also
+            # invalidate the nodes cache and publish a nodes change (mirrors
+            # the positions/messages routes): the dashboard re-pulls and
+            # flashes that node with a freshly-updated "last seen".
+            PotatoMesh::App::ApiCache.invalidate_prefix("api:telemetry:", "api:nodes:", "api:stats:")
+            PotatoMesh::App::PubSub.publish("telemetry", private_mode: private_mode?)
+            PotatoMesh::App::PubSub.publish("nodes", private_mode: private_mode?)
+            status 201
             { status: "ok" }.to_json
           ensure
             db&.close
@@ -408,6 +465,9 @@ module PotatoMesh
             rescue JSON::ParserError
               halt 400, { error: "invalid JSON" }.to_json
             end
+            unless data.is_a?(Array) || data.is_a?(Hash)
+              halt 400, { error: "invalid payload" }.to_json
+            end
             trace_packets = data.is_a?(Array) ? data : [data]
             halt 400, { error: "too many traces" }.to_json if trace_packets.size > 10000
             db = open_database
@@ -416,6 +476,8 @@ module PotatoMesh
               insert_trace(db, packet, protocol_cache: protocol_cache)
             end
             PotatoMesh::App::ApiCache.invalidate_prefix("api:traces:", "api:stats:")
+            PotatoMesh::App::PubSub.publish("traces", private_mode: private_mode?)
+            status 201
             { status: "ok" }.to_json
           ensure
             db&.close

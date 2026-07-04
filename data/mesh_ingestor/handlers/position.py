@@ -30,6 +30,8 @@ from ..serialization import (
     _iso,
     _node_num_from_id,
     _node_to_dict,
+    _normalize_lat_lon,
+    _normalize_position_time,
     _pkt_to_dict,
 )
 from . import _state
@@ -166,7 +168,7 @@ def store_position_packet(packet: Mapping, decoded: Mapping) -> None:
     altitude = _coerce_float(
         _first(position_section, "altitude", "raw.altitude", default=None)
     )
-    position_time = _coerce_int(
+    position_time = _normalize_position_time(
         _first(position_section, "time", "raw.time", default=None)
     )
     location_source = _first(
@@ -179,6 +181,16 @@ def store_position_packet(packet: Mapping, decoded: Mapping) -> None:
     location_source = (
         str(location_source).strip() if location_source not in {None, ""} else None
     )
+
+    # Collapse the Meshtastic "no GPS lock" sentinel ``(0, 0)`` pair to
+    # ``(None, None)`` before it reaches the API.  Single-axis zeros — i.e.
+    # legitimate equator or prime-meridian fixes — are preserved.  When the
+    # coordinates collapse we also drop altitude and location source, which
+    # would otherwise be meaningless without a fix.  See issue #782.
+    latitude, longitude = _normalize_lat_lon(latitude, longitude)
+    if latitude is None and longitude is None:
+        altitude = None
+        location_source = None
 
     precision_bits = _coerce_int(
         _first(
@@ -264,6 +276,11 @@ def store_position_packet(packet: Mapping, decoded: Mapping) -> None:
         "bitfield": bitfield,
         "payload_b64": payload_b64,
         "ingestor": _state.host_node_id(),
+        # Per-record protocol stamp closes the startup race where the web app
+        # processes a position before the ingestor heartbeat registers a
+        # protocol mapping — see CONTRACTS.md.  A handler-set override wins
+        # over the daemon-wide configured default.
+        "protocol": packet.get("protocol") or config.PROTOCOL,
     }
     if raw_payload:
         position_payload["raw"] = raw_payload
@@ -387,6 +404,10 @@ def store_traceroute_packet(packet: Mapping, decoded: Mapping) -> None:
         "snr": snr,
         "elapsed_ms": elapsed_ms,
         "ingestor": _state.host_node_id(),
+        # Per-record protocol stamp closes the startup race where the web app
+        # processes a traceroute before the ingestor heartbeat registers a
+        # protocol mapping — see CONTRACTS.md.
+        "protocol": packet.get("protocol") or config.PROTOCOL,
     }
 
     queue._queue_post_json(

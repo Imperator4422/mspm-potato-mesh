@@ -54,7 +54,14 @@ module PotatoMesh
         end
 
         raise last_error || InstanceFetchError.new("all resolved addresses failed")
-      rescue ArgumentError => e
+      rescue ArgumentError, SocketError => e
+        # +resolve_remote_ip_addresses+ runs the DNS lookup before the wrapped
+        # HTTP attempt: a blank/restricted host raises ArgumentError, and an
+        # unresolvable domain raises Socket::ResolutionError (a SocketError).
+        # Both are converted to InstanceFetchError so every fetch_instance_json
+        # caller rejects the peer gracefully instead of letting a raw resolution
+        # error escape as a 500.  (HTTP-attempt errors are already wrapped inside
+        # perform_single_http_request, so this never masks a live connection.)
         raise_instance_fetch_error(e)
       end
 
@@ -76,10 +83,14 @@ module PotatoMesh
             when Net::HTTPSuccess
               response.body
             else
-              raise InstanceFetchError, "unexpected response #{response.code}"
+              raise InstanceHttpResponseError, "unexpected response #{response.code}"
             end
           end
         end
+      rescue InstanceHttpResponseError
+        # Reached the peer at the HTTP layer; do not wrap so callers can
+        # distinguish "peer responded with non-2xx" from "transport failure".
+        raise
       rescue StandardError => e
         raise_instance_fetch_error(e)
       end
@@ -125,6 +136,12 @@ module PotatoMesh
             return [JSON.parse(body), uri] if body
           rescue JSON::ParserError => e
             errors << "#{uri}: invalid JSON (#{e.message})"
+          rescue InstanceHttpResponseError => e
+            # Peer answered at the HTTP layer (e.g. 4xx/5xx).  Falling back to
+            # the next transport candidate (http:// after https://) adds noise
+            # without adding any chance of success — stop here.
+            errors << "#{uri}: #{e.message}"
+            break
           rescue InstanceFetchError => e
             errors << "#{uri}: #{e.message}"
           end

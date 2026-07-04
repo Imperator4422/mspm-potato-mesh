@@ -14,39 +14,13 @@
  * limitations under the License.
  */
 
+/*
+ * The app is dark-only. These tokens are the (formerly ``body.dark``) dark
+ * palette, promoted to ``:root`` so every element — including ``html`` itself —
+ * resolves them; the previous light palette and its always-overridden
+ * ``body.dark`` token block were removed with the light theme.
+ */
 :root {
-  --bg: #f6f3ee;
-  --bg2: #ffffff;
-  --fg: #0c0f12;
-  --muted: #5c6773;
-  --card: rgba(0, 0, 0, 0.03);
-  --line: rgba(12, 15, 18, 0.08);
-  --accent: #2b6cb0;
-  --row-alt: rgba(0, 0, 0, 0.02);
-  --table-head-bg: rgba(0, 0, 0, 0.06);
-  --table-head-fg: var(--fg);
-  --input-bg: #ffffff;
-  --input-fg: var(--fg);
-  --input-border: rgba(12, 15, 18, 0.18);
-  --input-placeholder: rgba(12, 15, 18, 0.45);
-  --control-accent: var(--accent);
-  --announcement-bg: #fff4d6;
-  --announcement-fg: #7a3f00;
-  --announcement-border: #f0c05b;
-  --pad: 16px;
-  --map-tile-filter-light: grayscale(1) saturate(0) brightness(0.92) contrast(1.05);
-  --map-tile-filter-dark: grayscale(1) invert(1) brightness(0.9) contrast(1.08);
-}
-
-html {
-  color-scheme: light;
-}
-
-html[data-theme='dark'] {
-  color-scheme: dark;
-}
-
-body.dark {
   --bg: #0e1418;
   --bg2: #0e141b;
   --fg: #e6ebf0;
@@ -65,7 +39,11 @@ body.dark {
   --announcement-bg: #1e262c;
   --announcement-fg: #eee;
   --announcement-border: #757575;
-  --map-tiles-filter: var(--map-tile-filter-dark);
+  --pad: 16px;
+}
+
+html {
+  color-scheme: dark;
 }
 
 html,
@@ -207,7 +185,6 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  --map-tiles-filter: var(--map-tile-filter-light);
 }
 
 .page-shell {
@@ -1058,6 +1035,37 @@ body.view-chat .page-shell {
   display: none;
 }
 
+/* Channel dropdown selector (SPEC LV8): a compact jump-to-channel control at the
+   end of the tab bar. Mirrors the federation/region `.instance-select` chrome
+   (theme tokens + a CSS-gradient triangle) so the two dropdowns match, sized down
+   to sit beside the channel tabs. */
+.chat-tab-select {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-left: 0.5rem;
+  max-width: 11rem;
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-color: var(--input-bg);
+  color: var(--input-fg);
+  border: 1px solid var(--input-border);
+  border-radius: 8px;
+  padding: 4px 26px 4px 10px;
+  font-size: 13px;
+  line-height: 1.4;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 14px) calc(50% - 3px), calc(100% - 9px) calc(50% - 3px);
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+}
+
+.chat-tab-select:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .chat-tab:is(:focus-visible, :hover) {
   background: rgba(0, 0, 0, 0.06);
 }
@@ -1594,12 +1602,6 @@ body.dark .node-detail__chart-grid-line {
   position: relative;
 }
 
-.refresh-timestamp {
-  font-size: 0.85em;
-  color: var(--muted);
-  white-space: nowrap;
-}
-
 .filter-input input[type="text"] {
   flex: 1 1 auto;
   width: 100%;
@@ -1895,8 +1897,6 @@ input[type="radio"] {
 #map .leaflet-layer,
 #map .leaflet-tile.map-tiles {
   opacity: 0.75;
-  filter: var(--map-tiles-filter, var(--map-tile-filter-light));
-  -webkit-filter: var(--map-tiles-filter, var(--map-tile-filter-light));
 }
 
 .leaflet-popup-content-wrapper,
@@ -2263,20 +2263,6 @@ body.dark .short-info-overlay .short-info-close:hover {
   background: rgba(255, 255, 255, 0.1);
 }
 
-#map .leaflet-tile-pane,
-#map .leaflet-layer,
-#map .leaflet-tile.map-tiles {
-  filter: var(--map-tiles-filter, var(--map-tile-filter-light));
-  -webkit-filter: var(--map-tiles-filter, var(--map-tile-filter-light));
-}
-
-body.dark #map .leaflet-tile-pane,
-body.dark #map .leaflet-layer,
-body.dark #map .leaflet-tile.map-tiles {
-  filter: var(--map-tiles-filter, var(--map-tile-filter-dark));
-  -webkit-filter: var(--map-tiles-filter, var(--map-tile-filter-dark));
-}
-
 /* ===========================
    Federation Page Styles
    =========================== */
@@ -2558,4 +2544,47 @@ body.dark #map .leaflet-tile.map-tiles {
 
   .markdown-body h1 { font-size: 1.3em; }
   .markdown-body h2 { font-size: 1.15em; }
+}
+
+/* Live-update highlight (SPEC LV1/LV2/LV3, amends VF5): a ~1.2s fade applied to a
+   node row / chat message row when a live SSE update lands on it. It starts
+   white, fades through the element's role colour (the --flash-role-color custom
+   property stamped at render time) with increasing transparency, then clears.
+   An inset box-shadow overlay means there is no layout shift; each element runs
+   its own animation, so concurrent updates stack independently (LV2). */
+@keyframes live-flash-fade {
+  0% { box-shadow: inset 0 0 0 100vmax rgba(255, 255, 255, 0.9); }
+  30% { box-shadow: inset 0 0 0 100vmax var(--flash-role-color, rgba(255, 255, 255, 0.55)); }
+  100% { box-shadow: inset 0 0 0 100vmax transparent; }
+}
+
+.live-flash {
+  animation: live-flash-fade 1.2s ease-out;
+}
+
+/* Map-marker wave (SPEC LV5): an expanding ring emitted from a flashed marker.
+   The ring grows from ~12px radius and fades toward the role colour over ~1.2s.
+   Rendered as a Leaflet divIcon, so it is a positioned overlay with no layout
+   shift; the marker layer removes it after the animation completes. */
+@keyframes live-flash-wave {
+  0% { transform: scale(1); opacity: 0.85; }
+  100% { transform: scale(3.5); opacity: 0; }
+}
+
+.live-flash-wave {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 2px solid var(--flash-role-color, rgba(255, 255, 255, 0.85));
+  pointer-events: none;
+  animation: live-flash-wave 1.2s ease-out forwards;
+}
+
+/* Honor reduced-motion: data still updates live, only the highlight/wave is
+   withheld. */
+@media (prefers-reduced-motion: reduce) {
+  .live-flash,
+  .live-flash-wave {
+    animation: none;
+  }
 }

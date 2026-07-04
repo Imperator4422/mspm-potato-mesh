@@ -48,6 +48,9 @@ module PotatoMesh
         {
           refreshIntervalSeconds: PotatoMesh::Config.refresh_interval_seconds,
           refreshMs: PotatoMesh::Config.refresh_interval_seconds * 1000,
+          liveUpdatesEnabled: PotatoMesh::Config.live_updates_enabled?,
+          liveUpdatesPath: "/api/events",
+          safetyPollMs: PotatoMesh::Config.live_safety_poll_seconds * 1000,
           chatEnabled: !private_mode?,
           channel: sanitized_channel,
           frequency: sanitized_frequency,
@@ -59,7 +62,6 @@ module PotatoMesh
           },
           mapZoom: PotatoMesh::Config.map_zoom,
           maxDistanceKm: PotatoMesh::Config.max_distance_km,
-          tileFilters: PotatoMesh::Config.tile_filters,
           instanceDomain: app_constant(:INSTANCE_DOMAIN),
           instancesFeatureEnabled: federation_enabled? && !private_mode?,
         }

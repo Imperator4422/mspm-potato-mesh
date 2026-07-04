@@ -86,22 +86,28 @@ import { initializeMobileMenu } from './mobile-menu.js';
 import { MESSAGE_LIMIT, normaliseMessageLimit } from './message-limit.js';
 import { CHAT_LOG_ENTRY_TYPES, buildChatTabModel, MAX_CHANNEL_INDEX } from './chat-log-tabs.js';
 import { renderChatTabs } from './chat-tabs.js';
+import { createChatEntryCache } from './main/chat-entry-cache.js';
+import { chatMessageEntryKey, chatLogEntryKey } from './main/chat-entry-keys.js';
+import { createDataCache, CACHE_SCHEMA_VERSION } from './main/data-cache.js';
+import { createIndexedDbBackend } from './main/data-cache-idb.js';
+import { isExpired as isCacheEntryExpired, isStale as isCacheEntryStale } from './main/cache-lifetime.js';
+import { cacheKeyFor } from './main/cache-keys.js';
 import { formatPositionHighlights, formatTelemetryHighlights } from './chat-log-highlights.js';
 import { filterChatModel, normaliseChatFilterQuery } from './chat-search.js';
 import { buildMessageIndex } from './message-replies.js';
 import { renderChatEntryContent } from './chat-entry-renderer.js';
 import {
   SNAPSHOT_WINDOW,
-  aggregateNeighborSnapshots,
   aggregateNodeSnapshots,
   aggregatePositionSnapshots,
   aggregateTelemetrySnapshots,
 } from './snapshot-aggregator.js';
 import { normalizeNodeCollection } from './node-snapshot-normalizer.js';
-import { maxRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit } from './incremental-helpers.js';
+import { maxRecordTimestamp, minRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit, trimToWindow } from './incremental-helpers.js';
 import { buildTraceSegments } from './trace-paths.js';
 import {
   getRoleColor,
+  getRoleFlashColor,
   getRoleKey,
   getRoleRenderPriority,
   getRoleTextColor,
@@ -122,7 +128,6 @@ import {
 // remain locally callable inside ``initializeApp`` because module-level
 // bindings are visible in every nested scope.
 import {
-  cssEscape,
   fmtCoords,
   fmtHw,
   formatDate,
@@ -141,6 +146,7 @@ import {
 } from './main/format-utils.js';
 import {
   applyNodeNameFallback,
+  buildNodePlaceholder,
   extractIdentifierFromHref,
   getNodeDisplayNameForOverlay,
   getNodeIdentifierFromLink,
@@ -157,10 +163,10 @@ import {
   SNAPSHOT_LIMIT,
   TRACE_LIMIT,
   TRACE_MAX_AGE_SECONDS,
+  BOOT_CACHE_FLAG,
 } from './main/constants.js';
 import {
   fetchNeighbors,
-  fetchNodeById,
   fetchNodes,
   fetchPositions,
   fetchTelemetry,
@@ -168,6 +174,8 @@ import {
   filterRecentTraces,
   resolveSnapshotLimit,
   fetchMessages as fetchMessagesImpl,
+  paginateMessages as paginateMessagesImpl,
+  paginateCollection,
 } from './main/data-fetchers.js';
 import {
   compareNumber,
@@ -184,7 +192,13 @@ import {
 } from './main/protocol-icons.js';
 import { buildNeighborTooltipHtml, buildTraceTooltipHtml } from './main/tooltip-html.js';
 import { createOfflineTileLayer as createOfflineTileLayerImpl } from './main/offline-tile-layer.js';
+import { TILE_LAYER_URL, TILE_LAYER_OPTIONS } from './basemap-config.js';
+import { createTileFailurePolicy } from './main/tile-failure-policy.js';
 import { getActiveFullscreenElement, legendClickHandler } from './main/fullscreen-helpers.js';
+import { createEventStream } from './main/event-stream.js';
+import { flashNodeTargets, flashMessageTargets, emitNodeWaves } from './main/flash.js';
+import { captureOpenMarkerOverlays, restoreMarkerOverlays } from './main/marker-overlay-preservation.js';
+import { collectNodeIds, collectMessageIds, entryMessageId } from './main/flash-targets.js';
 
 /**
  * Entry point for the interactive dashboard. Wires up event listeners,
@@ -198,16 +212,13 @@ import { getActiveFullscreenElement, legendClickHandler } from './main/fullscree
  *   frequency: string,
  *   mapCenter: { lat: number, lon: number },
  *   mapZoom: number | null,
- *   maxDistanceKm: number,
- *   tileFilters: { light: string, dark: string }
+ *   maxDistanceKm: number
  * }} config Normalized application configuration.
  * @returns {{ _testUtils: Object }} Object whose ``_testUtils`` property exposes
  *   inner closures for unit tests. Production callers may ignore this.
  */
 export function initializeApp(config) {
-  const statusEl = document.getElementById('status');
   const footerActiveNodes = document.getElementById('footerActiveNodes');
-  const refreshBtn = document.getElementById('refreshBtn');
   const autorefreshToggle = document.getElementById('autorefreshToggle');
   const protocolToggleMeshcore = document.getElementById('protocolToggleMeshcore');
   const protocolToggleMeshtastic = document.getElementById('protocolToggleMeshtastic');
@@ -228,7 +239,6 @@ export function initializeApp(config) {
     ? String(document.body.dataset.privateMode).toLowerCase() === 'true'
     : false;
   const isDashboardView = bodyClassList ? bodyClassList.contains('view-dashboard') : false;
-  const isChatView = bodyClassList ? bodyClassList.contains('view-chat') : false;
   const isMapView = bodyClassList ? bodyClassList.contains('view-map') : false;
   const mapZoomOverride = Number.isFinite(config.mapZoom) ? Number(config.mapZoom) : null;
 
@@ -299,8 +309,13 @@ export function initializeApp(config) {
   let nodesById = new Map();
   let messagesById = new Map();
   let nodesByNum = new Map();
+  // No ``fetchNodeById`` is supplied, so the hydrator resolves senders purely
+  // from the already-loaded bulk node map (``nodesById``) and renders an ``!id``
+  // placeholder on a miss — it never issues per-node ``GET /api/nodes/:id``
+  // requests, which used to storm the server with hundreds of round trips (many
+  // 404s for RF-only nodes) on every cold load (issue: node hydration). A
+  // deliberate, batched refresh path can opt back in by injecting a fetcher.
   const messageNodeHydrator = createMessageNodeHydrator({
-    fetchNodeById,
     applyNodeFallback: applyNodeNameFallback,
     logger: console,
   });
@@ -315,6 +330,241 @@ export function initializeApp(config) {
   let lastTraceTimestamp = 0;
   /** Whether the very first full fetch has completed. */
   let initialFetchDone = false;
+  /** Whether the background chat-history backfill is currently running. */
+  let chatBackfillRunning = false;
+  /** One-shot guard: the chat-history backfill runs once after the first load. */
+  let chatHistoryBackfilled = false;
+  /**
+   * Oldest ``rx_time`` of the newest delta page (the "live frontier"). The
+   * background backfill pages backward from here, not from the global-oldest
+   * loaded row, so a warm-cache load bridges the gap between the newest page
+   * and the seeded cache instead of paging below the cache and orphaning the
+   * window in between. 0 until the first fetch; on a cold load it equals the
+   * global-oldest, so the cold backfill is unchanged.
+   */
+  let chatLiveFrontier = 0;
+  /** Settles when the one-shot chat-history backfill finishes (test hook). */
+  let backfillPromise = Promise.resolve();
+  /**
+   * Live frontiers for the bulk collections (oldest cursor value of the newest
+   * page) — the one-shot background backfill pages backward from here, exactly
+   * like {@link chatLiveFrontier}. 0 means "no backfill" (a short newest page,
+   * or a warm-cache load whose data is already seeded). Issue #832 / SPEC BP9a.
+   * @type {{ nodes: number, positions: number, telemetry: number, neighbors: number, traces: number }}
+   */
+  let collectionLiveFrontiers = { nodes: 0, positions: 0, telemetry: 0, neighbors: 0, traces: 0 };
+  /** One-shot guard: the bulk-collection backfill runs once after the first load. */
+  let collectionsBackfilled = false;
+  /** Settles when the one-shot bulk-collection backfill finishes (test hook). */
+  let collectionBackfillPromise = Promise.resolve();
+
+  // Persistent read-side cache (SPEC FC1–FC7). The IndexedDB backend is null
+  // when storage is unavailable, and PRIVATE mode disables + wipes the cache —
+  // either way ``createDataCache`` yields a no-op cache and the app falls back to
+  // network-only behavior. ``cachedAt`` is stamped in unix seconds to match the
+  // API's record timestamps (used by the lifetime helper).
+  const dataCache = createDataCache({
+    backend: createIndexedDbBackend(),
+    schemaVersion: CACHE_SCHEMA_VERSION,
+    instanceId: config.instanceDomain || '',
+    isPrivate: isPrivateMode,
+    now: () => Math.floor(Date.now() / 1000),
+  });
+  /** Unix-seconds of the last full cache write-back (throttle gate). */
+  let lastCacheWriteSeconds = 0;
+  /** Minimum seconds between full cache write-backs (the cache lags slightly). */
+  const CACHE_WRITE_INTERVAL_SECONDS = 30;
+  /** Settles when the most recent write-back's stores have flushed (test hook). */
+  let pendingCacheWrite = Promise.resolve();
+
+  /**
+   * Record (in ``localStorage``, synchronously readable by the cold-load boot
+   * prefetch) whether the persistent cache holds data. A warm marker makes the
+   * next load skip the early prefetch and use the faster FC2 seed-then-delta
+   * path; clearing it re-enables the cold prefetch. Best-effort — storage errors
+   * are swallowed, since the prefetch degrades gracefully either way.
+   *
+   * @param {boolean} present Whether the cache now holds data.
+   * @returns {void}
+   */
+  function setCachePresentFlag(present) {
+    try {
+      const store = typeof window !== 'undefined' && window.localStorage ? window.localStorage : null;
+      if (!store) return;
+      if (present) store.setItem(BOOT_CACHE_FLAG, '1');
+      else store.removeItem(BOOT_CACHE_FLAG);
+    } catch (error) {
+      /* storage unavailable/blocked — the prefetch still degrades gracefully */
+    }
+  }
+
+  /**
+   * Persist a collection's current rows into the cache, fire-and-forget. The
+   * cache is best-effort and never blocks rendering (FC7).
+   *
+   * @param {string} collection Cache collection name.
+   * @param {Array<Object>} records Rows to persist.
+   * @returns {void}
+   */
+  function cacheWriteCollection(collection, records) {
+    if (!Array.isArray(records) || records.length === 0) return Promise.resolve();
+    const entries = [];
+    for (const record of records) {
+      const key = cacheKeyFor(collection, record);
+      if (key != null) entries.push({ key, value: record });
+    }
+    return entries.length > 0 ? dataCache.putAll(collection, entries) : Promise.resolve();
+  }
+
+  /**
+   * Shallow-copy a chat message without its hydrated ``node`` so the cache stores
+   * the raw row; the sender is re-resolved from the bulk node map on seed.
+   *
+   * @param {Object} message Hydrated chat message.
+   * @returns {Object} Message copy without ``node``.
+   */
+  function messageForCache(message) {
+    if (!message || typeof message !== 'object') return message;
+    const copy = { ...message };
+    delete copy.node;
+    return copy;
+  }
+
+  /**
+   * Throttled full write-back of the live dashboard state to the cache (SPEC
+   * FC2). Runs at most once per {@link CACHE_WRITE_INTERVAL_SECONDS} (always on
+   * the first successful refresh). No-op when the cache is disabled.
+   *
+   * @returns {void}
+   */
+  function writeBackCache() {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (lastCacheWriteSeconds && nowSeconds - lastCacheWriteSeconds < CACHE_WRITE_INTERVAL_SECONDS) {
+      return;
+    }
+    lastCacheWriteSeconds = nowSeconds;
+    pendingCacheWrite = Promise.allSettled([
+      cacheWriteCollection('nodes', allNodes),
+      cacheWriteCollection('positions', allPositionEntries),
+      cacheWriteCollection('telemetry', allTelemetryEntries),
+      cacheWriteCollection('neighbors', allNeighbors),
+      cacheWriteCollection('traces', allTraces),
+      cacheWriteCollection('messages', allMessages.map(messageForCache)),
+      cacheWriteCollection('encrypted', allEncryptedMessages.map(messageForCache)),
+    ]);
+    // Mark the cache populated so the next load skips the cold prefetch in favour
+    // of the faster FC2 seed-then-delta path — only when we actually have data to
+    // persist and the cache is enabled (PRIVATE / no-IndexedDB leave it cold).
+    if (!dataCache.isDisabled() && allNodes.length > 0) setCachePresentFlag(true);
+  }
+
+  /**
+   * Read non-expired entries for ``collection`` from the cache, deleting any
+   * past their eviction window so the store stays bounded across sessions
+   * (FC3/FC5). Returns the full entries (``{ key, value, cachedAt }``) so callers
+   * can both seed the value and judge staleness.
+   *
+   * @param {string} collection Cache collection name.
+   * @param {number} nowSeconds Current time, unix seconds.
+   * @returns {Promise<Array<{ key: string, value: Object, cachedAt: number }>>} Live entries.
+   */
+  async function readLiveCacheEntries(collection, nowSeconds) {
+    const rows = await dataCache.getAll(collection);
+    const live = [];
+    for (const entry of rows) {
+      if (isCacheEntryExpired(collection, entry, nowSeconds)) {
+        void dataCache.delete(collection, entry.key);
+      } else {
+        live.push(entry);
+      }
+    }
+    return live;
+  }
+
+  /**
+   * Seed the in-memory dashboard state from the persistent cache for an instant
+   * first paint, then set the per-collection high-water marks so the subsequent
+   * refresh fetches only the delta (SPEC FC2). Cached rows are already the
+   * render-ready ``all*`` form, so seeding is a direct assignment (messages are
+   * re-hydrated against the seeded node map). No-op (returns false) when the
+   * cache is disabled or empty, leaving the normal cold fetch to proceed.
+   *
+   * @returns {Promise<boolean>} True when any cached data seeded the state.
+   */
+  async function seedFromCache() {
+    await dataCache.ready();
+    if (dataCache.isDisabled()) {
+      // No persistent cache this session (PRIVATE mode or storage unavailable);
+      // clear any stale warm-marker so the next load runs the cold prefetch.
+      setCachePresentFlag(false);
+      return false;
+    }
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const [nodeEntries, positionEntries, telemetryEntries, neighborEntries, traceEntries] = await Promise.all([
+      readLiveCacheEntries('nodes', nowSeconds),
+      readLiveCacheEntries('positions', nowSeconds),
+      readLiveCacheEntries('telemetry', nowSeconds),
+      readLiveCacheEntries('neighbors', nowSeconds),
+      readLiveCacheEntries('traces', nowSeconds),
+    ]);
+    const messageEntries = CHAT_ENABLED ? await readLiveCacheEntries('messages', nowSeconds) : [];
+    const encryptedEntries = CHAT_ENABLED ? await readLiveCacheEntries('encrypted', nowSeconds) : [];
+    if (
+      nodeEntries.length === 0 &&
+      messageEntries.length === 0 &&
+      encryptedEntries.length === 0 &&
+      positionEntries.length === 0 &&
+      telemetryEntries.length === 0 &&
+      neighborEntries.length === 0 &&
+      traceEntries.length === 0
+    ) {
+      return false;
+    }
+
+    allNodes = nodeEntries.map(entry => entry.value);
+    allPositionEntries = positionEntries.map(entry => entry.value);
+    allTelemetryEntries = telemetryEntries.map(entry => entry.value);
+    allNeighbors = neighborEntries.map(entry => entry.value);
+    allTraces = traceEntries.map(entry => entry.value);
+    rebuildNodeIndex(allNodes);
+    const [seededChat, seededEncrypted] = await Promise.all([
+      messageNodeHydrator.hydrate(messageEntries.map(entry => entry.value), nodesById),
+      messageNodeHydrator.hydrate(encryptedEntries.map(entry => entry.value), nodesById),
+    ]);
+    allMessages = Array.isArray(seededChat) ? seededChat : [];
+    allEncryptedMessages = Array.isArray(seededEncrypted) ? seededEncrypted : [];
+
+    // FC3 staleness: when every cached node copy is older than the 24 h node
+    // staleness window, prefer a full node refresh (high-water 0 → since=0) over
+    // a delta, so all node metadata is refreshed rather than only nodes heard
+    // since the newest cached one. Inactive nodes are still seeded (retained),
+    // they are just re-fetched fresh on this first refresh.
+    const nodesStale =
+      nodeEntries.length > 0 && nodeEntries.every(entry => isCacheEntryStale('nodes', entry, nowSeconds));
+    lastNodeTimestamp = nodesStale ? 0 : maxRecordTimestamp(allNodes, ['last_heard']);
+    lastMessageTimestamp = Math.max(
+      maxRecordTimestamp(allMessages, ['rx_time']),
+      maxRecordTimestamp(allEncryptedMessages, ['rx_time']),
+    );
+    lastPositionTimestamp = maxRecordTimestamp(allPositionEntries, ['rx_time', 'position_time']);
+    lastTelemetryTimestamp = maxRecordTimestamp(allTelemetryEntries, ['rx_time', 'telemetry_time']);
+    lastNeighborTimestamp = maxRecordTimestamp(allNeighbors, ['rx_time']);
+    lastTraceTimestamp = maxRecordTimestamp(allTraces, ['rx_time']);
+    initialFetchDone = true;
+    applyFilter();
+    return true;
+  }
+
+  /**
+   * Empty the persistent cache on demand (the FC4 "clear cached data" control).
+   *
+   * @returns {Promise<void>} Resolves once the cache is cleared.
+   */
+  async function clearDataCache() {
+    await dataCache.clear();
+    // Re-enable the cold prefetch on the next load now that the cache is empty.
+    setCachePresentFlag(false);
+  }
 
   // NODE_LIMIT, TRACE_LIMIT, TRACE_MAX_AGE_SECONDS, and SNAPSHOT_LIMIT are
   // imported from ``./main/constants.js`` so the helpers extracted into
@@ -322,7 +572,27 @@ export function initializeApp(config) {
   // values without re-declaring them here.
   const CHAT_LIMIT = MESSAGE_LIMIT;
   const CHAT_RECENT_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+  // Memoising cache of chat-log entry DOM nodes. Incremental rendering reuses
+  // already-built entries across refresh ticks so only new/changed entries are
+  // parsed from HTML, keeping idle re-renders free of per-entry work (issue:
+  // chat-log render). Exposed via ``_testUtils.getChatRenderStats`` so unit
+  // tests and the manual verification hook can confirm idle ticks materialise
+  // no entries.
+  const chatEntryCache = createChatEntryCache({ documentRef: document });
   const REFRESH_MS = config.refreshMs;
+  // Live-update (SSE) configuration. When live updates are active the SSE stream
+  // drives refreshes and the only timer is the slow safety poll; otherwise the
+  // app falls back to the REFRESH_MS poll exactly as before (SPEC PS5/PS8).
+  const LIVE_UPDATES_ENABLED = Boolean(config.liveUpdatesEnabled);
+  const LIVE_UPDATES_PATH = typeof config.liveUpdatesPath === 'string' && config.liveUpdatesPath
+    ? config.liveUpdatesPath
+    : '/api/events';
+  const SAFETY_POLL_MS = Number.isFinite(config.safetyPollMs) && config.safetyPollMs > 0
+    ? config.safetyPollMs
+    : REFRESH_MS;
+  // Coalesce a burst of SSE pings into one delta fetch (client-side throttle,
+  // complementing the server-side coalescing, SPEC PS4).
+  const LIVE_DEBOUNCE_MS = 250;
   const CHAT_ENABLED = Boolean(config.chatEnabled);
   const instanceSelectorEnabled = Boolean(config.instancesFeatureEnabled);
 
@@ -340,6 +610,27 @@ export function initializeApp(config) {
   let refreshTimer = null;
   let autorefreshPaused = false;
   let activeStatsRequestId = 0;
+  // --- Live-update (SSE) state ---
+  /** @type {?ReturnType<typeof createEventStream>} */
+  let liveStream = null;
+  /** Whether an SSE stream is currently open and driving updates. */
+  let liveActive = false;
+  /** The auto-refresh timer cadence last armed (ms); exposed for tests. */
+  let autoRefreshIntervalMs = 0;
+  /** Collections flagged dirty by SSE pings, fetched on the next debounced refresh. */
+  const dirtyCollections = new Set();
+  /** @type {ReturnType<typeof setTimeout>|null} */
+  let liveRefreshTimer = null;
+  /** Promise of the most recent live-driven refresh (test hook). */
+  let liveRefreshPromise = Promise.resolve();
+  /** Count of flash rounds triggered by SSE pings (VF2 gating; test hook). */
+  let liveFlashCount = 0;
+  /** Node ids flashed by the most recent SSE-ping refresh (test hook). */
+  let lastFlashedNodeIds = [];
+  /** Message ids flashed by the most recent SSE-ping refresh (test hook). */
+  let lastFlashedMessageIds = [];
+  /** Per-render map of message id → its channel tab id, for the tab-header flash. */
+  let messageTabId = new Map();
 
   /**
    * Close any open short-info overlays that do not contain the provided anchor.
@@ -361,30 +652,6 @@ export function initializeApp(config) {
         continue;
       }
       overlayStack.close(entry.anchor);
-    }
-  }
-
-  /**
-   * Scroll the active chat tab panel to its most recent entry when the
-   * dedicated chat view is displayed.
-   *
-   * @returns {void}
-   */
-  function scrollActiveChatPanelToBottom() {
-    if (!chatEl || !isChatView) {
-      return;
-    }
-    const activeTabId = chatEl.dataset?.activeTab;
-    if (!activeTabId) {
-      return;
-    }
-    const escapedId = cssEscape(activeTabId);
-    if (!escapedId) {
-      return;
-    }
-    const panel = chatEl.querySelector(`#chat-panel-${escapedId}`);
-    if (panel && typeof panel.scrollHeight === 'number' && typeof panel.scrollTop === 'number') {
-      panel.scrollTop = panel.scrollHeight;
     }
   }
 
@@ -469,7 +736,139 @@ export function initializeApp(config) {
   updateSortIndicators();
 
   /**
-   * Restart the auto-refresh timer according to the user's preferences.
+   * Fetch only the collections flagged dirty by SSE pings, then clear the
+   * pending set. Targeted delta fetch (SPEC PS3): a `messages` ping fetches only
+   * `/api/messages`, not the whole dataset.
+   *
+   * @returns {Promise<void>} resolves once the targeted refresh completes.
+   */
+  function runLiveRefresh() {
+    liveRefreshTimer = null;
+    const collections = new Set(dirtyCollections);
+    dirtyCollections.clear();
+    // flash: true marks this as the SSE-ping path, the only refresh that
+    // flashes changed rows (SPEC VF2). Resync / safety poll / initial load
+    // call refresh() without it, so they never flash.
+    liveRefreshPromise = refresh({ collections, flash: true });
+    return liveRefreshPromise;
+  }
+
+  /**
+   * Flash each changed node's table row(s) and map marker white (SPEC VF3).
+   * Called after the table + map have rendered so the highlight lands on the
+   * final element. Targets already-rendered DOM only — it never re-materialises
+   * rows or fetches, so the incremental-render invariants (CR-A1) are preserved.
+   *
+   * @param {Set<string>} nodeIds Canonical node ids to flash.
+   * @returns {void}
+   */
+  function flashChangedNodes(nodeIds) {
+    if (!nodeIds || nodeIds.size === 0) return;
+    // Record that a flash round was triggered (VF2 gating — test hook).
+    liveFlashCount += 1;
+    lastFlashedNodeIds = [...nodeIds];
+    flashNodeTargets(nodeIds, { documentRef: document, markerByNodeId });
+    // Emit an expanding wave from each changed node's marker (SPEC LV5). Guarded
+    // on Leaflet so the poll / no-map paths stay no-ops; the wave colour resolves
+    // to the node's role colour.
+    if (hasLeaflet && flashWavesLayer) {
+      emitNodeWaves(nodeIds, {
+        markerByNodeId,
+        leaflet: L,
+        layer: flashWavesLayer,
+        colorForNodeId: (id) => {
+          const node = nodesById.get(id);
+          return getRoleFlashColor(node && node.role, node && node.protocol, 0.85);
+        },
+      });
+    }
+  }
+
+  /**
+   * Flash each changed message's chat row(s) and its channel tab header (SPEC
+   * VF3). Called after the chat has rendered (so the rows + tabs exist and the
+   * message→tab map is populated). Targets already-rendered DOM only.
+   *
+   * @param {Set<string>} messageIds Message ids to flash.
+   * @returns {void}
+   */
+  function flashChangedMessages(messageIds) {
+    if (!messageIds || messageIds.size === 0) return;
+    lastFlashedMessageIds = [...messageIds];
+    flashMessageTargets(messageIds, { documentRef: document, messageTabId });
+  }
+
+  /**
+   * Flag a collection dirty in response to an SSE change ping and arm the
+   * debounce timer so a burst of pings collapses into one delta fetch.
+   *
+   * @param {string} collection Changed collection name.
+   * @returns {void}
+   */
+  function scheduleLiveRefresh(collection) {
+    dirtyCollections.add(collection);
+    if (!liveRefreshTimer) {
+      liveRefreshTimer = setTimeout(runLiveRefresh, LIVE_DEBOUNCE_MS);
+    }
+  }
+
+  /**
+   * Run a full delta refresh on every SSE (re)connect so any change missed
+   * while the stream was down is recovered (SPEC PS5).
+   *
+   * @returns {void}
+   */
+  function handleLiveResync() {
+    if (liveRefreshTimer) {
+      clearTimeout(liveRefreshTimer);
+      liveRefreshTimer = null;
+    }
+    dirtyCollections.clear();
+    liveRefreshPromise = refresh();
+  }
+
+  /**
+   * Open the SSE stream when live updates are enabled.
+   *
+   * @returns {boolean} true when a stream is active (caller uses the safety
+   *   poll); false when disabled/unsupported (caller uses the REFRESH_MS poll).
+   */
+  function startLiveUpdates() {
+    if (!LIVE_UPDATES_ENABLED) return false;
+    if (!liveStream) {
+      liveStream = createEventStream({
+        path: LIVE_UPDATES_PATH,
+        onChange: collection => scheduleLiveRefresh(collection),
+        onResync: () => handleLiveResync(),
+        onError: (message, error) => console.debug('live updates:', message, error),
+      });
+    }
+    liveActive = liveStream.start();
+    return liveActive;
+  }
+
+  /**
+   * Close the SSE stream and drop any pending live refresh.
+   *
+   * @returns {void}
+   */
+  function stopLiveUpdates() {
+    if (liveStream) liveStream.stop();
+    liveActive = false;
+    if (liveRefreshTimer) {
+      clearTimeout(liveRefreshTimer);
+      liveRefreshTimer = null;
+    }
+    dirtyCollections.clear();
+  }
+
+  /**
+   * Restart the auto-refresh according to the user's preferences.
+   *
+   * With live updates active the SSE stream drives fetches and the timer is the
+   * slow safety poll ({@link SAFETY_POLL_MS}); otherwise it is the legacy
+   * {@link REFRESH_MS} poll. Paused auto-refresh arms no timer and closes the
+   * stream so no background requests are made (SPEC PS5).
    *
    * @returns {void}
    */
@@ -480,12 +879,21 @@ export function initializeApp(config) {
       clearInterval(refreshTimer);
       refreshTimer = null;
     }
+    autoRefreshIntervalMs = 0;
+    // When the user has explicitly paused auto-refresh, skip arming the timer
+    // and tear down the live stream so no background API requests are made.
+    if (autorefreshPaused) {
+      stopLiveUpdates();
+      return;
+    }
+    // Prefer live push; fall back to polling when SSE is disabled/unsupported.
+    const live = startLiveUpdates();
+    const intervalMs = live ? SAFETY_POLL_MS : REFRESH_MS;
     // Only arm the timer when a positive interval is configured; a zero or
     // negative value means auto-refresh is intentionally disabled.
-    // When the user has explicitly paused auto-refresh, skip arming the timer
-    // entirely so no background API requests are made.
-    if (REFRESH_MS > 0 && !autorefreshPaused) {
-      refreshTimer = setInterval(refresh, REFRESH_MS);
+    if (intervalMs > 0) {
+      autoRefreshIntervalMs = intervalMs;
+      refreshTimer = setInterval(refresh, intervalMs);
     }
   }
 
@@ -532,6 +940,12 @@ export function initializeApp(config) {
   let traceLinesToggleButton = null;
   let markersLayer = null;
   let spiderLinesLayer = null;
+  // Dedicated, never-cleared layer hosting transient LV5 wave rings; each wave
+  // self-removes after its animation, so a map re-render never clears it.
+  let flashWavesLayer = null;
+  // Per-render map of canonical node id → its Leaflet marker, so a live update
+  // can flash the marker for a changed node (SPEC VF3). Rebuilt every renderMap.
+  let markerByNodeId = new Map();
   // Per-render record of the offset markers we created so the zoom event
   // handlers can re-project them and keep the on-screen pixel gap constant
   // regardless of zoom level.  Each entry is
@@ -563,7 +977,6 @@ export function initializeApp(config) {
   // by groupSize we share a single instance across same-size groups and
   // across renders.  See ``getColocatedHubIcon`` for the lookup.
   const colocatedHubIconCache = new Map();
-  let tileDomObserver = null;
   const fullscreenChangeEvents = [
     'fullscreenchange',
     'webkitfullscreenchange',
@@ -921,100 +1334,12 @@ export function initializeApp(config) {
 
 
   // --- Map setup ---
-  const TILE_LAYER_URL = 'https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png';
-  const TILE_FILTER_LIGHT = config.tileFilters.light;
-  const TILE_FILTER_DARK = config.tileFilters.dark;
+  // The basemap is CARTO Dark Matter (see ``./basemap-config.js``). Its tiles
+  // are natively dark-grey, so there is no per-theme CSS colour filter — the
+  // old ``grayscale``/``invert`` pipeline was removed with the provider swap.
 
   if (hasLeaflet) {
     mapCenterLatLng = L.latLng(MAP_CENTER_COORDS.lat, MAP_CENTER_COORDS.lon);
-  }
-
-  /**
-   * Return the CSS filter applied to Leaflet tiles for the active theme.
-   *
-   * @returns {string} CSS filter expression.
-   */
-  function resolveTileFilter() {
-    return document.body.classList.contains('dark') ? TILE_FILTER_DARK : TILE_FILTER_LIGHT;
-  }
-
-  /**
-   * Apply the configured filter to an individual Leaflet tile element.
-   *
-   * @param {HTMLElement} tile Tile image element.
-   * @param {string} filterValue CSS filter expression.
-   * @returns {void}
-   */
-  function applyFilterToTileElement(tile, filterValue) {
-    if (!tile || usingOfflineTiles) return;
-    if (tile.classList && !tile.classList.contains('map-tiles')) {
-      tile.classList.add('map-tiles');
-    }
-    const value = filterValue || resolveTileFilter();
-    if (tile.style) {
-      tile.style.filter = value;
-      tile.style.webkitFilter = value;
-    }
-  }
-
-  /**
-   * Return the Leaflet DOM container that currently owns map tiles.
-   *
-   * @returns {HTMLElement|null} Tile layer container element.
-   */
-  function getActiveTileLayerContainer() {
-    if (!map) return null;
-    const layer = usingOfflineTiles ? offlineTiles : tiles;
-    return layer && typeof layer.getContainer === 'function' ? layer.getContainer() : null;
-  }
-
-  /**
-   * Apply a CSS filter to all currently mounted Leaflet tile elements.
-   *
-   * @param {string} filterValue CSS filter expression.
-   * @returns {void}
-   */
-  function applyFilterToTileContainers(filterValue) {
-    if (!map) return;
-    const value = filterValue || resolveTileFilter();
-    const container = getActiveTileLayerContainer();
-    if (container && container.style) {
-      container.style.filter = value;
-      container.style.webkitFilter = value;
-    }
-    const tilePane = typeof map.getPane === 'function' ? map.getPane('tilePane') : null;
-    if (tilePane && tilePane.style) {
-      tilePane.style.filter = value;
-      tilePane.style.webkitFilter = value;
-    }
-  }
-
-  /**
-   * Ensure a tile element reflects the active theme filter.
-   *
-   * @param {HTMLElement} tile Tile element managed by Leaflet.
-   * @returns {void}
-   */
-  function ensureTileHasCurrentFilter(tile) {
-    if (!map || usingOfflineTiles) return;
-    const filterValue = resolveTileFilter();
-    applyFilterToTileElement(tile, filterValue);
-  }
-
-  /**
-   * Synchronise all existing tiles with the current theme filter.
-   *
-   * @returns {void}
-   */
-  function applyFiltersToAllTiles() {
-    if (!map) return;
-    const filterValue = resolveTileFilter();
-    document.body.style.setProperty('--map-tiles-filter', filterValue);
-    if (!usingOfflineTiles) {
-      const tileEls = mapContainer ? mapContainer.querySelectorAll('.leaflet-tile') : [];
-      tileEls.forEach(tile => applyFilterToTileElement(tile, filterValue));
-    }
-    applyFilterToTileContainers(filterValue);
   }
 
   /**
@@ -1033,53 +1358,6 @@ export function initializeApp(config) {
   function createOfflineTileLayer() {
     if (!hasLeaflet) return null;
     return createOfflineTileLayerImpl(L);
-  }
-
-  /**
-   * Disconnect and clear the MutationObserver tracking tile additions.
-   *
-   * @returns {void}
-   */
-  function disconnectTileObserver() {
-    if (tileDomObserver) {
-      tileDomObserver.disconnect();
-      tileDomObserver = null;
-    }
-  }
-
-  /**
-   * Observe a Leaflet tile container to reapply filters as new tiles load.
-   *
-   * @param {L.GridLayer} layer Leaflet layer whose container should be watched.
-   * @returns {void}
-   */
-  function observeTileContainer(layer) {
-    if (!map || typeof MutationObserver !== 'function') return;
-    const targetLayer = layer || (usingOfflineTiles ? offlineTiles : tiles);
-    const container = targetLayer && typeof targetLayer.getContainer === 'function' ? targetLayer.getContainer() : null;
-    const tilePane = typeof map.getPane === 'function' ? map.getPane('tilePane') : null;
-    const targets = [];
-    if (container) targets.push(container);
-    if (tilePane && !targets.includes(tilePane)) targets.push(tilePane);
-    if (!targets.length) return;
-    disconnectTileObserver();
-    tileDomObserver = new MutationObserver(mutations => {
-      const filterValue = resolveTileFilter();
-      mutations.forEach(mutation => {
-        mutation.addedNodes.forEach(node => {
-          if (!node || node.nodeType !== 1) return;
-          if (!usingOfflineTiles && node.classList && node.classList.contains('leaflet-tile')) {
-            applyFilterToTileElement(node, filterValue);
-          }
-          if (typeof node.querySelectorAll === 'function') {
-            const nestedTiles = node.querySelectorAll('.leaflet-tile');
-            nestedTiles.forEach(tile => applyFilterToTileElement(tile, filterValue));
-          }
-        });
-      });
-      applyFilterToTileContainers(filterValue);
-    });
-    targets.forEach(target => tileDomObserver.observe(target, { childList: true, subtree: true }));
   }
 
   /**
@@ -1127,11 +1405,9 @@ export function initializeApp(config) {
     }
     usingOfflineTiles = true;
     offlineTiles.addTo(map);
-    observeTileContainer(offlineTiles);
     if (message) {
       showMapStatus(message);
     }
-    applyFiltersToAllTiles();
   }
 
   const mapAlreadyInitialized = mapContainer && mapContainer._leaflet_id;
@@ -1139,37 +1415,39 @@ export function initializeApp(config) {
   if (hasLeaflet && mapContainer && !isFederationView && !mapAlreadyInitialized) {
     map = L.map(mapContainer, { worldCopyJump: true, attributionControl: false });
     showMapStatus('Loading map tiles…');
-    tiles = L.tileLayer(TILE_LAYER_URL, {
-      maxZoom: 19,
-      className: 'map-tiles',
-      crossOrigin: 'anonymous'
-    });
+    tiles = L.tileLayer(TILE_LAYER_URL, TILE_LAYER_OPTIONS);
+    const tileFailurePolicy = createTileFailurePolicy();
+    const OFFLINE_TILES_MESSAGE =
+      'Map tiles unavailable. Showing offline placeholder basemap.';
 
-    tiles.on('tileloadstart', event => {
-      if (!event || !event.tile) return;
-      ensureTileHasCurrentFilter(event.tile);
-      applyFilterToTileContainers();
-    });
-
-    tiles.on('tileload', event => {
-      if (!event || !event.tile) return;
-      ensureTileHasCurrentFilter(event.tile);
-      applyFilterToTileContainers();
-    });
-
-    tiles.on('load', () => {
-      usingOfflineTiles = false;
+    tiles.on('tileload', () => {
+      // The first successful tile latches the basemap "alive": from here on,
+      // isolated tile errors are tolerated and never swap in the offline layer.
+      tileFailurePolicy.recordTileLoad();
       hideMapStatus();
-      applyFiltersToAllTiles();
-      observeTileContainer(tiles);
     });
 
     tiles.on('tileerror', () => {
-      activateOfflineTiles('Map tiles unavailable. Showing offline placeholder basemap.');
+      // A single tile error no longer kills the basemap (DM3). The offline
+      // fallback only fires once the policy judges the basemap comprehensively
+      // unreachable (no successes after enough failures).
+      if (tileFailurePolicy.recordTileError()) {
+        activateOfflineTiles(OFFLINE_TILES_MESSAGE);
+      }
+    });
+
+    tiles.on('load', () => {
+      // The current viewport finished loading. If not a single tile succeeded,
+      // the provider is unreachable — fall back; otherwise the basemap is up.
+      if (tileFailurePolicy.recordLayerLoad()) {
+        activateOfflineTiles(OFFLINE_TILES_MESSAGE);
+        return;
+      }
+      usingOfflineTiles = false;
+      hideMapStatus();
     });
 
     tiles.addTo(map);
-    observeTileContainer(tiles);
 
     const initialBounds = computeBoundingBox(
       MAP_CENTER_COORDS,
@@ -1188,17 +1466,13 @@ export function initializeApp(config) {
 
     if (typeof map.whenReady === 'function') {
       map.whenReady(() => {
-        applyFiltersToAllTiles();
         refreshMapSize();
         applyLastRecordedBounds({ animate: false });
       });
     } else {
-      applyFiltersToAllTiles();
       applyLastRecordedBounds({ animate: false });
     }
 
-    map.on('moveend', applyFiltersToAllTiles);
-    map.on('zoomend', applyFiltersToAllTiles);
     map.on('movestart', () => {
       autoFitController.handleUserInteraction();
     });
@@ -1207,6 +1481,7 @@ export function initializeApp(config) {
     });
 
     neighborLinesLayer = L.layerGroup().addTo(map);
+    flashWavesLayer = L.layerGroup().addTo(map);
     traceLinesLayer = L.layerGroup().addTo(map);
     // Spider lines render between the connection lines and the markers so the
     // dashed white "leader" lines are visible against neighbour/trace overlays
@@ -1238,15 +1513,6 @@ export function initializeApp(config) {
     }
   } else if (mapContainer && !isFederationView) {
     setMapPlaceholder('Leaflet assets are unavailable. Data will continue to refresh without a live map.');
-  }
-
-  if (typeof window !== 'undefined') {
-    /**
-     * Helper exposed for the theme module to refresh Leaflet tile filters.
-     *
-     * @type {function(): void}
-     */
-    window.applyFiltersToAllTiles = applyFiltersToAllTiles;
   }
 
   let legendContainer = null;
@@ -1805,7 +2071,11 @@ export function initializeApp(config) {
       if (!record) {
         let neighborNode = nodesById.get(neighborId);
         if (!neighborNode) {
-          const placeholder = { node_id: neighborId };
+          // Inherit the source node's protocol so the fallback label tracks
+          // the radio the neighbor lives on.  Neighborinfo entries are emitted
+          // by a node talking to its own radio peers, so cross-protocol mixing
+          // is not a concern here.
+          const placeholder = buildNodePlaceholder(neighborId, entry);
           applyNodeNameFallback(placeholder);
           neighborNode = placeholder;
         }
@@ -2204,12 +2474,13 @@ export function initializeApp(config) {
   }
 
   /**
-   * Build a chat log entry describing a node join event.
+   * Build the parts (class name + HTML) for a node-join chat entry.
    *
-   * @param {Object} n Node payload.
-   * @returns {HTMLElement} Chat log element.
+   * @param {Object} node Node payload.
+   * @param {?number} [timestampOverride=null] Optional timestamp override.
+   * @returns {{ className: string, html: string }|null} Entry parts or null.
    */
-  function createNodeChatEntry(node, timestampOverride = null) {
+  function buildNodeChatEntryParts(node, timestampOverride = null) {
     if (!node || typeof node !== 'object') return null;
     const nodeIdRaw = pickFirstProperty([node], ['node_id', 'nodeId']);
     const fallbackId = nodeIdRaw || 'Unknown node';
@@ -2224,7 +2495,7 @@ export function initializeApp(config) {
     const tsSeconds = timestampOverride != null
       ? timestampOverride
       : resolveTimestampSeconds(node.first_heard ?? node.firstHeard, node.first_heard_iso ?? node.firstHeardIso);
-    return createAnnouncementEntry({
+    return buildAnnouncementParts({
       timestampSeconds: tsSeconds,
       shortName: shortNameDisplay,
       longName: longNameDisplay,
@@ -2240,9 +2511,11 @@ export function initializeApp(config) {
    * Build a formatted suffix that enumerates highlight values.
    *
    * @param {Array<{label: string, value: string}>} highlights Highlight metadata entries.
+   * @param {string} [separator=' — '] Leading separator placed before the joined
+   *   highlights (e.g. ``': '`` so a position reads "Broadcasted position info: …").
    * @returns {string} HTML suffix containing escaped highlight entries.
    */
-  function buildHighlightSuffix(highlights) {
+  function buildHighlightSuffix(highlights, separator = ' — ') {
     if (!Array.isArray(highlights) || highlights.length === 0) {
       return '';
     }
@@ -2265,7 +2538,7 @@ export function initializeApp(config) {
     if (!parts.length) {
       return '';
     }
-    return ` — ${parts.join(', ')}`;
+    return `${separator}${parts.join(', ')}`;
   }
 
   /**
@@ -2298,9 +2571,22 @@ export function initializeApp(config) {
     return `<span class="chat-entry-copy">${escapeHtml(safeBase)}${safeSuffix}</span>`;
   }
 
-  function createNodeInfoChatEntry(entry, context) {
+  /**
+   * Build the parts for a "node info updated" chat entry.
+   *
+   * @param {Object} entry Structured chat-log entry.
+   * @param {Object} context Display context from {@link buildDisplayContext}.
+   * @returns {{ className: string, html: string }} Entry parts.
+   */
+  function buildNodeInfoChatEntryParts(entry, context) {
     const label = context.longName ? String(context.longName) : (context.nodeId || 'Unknown node');
-    return createAnnouncementEntry({
+    // The reason annotates *why* the node record updated — "(advert)" for a bare
+    // heard / node-info update, "(message)" for a decrypted chat message recorded
+    // node-centrically so its body never reaches the Log (LV7).  Absent reason
+    // degrades to the plain "Updated node info" copy.
+    const reason = typeof entry?.reason === 'string' ? entry.reason.trim() : '';
+    const reasonSuffix = reason ? ` (${reason})` : '';
+    return buildAnnouncementParts({
       timestampSeconds: entry?.ts ?? null,
       shortName: context.shortName,
       longName: label,
@@ -2308,14 +2594,21 @@ export function initializeApp(config) {
       metadataSource: context.metadataSource,
       nodeData: context.nodeData,
       protocol: context.protocol,
-      messageHtml: `${renderEmojiHtml('💾')} ${renderAnnouncementCopy('Updated node info')}`
+      messageHtml: `${renderEmojiHtml('💾')} ${renderAnnouncementCopy(`Updated node info${reasonSuffix}`)}`
     });
   }
 
-  function createTelemetryChatEntry(entry, context) {
+  /**
+   * Build the parts for a telemetry-broadcast chat entry.
+   *
+   * @param {Object} entry Structured chat-log entry.
+   * @param {Object} context Display context from {@link buildDisplayContext}.
+   * @returns {{ className: string, html: string }} Entry parts.
+   */
+  function buildTelemetryChatEntryParts(entry, context) {
     const label = context.longName ? String(context.longName) : (context.nodeId || 'Unknown node');
     const highlightSuffix = buildHighlightSuffix(formatTelemetryHighlights(entry?.telemetry));
-    return createAnnouncementEntry({
+    return buildAnnouncementParts({
       timestampSeconds: entry?.ts ?? null,
       shortName: context.shortName,
       longName: label,
@@ -2327,10 +2620,19 @@ export function initializeApp(config) {
     });
   }
 
-  function createPositionChatEntry(entry, context) {
+  /**
+   * Build the parts for a position-broadcast chat entry.
+   *
+   * @param {Object} entry Structured chat-log entry.
+   * @param {Object} context Display context from {@link buildDisplayContext}.
+   * @returns {{ className: string, html: string }} Entry parts.
+   */
+  function buildPositionChatEntryParts(entry, context) {
     const label = context.longName ? String(context.longName) : (context.nodeId || 'Unknown node');
-    const highlightSuffix = buildHighlightSuffix(formatPositionHighlights(entry?.position));
-    return createAnnouncementEntry({
+    // A position reads "Broadcasted position info: <lat>, <lon>" (colon, not the
+    // em dash used by telemetry) to match the neighbour entry's punctuation.
+    const highlightSuffix = buildHighlightSuffix(formatPositionHighlights(entry?.position), ': ');
+    return buildAnnouncementParts({
       timestampSeconds: entry?.ts ?? null,
       shortName: context.shortName,
       longName: label,
@@ -2342,7 +2644,14 @@ export function initializeApp(config) {
     });
   }
 
-  function createNeighborChatEntry(entry, context) {
+  /**
+   * Build the parts for a neighbour-broadcast chat entry.
+   *
+   * @param {Object} entry Structured chat-log entry.
+   * @param {Object} context Display context from {@link buildDisplayContext}.
+   * @returns {{ className: string, html: string }} Entry parts.
+   */
+  function buildNeighborChatEntryParts(entry, context) {
     const label = context.longName ? String(context.longName) : (context.nodeId || 'Unknown node');
     const neighborId = entry?.neighborId ?? pickFirstProperty([entry?.neighbor], ['neighbor_id', 'neighborId']);
     let neighborLabel = null;
@@ -2356,7 +2665,7 @@ export function initializeApp(config) {
       }
     }
     const detail = neighborLabel ? `: ${escapeHtml(String(neighborLabel))}` : '';
-    return createAnnouncementEntry({
+    return buildAnnouncementParts({
       timestampSeconds: entry?.ts ?? null,
       shortName: context.shortName,
       longName: label,
@@ -2368,32 +2677,44 @@ export function initializeApp(config) {
     });
   }
 
-  function createChatLogEntry(entry) {
+  /**
+   * Compute the class name and HTML for a mixed-feed (Log tab) chat entry,
+   * dispatching on the entry type, without touching the DOM. Returns ``null``
+   * for entries that should not render. Used by the memoising render path.
+   *
+   * @param {Object} entry Structured chat-log entry.
+   * @returns {{ className: string, html: string }|null} Entry parts or null.
+   */
+  function buildChatLogEntryParts(entry) {
     if (!entry || typeof entry !== 'object') return null;
     if (entry.type === CHAT_LOG_ENTRY_TYPES.NODE_NEW) {
-      return createNodeChatEntry(entry.node ?? resolveNodeForLogEntry(entry) ?? null, entry?.ts ?? null);
+      return buildNodeChatEntryParts(entry.node ?? resolveNodeForLogEntry(entry) ?? null, entry?.ts ?? null);
     }
     const context = buildDisplayContext(entry);
     switch (entry.type) {
       case CHAT_LOG_ENTRY_TYPES.NODE_INFO:
-        return createNodeInfoChatEntry(entry, context);
+        return buildNodeInfoChatEntryParts(entry, context);
       case CHAT_LOG_ENTRY_TYPES.TELEMETRY:
-        return createTelemetryChatEntry(entry, context);
+        return buildTelemetryChatEntryParts(entry, context);
       case CHAT_LOG_ENTRY_TYPES.POSITION:
-        return createPositionChatEntry(entry, context);
+        return buildPositionChatEntryParts(entry, context);
       case CHAT_LOG_ENTRY_TYPES.NEIGHBOR:
-        return createNeighborChatEntry(entry, context);
+        return buildNeighborChatEntryParts(entry, context);
       case CHAT_LOG_ENTRY_TYPES.TRACE:
-        return createTraceChatEntry(entry, context);
+        return buildTraceChatEntryParts(entry, context);
+      case CHAT_LOG_ENTRY_TYPES.MESSAGE:
       case CHAT_LOG_ENTRY_TYPES.MESSAGE_ENCRYPTED:
-        return entry?.message ? createMessageChatEntry(entry.message) : null;
+        return entry?.message ? buildMessageChatEntryParts(entry.message) : null;
       default:
         return null;
     }
   }
 
   /**
-   * Create a consistently formatted chat log entry for node-centric events.
+   * Compute the class name and HTML string for a node-centric announcement
+   * entry, without touching the DOM. The render path consumes this pure form so
+   * the HTML parse can be memoised per entry (issue: chat-log render); the
+   * {@link createAnnouncementEntry} wrapper materialises it into a node.
    *
    * @param {{
    *   timestampSeconds: ?number,
@@ -2405,9 +2726,9 @@ export function initializeApp(config) {
    *   messageHtml: string,
    *   protocol: ?string
    * }} params Rendering parameters.
-   * @returns {HTMLElement} Chat log element.
+   * @returns {{ className: string, html: string }} Entry class name and HTML.
    */
-  function createAnnouncementEntry({
+  function buildAnnouncementParts({
     timestampSeconds,
     shortName,
     longName,
@@ -2417,7 +2738,6 @@ export function initializeApp(config) {
     messageHtml,
     protocol: protocolHint = null
   }) {
-    const div = document.createElement('div');
     const tsDate = timestampSeconds != null ? new Date(timestampSeconds * 1000) : null;
     const ts = tsDate ? formatTime(tsDate) : '--:--:--';
     const metadata = extractChatMessageMetadata(metadataSource || nodeData || {});
@@ -2431,9 +2751,22 @@ export function initializeApp(config) {
     const announcementProtocol =
       protocolHint ?? pickFirstProperty([nodeData, metadataSource], ['protocol']);
     const announcementIconPrefix = protocolIconPrefixHtml(announcementProtocol);
-    div.className = 'chat-entry-node';
-    div.innerHTML = `${prefix}${presetTag} ${announcementIconPrefix}${shortHtml} ${messageHtml}`;
-    return div;
+    return {
+      className: 'chat-entry-node',
+      html: `${prefix}${presetTag} ${announcementIconPrefix}${shortHtml} ${messageHtml}`
+    };
+  }
+
+  /**
+   * Materialise a node-centric announcement entry as a DOM element. Thin wrapper
+   * over {@link buildAnnouncementParts} retained for the test-utility surface;
+   * the render path uses the parts form directly so it can memoise the parse.
+   *
+   * @param {Object} params Rendering parameters (see {@link buildAnnouncementParts}).
+   * @returns {HTMLElement} Chat log element.
+   */
+  function createAnnouncementEntry(params) {
+    return materializeEntryNode(buildAnnouncementParts(params));
   }
 
   /**
@@ -2458,7 +2791,15 @@ export function initializeApp(config) {
     return labels;
   }
 
-  function createTraceChatEntry(entry, context) {
+  /**
+   * Build the parts for a traceroute chat entry, or null when the trace path is
+   * too short to render.
+   *
+   * @param {Object} entry Structured chat-log entry carrying ``tracePath``.
+   * @param {Object} context Display context from {@link buildDisplayContext}.
+   * @returns {{ className: string, html: string }|null} Entry parts or null.
+   */
+  function buildTraceChatEntryParts(entry, context) {
     if (!entry || !Array.isArray(entry.tracePath) || entry.tracePath.length < 2) {
       return null;
     }
@@ -2467,7 +2808,7 @@ export function initializeApp(config) {
     const labels = formatTracePathLabels(entry.tracePath);
     const labelText = labels.length ? labels.join(', ') : 'Traceroute';
     const labelSuffix = `: ${escapeHtml(labelText)}`;
-    return createAnnouncementEntry({
+    return buildAnnouncementParts({
       timestampSeconds: entry?.ts ?? null,
       shortName: context.shortName,
       longName: context.longName || context.nodeId || labels[0] || 'Traceroute',
@@ -2698,12 +3039,15 @@ export function initializeApp(config) {
   }
 
   /**
-   * Build a chat log entry for a text message.
+   * Compute the class name and HTML for a text-message chat entry, without
+   * touching the DOM. Returns ``null`` for encrypted placeholder blobs that
+   * should not render. The render path consumes this pure form so the HTML
+   * parse can be memoised per message (issue: chat-log render).
    *
    * @param {Object} m Message payload.
-   * @returns {HTMLElement} Chat log element.
+   * @returns {{ className: string, html: string }|null} Entry parts or null.
    */
-  function createMessageChatEntry(m) {
+  function buildMessageChatEntryParts(m) {
     let plainText = '';
     if (m?.text != null) {
       plainText = String(m.text).trim();
@@ -2712,7 +3056,6 @@ export function initializeApp(config) {
       return null;
     }
 
-    const div = document.createElement('div');
     const tsSeconds = resolveTimestampSeconds(
       m.rx_time ?? m.rxTime,
       m.rx_iso ?? m.rxIso
@@ -2758,9 +3101,23 @@ export function initializeApp(config) {
       frequency: metadata.frequency ? escapeHtml(metadata.frequency) : ''
     });
     const presetTag = formatChatPresetTag({ presetCode: metadata.presetCode });
-    div.className = 'chat-entry-msg';
-    div.innerHTML = `${prefix}${presetTag} ${nodeProtocolPrefix}${short} ${text}`;
-    return div;
+    return {
+      className: 'chat-entry-msg',
+      html: `${prefix}${presetTag} ${nodeProtocolPrefix}${short} ${text}`
+    };
+  }
+
+  /**
+   * Materialise a text-message chat entry as a DOM element. Thin wrapper over
+   * {@link buildMessageChatEntryParts} retained for the test-utility surface;
+   * the render path uses the parts form directly so it can memoise the parse.
+   *
+   * @param {Object} m Message payload.
+   * @returns {HTMLElement|null} Chat log element, or null for hidden blobs.
+   */
+  function createMessageChatEntry(m) {
+    const parts = buildMessageChatEntryParts(m);
+    return parts ? materializeEntryNode(parts) : null;
   }
 
   /**
@@ -2857,6 +3214,9 @@ export function initializeApp(config) {
     filterQuery = ''
   }) {
     if (!CHAT_ENABLED || !chatEl) return;
+    // Reset the message→tab map for this render; buildChatFragment repopulates it
+    // as it materialises each channel tab's entries (SPEC VF3 tab flash).
+    messageTabId = new Map();
     const combinedMessages = Array.isArray(messages) ? [...messages] : [];
     if (Array.isArray(encryptedMessages) && encryptedMessages.length > 0) {
       combinedMessages.push(...encryptedMessages);
@@ -2900,32 +3260,46 @@ export function initializeApp(config) {
     );
 
     const logContent = buildChatFragment({
+      namespace: 'log',
       entries: filteredLogEntries,
-      renderEntry: createChatLogEntry,
+      renderParts: buildChatLogEntryParts,
+      keyOf: chatLogEntryKey,
       emptyLabel: 'No recent mesh activity.'
     });
 
-    const channelTabs = filteredChannels.map(channel => ({
-      id: channel.id || `channel-${channel.index}`,
-      label: `${channel.label} (${channel.messageCount})`,
-      iconSrc: isMeshtasticProtocol(channel.protocol)
-        ? MESHTASTIC_ICON_SRC
-        : isMeshcoreProtocol(channel.protocol)
-          ? MESHCORE_ICON_SRC
-          : null,
-      content: buildChatFragment({
-        entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
-        renderEntry: entry => createMessageChatEntry(entry.item),
-        emptyLabel: 'No messages on this channel.'
-      }),
-      index: channel.index,
-      isPrimaryFallback: Boolean(channel.isPrimaryFallback)
-    }));
+    const channelTabs = filteredChannels.map(channel => {
+      const tabId = channel.id || `channel-${channel.index}`;
+      return {
+        id: tabId,
+        label: `${channel.label} (${channel.messageCount})`,
+        iconSrc: isMeshtasticProtocol(channel.protocol)
+          ? MESHTASTIC_ICON_SRC
+          : isMeshcoreProtocol(channel.protocol)
+            ? MESHCORE_ICON_SRC
+            : null,
+        // Channel tabs are the chat proper: render the entire window (issue #796)
+        // rather than only the newest CHAT_LIMIT.  The entry set is already bounded
+        // by the seven-day window, so there is no count cap to apply here.
+        content: buildChatFragment({
+          namespace: tabId,
+          entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
+          renderParts: entry => buildMessageChatEntryParts(entry.item),
+          keyOf: entry => chatMessageEntryKey(entry.item),
+          emptyLabel: 'No messages on this channel.',
+          limit: Infinity
+        }),
+        index: channel.index,
+        isPrimaryFallback: Boolean(channel.isPrimaryFallback)
+      };
+    });
 
     const tabs = [
       { id: 'log', label: 'Log', content: logContent },
       ...channelTabs
     ];
+    // Release entry-node caches for tabs no longer present (e.g. a channel that
+    // dropped out of the window) so cached DOM nodes are not retained forever.
+    chatEntryCache.retainNamespaces(new Set(tabs.map(tab => tab.id)));
 
     const previousActive = chatEl.dataset?.activeTab || null;
     const defaultActive =
@@ -2940,50 +3314,91 @@ export function initializeApp(config) {
       previousActiveTabId: previousActive,
       defaultActiveTabId: defaultActive
     });
-    scrollActiveChatPanelToBottom();
+    // renderChatTabs now owns chat-panel scroll: it pins to the bottom on the
+    // initial render and tail-follows a bottom-pinned reader, but preserves the
+    // vertical position on a passive live refresh (bugfix B). No extra
+    // force-scroll here — that was what reset the reader to the bottom every tick.
   }
 
   /**
-   * Construct a document fragment for chat entries, inserting date dividers
-   * and optional empty-state labels.
+   * Build a div element from precomputed entry parts (class name + HTML). This
+   * is the single place a chat entry is parsed from an HTML string; both the
+   * node-returning ``create…Entry`` test wrappers and {@link chatEntryCache}
+   * funnel through it.
+   *
+   * @param {{ className: string, html: string }} parts Entry class name and HTML.
+   * @returns {HTMLElement} Entry element.
+   */
+  function materializeEntryNode({ className, html }) {
+    const div = document.createElement('div');
+    div.className = className;
+    div.innerHTML = html;
+    return div;
+  }
+
+  /**
+   * Construct a document fragment for chat entries, inserting date dividers and
+   * an optional empty-state label. Entry nodes are sourced from
+   * {@link chatEntryCache}, so an entry whose rendered HTML is unchanged since
+   * the previous refresh is reused rather than re-parsed (issue: chat-log
+   * render). Entries that aged out of this tab's window are pruned from the
+   * cache afterwards.
    *
    * @param {{
-   *   entries: Array<{ ts: number, item: Object }>,
-   *   renderEntry: Function,
-   *   emptyLabel?: string
-   * }} params Fragment construction parameters.
+   *   namespace: string,
+   *   entries: Array<{ ts: number, item?: Object }>,
+   *   renderParts: Function,
+   *   keyOf: Function,
+   *   emptyLabel?: string,
+   *   limit?: number
+   * }} params Fragment construction parameters.  ``namespace`` scopes the entry
+   *   cache to a single tab; ``limit`` caps how many of the newest entries are
+   *   rendered (pass ``Infinity`` to render them all — the Log firehose defaults
+   *   to {@link CHAT_LIMIT}, chat channel tabs opt out).
    * @returns {DocumentFragment} Populated fragment.
    */
-  function buildChatFragment({ entries = [], renderEntry, emptyLabel }) {
+  function buildChatFragment({ namespace, entries = [], renderParts, keyOf, emptyLabel, limit = CHAT_LIMIT }) {
     const fragment = document.createDocumentFragment();
-    if (!entries || entries.length === 0) {
-      if (emptyLabel) {
-        const empty = document.createElement('p');
-        empty.className = 'chat-empty';
-        empty.textContent = emptyLabel;
-        fragment.appendChild(empty);
-      }
-      return fragment;
-    }
     const getDivider = createDateDividerFactory();
-    const limitedEntries = entries.slice(Math.max(entries.length - CHAT_LIMIT, 0));
+    const limitedEntries = Number.isFinite(limit)
+      ? entries.slice(Math.max(entries.length - limit, 0))
+      : entries;
     let renderedEntries = 0;
     for (const entry of limitedEntries) {
       if (!entry || typeof entry.ts !== 'number') {
         continue;
       }
-      if (typeof renderEntry !== 'function') {
+      if (typeof renderParts !== 'function' || typeof keyOf !== 'function') {
         continue;
       }
-      const node = renderEntry(entry);
-      if (!node) {
+      const parts = renderParts(entry);
+      if (!parts) {
         continue;
+      }
+      const node = chatEntryCache.materialize(namespace, keyOf(entry), parts.className, parts.html);
+      // Tag message rows so a live update can flash them (SPEC VF3); for channel
+      // tabs (namespace is the tab id, not 'log') record the message→tab id so
+      // the channel's tab header can flash too.
+      const messageId = entryMessageId(entry);
+      if (messageId) {
+        node.dataset.messageId = messageId;
+        if (namespace !== 'log') messageTabId.set(messageId, namespace);
+        // Stamp the sender's role colour so the live-update fade lands on it
+        // (LV3). Falls back to the CSS default when the sender node is unknown.
+        const flashMessage = entry.item || entry.message;
+        const senderId = flashMessage && (flashMessage.from_id || flashMessage.fromId);
+        const senderNode = senderId ? nodesById.get(senderId) : null;
+        if (senderNode && node.style && typeof node.style.setProperty === 'function') {
+          node.style.setProperty('--flash-role-color', getRoleFlashColor(senderNode.role, senderNode.protocol));
+        }
       }
       const divider = getDivider(entry.ts);
       if (divider) fragment.appendChild(divider);
       fragment.appendChild(node);
       renderedEntries += 1;
     }
+    // Drop cached nodes for entries no longer present in this tab's window.
+    chatEntryCache.prune(namespace);
     if (renderedEntries === 0 && emptyLabel) {
       const empty = document.createElement('p');
       empty.className = 'chat-empty';
@@ -3012,6 +3427,245 @@ export function initializeApp(config) {
       chatEnabled: CHAT_ENABLED,
       normaliseMessageLimit,
     });
+  }
+
+  /**
+   * Hydrate one page of older messages and merge it into the live chat state,
+   * then re-render the chat log.  The read-modify-write of ``allMessages`` is
+   * synchronous (no ``await`` between the merge and the assignment) so a
+   * concurrent incremental {@link refresh} cannot clobber the history this adds.
+   *
+   * @param {Array<Object>} batch Raw older message rows from the backfill pager.
+   * @returns {Promise<void>} Resolves once the page is merged and rendered.
+   */
+  async function commitHistoricalMessages(batch) {
+    if (!Array.isArray(batch) || batch.length === 0) return;
+    const hydrated = await messageNodeHydrator.hydrate(batch, nodesById);
+    const rows = Array.isArray(hydrated) ? hydrated : [];
+    if (rows.length === 0) return;
+    const floor = Math.floor(Date.now() / 1000) - CHAT_RECENT_WINDOW_SECONDS;
+    allMessages = trimToWindow(mergeById(allMessages, rows, 'id'), floor);
+    rerenderChatLog();
+  }
+
+  /**
+   * Stream the rest of the chat window in the background once the initial load
+   * has rendered the newest page (issue #802).  Pages backward from the oldest
+   * loaded message, committing and rendering each page as it arrives so the feed
+   * fills progressively while the main thread stays responsive — every awaited
+   * fetch yields to the event loop, so this is cooperative background work
+   * rather than a blocking burst (a true Worker cannot touch the DOM).  A guard
+   * prevents overlapping runs.
+   *
+   * @returns {Promise<void>} Resolves when the window is exhausted (or on error).
+   */
+  async function backfillChatHistory() {
+    if (!CHAT_ENABLED || chatBackfillRunning) return;
+    // Page backward from the live frontier (oldest row of the newest delta
+    // page), not the global-oldest loaded row. On a cold load they are equal;
+    // on a warm-cache load the cache contributes older rows, so anchoring at the
+    // global min would page below the cache and never fill the gap between the
+    // cache's newest row and the newest page's oldest row (the orphaned middle
+    // window). Falls back to the global min when no live page was fetched.
+    const before = chatLiveFrontier > 0
+      ? chatLiveFrontier
+      : minRecordTimestamp(allMessages, ['rx_time']);
+    if (!(before > 0)) return;
+    chatBackfillRunning = true;
+    try {
+      for await (const batch of paginateMessagesImpl(MESSAGE_LIMIT, {
+        before,
+        chatEnabled: CHAT_ENABLED,
+        normaliseMessageLimit,
+      })) {
+        await commitHistoricalMessages(batch);
+      }
+    } catch (err) {
+      console.warn('chat history backfill failed; showing the most recent page only', err);
+    } finally {
+      chatBackfillRunning = false;
+    }
+  }
+
+  /**
+   * Re-aggregate the per-source snapshot arrays and re-enrich the node
+   * collection (display name, position, distance, telemetry) from the current
+   * module-level ``all*`` sources, then rebuild the node lookup index. Shared by
+   * {@link refresh} and the background collection backfill (issue #832) so a
+   * streamed history page derives the rendered node state identically to a full
+   * refresh. Does not touch ``allMessages`` / ``allEncryptedMessages`` (hydrated
+   * separately) or ``allTraces`` (not node-derived).
+   *
+   * @returns {void}
+   */
+  function rebuildNodeDerivedState() {
+    const aggregatedNodes = aggregateNodeSnapshots(allNodes);
+    const aggregatedPositions = aggregatePositionSnapshots(allPositionEntries);
+    const aggregatedTelemetry = aggregateTelemetrySnapshots(allTelemetryEntries);
+    // Enrich merged node records with display name, position, distance, and
+    // telemetry before any rendering or filtering takes place.
+    aggregatedNodes.forEach(applyNodeNameFallback);
+    mergePositionsIntoNodes(aggregatedNodes, aggregatedPositions);
+    computeDistances(aggregatedNodes);
+    mergeTelemetryIntoNodes(aggregatedNodes, aggregatedTelemetry);
+    normalizeNodeCollection(aggregatedNodes);
+    allNodes = aggregatedNodes;
+    // Rebuild lookup maps so marker updates and message hydration always resolve
+    // to the latest node objects.
+    rebuildNodeIndex(allNodes);
+    // The per-packet accumulators (allTelemetryEntries / allPositionEntries /
+    // allNeighbors) are deliberately left RAW — the aggregated forms above are
+    // locals used only to enrich the node records. Writing an aggregate back into
+    // an accumulator would feed it into the next refresh's merge + re-aggregation,
+    // which is lossy: aggregateSnapshots clones with ``{...snapshot}`` (dropping
+    // the non-enumerable ``snapshots`` history) and merges oldest-last (pinning to
+    // the stalest reading), collapsing each node's history to {stale-first, newest}
+    // so a telemetry/position Log entry flashes in and vanishes on the next tick.
+    // Keeping the accumulators raw gives every packet a stable, id-keyed Log entry
+    // (bugfix A1).
+  }
+
+  /** Floor (unix s) below which backfilled positions/telemetry are dropped (FC3: 7 d). */
+  const recentBackfillFloor = () => Math.floor(Date.now() / 1000) - CHAT_RECENT_WINDOW_SECONDS;
+  /** Floor (unix s) below which backfilled neighbors/traces are dropped (FC3: 28 d). */
+  const longBackfillFloor = () => Math.floor(Date.now() / 1000) - TRACE_MAX_AGE_SECONDS;
+
+  /**
+   * Per-collection wiring for the background backfill (issue #832). Each entry
+   * knows how to fetch a backward page (inclusive ``before`` cursor on the
+   * route's primary sort column), how to identify a row for cross-page
+   * de-duplication, which cursor value advances the walk, how to merge a page
+   * into the module state (bounded by the same window the refresh tick uses), and
+   * how to re-derive the rendered state the merged collection feeds.
+   *
+   * Cursor columns match each route's server-side ``ORDER BY`` (SPEC BP1):
+   * ``last_heard`` for nodes, ``rx_time`` for the rest.
+   *
+   * @type {ReadonlyArray<Object>}
+   */
+  const COLLECTION_BACKFILLS = [
+    {
+      name: 'nodes',
+      fetchPage: (limit, before) => fetchNodes(limit, 0, { before }),
+      idOf: row => row && row.node_id,
+      cursorOf: row => row && row.last_heard,
+      merge: batch => { allNodes = mergeById(allNodes, batch, 'node_id'); },
+      refine: () => rebuildNodeDerivedState(),
+    },
+    {
+      name: 'positions',
+      fetchPage: (limit, before) => fetchPositions(limit, 0, { before }),
+      idOf: row => row && row.id,
+      cursorOf: row => row && row.rx_time,
+      merge: batch => {
+        allPositionEntries = trimToWindow(mergeById(allPositionEntries, batch, 'id'), recentBackfillFloor());
+      },
+      refine: () => rebuildNodeDerivedState(),
+    },
+    {
+      name: 'telemetry',
+      fetchPage: (limit, before) => fetchTelemetry(limit, 0, { before }),
+      idOf: row => row && row.id,
+      cursorOf: row => row && row.rx_time,
+      merge: batch => {
+        allTelemetryEntries = trimToWindow(mergeById(allTelemetryEntries, batch, 'id'), recentBackfillFloor());
+      },
+      refine: () => rebuildNodeDerivedState(),
+    },
+    {
+      name: 'neighbors',
+      fetchPage: (limit, before) => fetchNeighbors(limit, 0, { before }),
+      // Composite primary key (node_id, neighbor_id) — unique per tuple, so the
+      // inclusive boundary row is de-duplicated across pages.
+      idOf: row => (row ? `${row.node_id}|${row.neighbor_id}` : undefined),
+      cursorOf: row => row && row.rx_time,
+      merge: batch => {
+        allNeighbors = trimToWindow(
+          mergeByCompositeKey(allNeighbors, batch, ['node_id', 'neighbor_id']),
+          longBackfillFloor(),
+        );
+      },
+      // Neighbors stay RAW (like traces) so the Log keeps every per-pair snapshot
+      // and the map / overlay consumers dedupe internally; re-aggregating here
+      // would erode history exactly as the refresh path used to (bugfix A1).
+      refine: () => {},
+    },
+    {
+      name: 'traces',
+      // Fetch raw (applyAgeFilter:false) so the pager sees the server's true page
+      // length for short-page termination; the age bound is applied by the
+      // window-trim in merge() instead.
+      fetchPage: (limit, before) => fetchTraces(limit, 0, { before, applyAgeFilter: false }),
+      idOf: row => row && row.id,
+      cursorOf: row => row && row.rx_time,
+      merge: batch => {
+        allTraces = trimToWindow(mergeById(allTraces, batch, 'id'), longBackfillFloor());
+      },
+      refine: () => {},
+    },
+  ];
+
+  /**
+   * Merge one streamed backward page into the module state, re-derive what it
+   * feeds, and repaint — progressively, one page at a time, mirroring the chat
+   * history backfill (issue #802). The merge + re-render is synchronous (no
+   * ``await``) so it cannot interleave with a concurrent refresh or another
+   * collection's commit. Each page is network-spaced, so the per-page render is
+   * not a hot loop; the stats fetch is skipped (the authoritative count is
+   * server-computed and unchanged by how many rows the client has paged in).
+   *
+   * @param {Object} spec One {@link COLLECTION_BACKFILLS} entry.
+   * @param {Array<Object>} batch Freshly-seen rows for this page (the pager only
+   *   ever yields a non-empty array).
+   * @returns {void}
+   */
+  function commitBackfillPage(spec, batch) {
+    spec.merge(batch);
+    spec.refine();
+    renderFilteredOutputs();
+  }
+
+  /**
+   * Page one collection backward from its live frontier, committing+rendering
+   * each page, until the visibility window is exhausted. A no-op (no request)
+   * when the collection recorded no frontier — a short newest page or a warm-cache
+   * load. Errors are swallowed (logged) so one failing stream never aborts the
+   * others or the rendered newest page — mirroring {@link backfillChatHistory}.
+   *
+   * @param {Object} spec One {@link COLLECTION_BACKFILLS} entry.
+   * @returns {Promise<void>} Resolves when this collection's window is exhausted.
+   */
+  async function backfillCollection(spec) {
+    const before = collectionLiveFrontiers[spec.name];
+    if (!(before > 0)) return;
+    try {
+      for await (const batch of paginateCollection(spec.fetchPage, {
+        limit: NODE_LIMIT,
+        before,
+        idOf: spec.idOf,
+        cursorOf: spec.cursorOf,
+      })) {
+        commitBackfillPage(spec, batch);
+      }
+    } catch (err) {
+      console.warn(`${spec.name} backfill failed; showing the most recent page only`, err);
+    }
+  }
+
+  /**
+   * One-shot background backfill of every bulk collection (issue #832). After
+   * the first paint has rendered each collection's newest page, page the five
+   * collections backward through their visibility windows concurrently, each
+   * committing+repainting its pages as they arrive. Each {@link backfillCollection}
+   * self-gates on its frontier, so a collection with none (a short newest page, or
+   * a warm-cache load) returns without a request and the fan-out is a clean no-op
+   * when there is nothing to page — no pointless request, no empty long-load.
+   * Invoked once (guarded by ``collectionsBackfilled`` in {@link refresh}).
+   *
+   * @returns {Promise<void>} Resolves when every collection's window is exhausted.
+   */
+  async function backfillAllCollections() {
+    await Promise.all(COLLECTION_BACKFILLS.map(spec => backfillCollection(spec)));
   }
 
   /**
@@ -3072,6 +3726,16 @@ export function initializeApp(config) {
     const frag = document.createDocumentFragment();
     for (const n of nodes) {
       const tr = document.createElement('tr');
+      // Row-level node id hook for live-update flashes (SPEC VF3); kept distinct
+      // from the inner link's data-node-id so it never affects click handling.
+      if (typeof n.node_id === 'string' && n.node_id) {
+        tr.dataset.nodeRow = n.node_id;
+      }
+      // Stamp the role colour so the live-update fade lands on it (LV3); the CSS
+      // keyframe reads --flash-role-color, so the flash helper needs no colour.
+      if (tr.style && typeof tr.style.setProperty === 'function') {
+        tr.style.setProperty('--flash-role-color', getRoleFlashColor(n.role, n.protocol));
+      }
       const lastPositionTime = toFiniteNumber(n.position_time ?? n.positionTime);
       const lastPositionCell = lastPositionTime != null ? timeAgo(lastPositionTime, nowSec) : '';
       const latitudeDisplay = fmtCoords(n.latitude);
@@ -3348,7 +4012,15 @@ export function initializeApp(config) {
     // Capture the zoom bucket the upcoming render targets so the zoomend
     // handler can detect threshold crossings on the next zoom event.
     lastRenderedZoomBucket = currentZoomBucket();
+    // Snapshot any open marker overlay before clearing the layer (item 7):
+    // clearLayers() destroys each marker's DOM element, which would orphan an
+    // open overlay and let cleanupOrphans() close it. We re-anchor to the
+    // rebuilt markers after the render below so the overlay stays open.
+    const preservedMarkerOverlays = captureOpenMarkerOverlays(overlayStack, markerByNodeId);
     markersLayer.clearLayers();
+    // Reset the node→marker map for this render so live-update flashes target
+    // the current markers (SPEC VF3).
+    markerByNodeId = new Map();
     const pts = [];
     const nodesById = new Map();
     for (const node of nodes) {
@@ -3663,6 +4335,10 @@ export function initializeApp(config) {
       const fallbackOverlayProvider = () => mergeOverlayDetails(null, n);
       let markerToken = 0;
       marker.addTo(markersLayer);
+      // Remember this node's marker so a live update can flash it (SPEC VF3).
+      if (n && typeof n.node_id === 'string' && n.node_id) {
+        markerByNodeId.set(n.node_id, marker);
+      }
       // Track every offset marker so the zoomend handler can reposition the
       // marker + leader line in lock-step.  Markers rendered at the shared
       // centre (singletons / low-zoom overlap / collapsed-group fallback)
@@ -3717,6 +4393,10 @@ export function initializeApp(config) {
         },
       });
     }
+    // Re-anchor any overlay preserved above onto its rebuilt marker so it
+    // stays open across the re-render instead of being closed by
+    // cleanupOrphans (item 7).
+    restoreMarkerOverlays(overlayStack, preservedMarkerOverlays, markerByNodeId);
     overlayStack.cleanupOrphans();
   }
 
@@ -3837,6 +4517,56 @@ export function initializeApp(config) {
   }
 
   /**
+   * Re-render only the chat log from the current message/node/telemetry state.
+   * Used both by {@link applyFilter} and by the background history backfill
+   * (issue #802) so each streamed page repaints the chat without re-running the
+   * full filter pipeline (node table, map, ``/api/stats`` fetch).
+   *
+   * @param {string} [filterQuery] Raw filter text for substring highlighting;
+   *   defaults to the current filter input value.
+   * @returns {void}
+   */
+  function rerenderChatLog(filterQuery = filterInput ? filterInput.value : '') {
+    renderChatLog({
+      nodes: allNodes,
+      messages: allMessages,
+      encryptedMessages: allEncryptedMessages,
+      telemetryEntries: allTelemetryEntries,
+      positionEntries: allPositionEntries,
+      neighborEntries: allNeighbors,
+      traceEntries: allTraces,
+      filterQuery
+    });
+  }
+
+  /**
+   * Render the filter-dependent outputs — node table, map markers, sort
+   * indicators, and chat log — from the current in-memory state, **without** the
+   * ``/api/stats`` fetch. {@link applyFilter} composes this with the stats
+   * refresh; the background collection backfill (issue #832) calls it directly so
+   * streaming a history page repaints the table/map without firing a redundant
+   * authoritative-count request per page — the ``/api/stats`` count is
+   * server-computed and unaffected by how many rows the client has paged in.
+   *
+   * @param {string} [filterQuery] Raw filter text for substring highlighting;
+   *   defaults to the current filter input value.
+   * @returns {void}
+   */
+  function renderFilteredOutputs(filterQuery = filterInput ? filterInput.value : '') {
+    // Text and role filters apply only to the node table and map; the chat log
+    // always receives the full node collection so reply-thread lookups succeed
+    // even for nodes that are currently hidden by the active filter.
+    const sortedNodes = getFilteredSortedNodes();
+    const nowSec = Date.now() / 1000;
+    renderTable(sortedNodes, nowSec);
+    renderMap(sortedNodes, nowSec);
+    updateSortIndicators();
+    // Pass the raw filterQuery (not the normalised form) so the chat log can
+    // highlight matching substrings in their original case.
+    rerenderChatLog(filterQuery);
+  }
+
+  /**
    * Apply text and role filters to the node list and re-render outputs.
    *
    * @returns {void}
@@ -3844,15 +4574,10 @@ export function initializeApp(config) {
   function applyFilter() {
     updateFilterClearVisibility();
     const filterQuery = filterInput ? filterInput.value : '';
-    // Text and role filters apply only to the node table and map; the chat log
-    // always receives the full node collection so reply-thread lookups succeed
-    // even for nodes that are currently hidden by the active filter.
-    const sortedNodes = getFilteredSortedNodes();
-    const nowSec = Date.now()/1000;
-    renderTable(sortedNodes, nowSec);
-    renderMap(sortedNodes, nowSec);
+    renderFilteredOutputs(filterQuery);
     // Show an immediate local estimate for the title so it doesn't flicker
     // to (0) while waiting for the async /api/stats response.
+    const nowSec = Date.now() / 1000;
     const localStats = computeLocalActiveNodeStats(allNodes, nowSec);
     updateTitleCount(adjustStatsForHiddenProtocols(localStats));
     // Title, legend, footer, and visibility are then corrected by /api/stats
@@ -3865,19 +4590,6 @@ export function initializeApp(config) {
       updateLegendProtocolCounts(stats);
       updateFooterStats(visibleStats);
       applyProtocolVisibility(stats);
-    });
-    updateSortIndicators();
-    // Pass the raw filterQuery (not the normalised form) so the chat log can
-    // highlight matching substrings in their original case.
-    renderChatLog({
-      nodes: allNodes,
-      messages: allMessages,
-      encryptedMessages: allEncryptedMessages,
-      telemetryEntries: allTelemetryEntries,
-      positionEntries: allPositionEntries,
-      neighborEntries: allNeighbors,
-      traceEntries: allTraces,
-      filterQuery
     });
   }
 
@@ -3912,15 +4624,20 @@ export function initializeApp(config) {
    *
    * @returns {Promise<void>} Resolves when rendering completes.
    */
-  async function refresh() {
+  async function refresh(refreshOptions = {}) {
     try {
-      if (statusEl) {
-        statusEl.textContent = 'refreshing…';
-      }
       // On the first load fetch the full dataset; subsequent refreshes pass
       // the ``since`` timestamp so only new/changed rows are transferred.
       // A 1-second overlap avoids missing rows that arrive at the boundary.
       const useSince = initialFetchDone;
+      // Targeted delta (SPEC PS3): when an SSE ping requests specific
+      // collections, fetch only those. Gating applies only once the initial
+      // full load is done, so a ping racing the first load can never
+      // partial-fetch and wipe the collections it skipped.
+      const only = useSince && refreshOptions.collections instanceof Set
+        ? refreshOptions.collections
+        : null;
+      const want = name => !only || only.has(name);
       const nodeSince = useSince ? Math.max(0, lastNodeTimestamp - 1) : 0;
       const msgSince = useSince ? Math.max(0, lastMessageTimestamp - 1) : 0;
       const posSince = useSince ? Math.max(0, lastPositionTimestamp - 1) : 0;
@@ -3928,30 +4645,42 @@ export function initializeApp(config) {
       const nbSince = useSince ? Math.max(0, lastNeighborTimestamp - 1) : 0;
       const trSince = useSince ? Math.max(0, lastTraceTimestamp - 1) : 0;
 
+      // Cold-load boot prefetch (initial-load latency fix): the early boot module
+      // (main/boot-prefetch.js) may have already issued the first-load (since=0)
+      // requests in parallel with the module graph. On the first cold refresh,
+      // consume those in-flight responses instead of issuing our own. One-shot
+      // (the global is cleared on read), so reconnect resyncs and later refreshes
+      // fetch normally; on a warm load the boot module skipped prefetch so this is
+      // absent and the FC2 delta path is untouched.
+      const bootSource = typeof window !== 'undefined' ? window : globalThis;
+      const boot = (!useSince && bootSource && bootSource.__PM_BOOT__) ? bootSource.__PM_BOOT__ : null;
+      if (boot) bootSource.__PM_BOOT__ = null;
+      const bootResponse = key => (boot ? boot[key] : undefined);
+
       // Secondary fetches are fire-and-forget with individual error handlers so
       // that a failure in one stream (e.g. telemetry) does not abort the whole
       // refresh cycle.  Each promise resolves to an empty array on error, which
       // preserves the previous data until the next successful fetch.
-      const neighborPromise = fetchNeighbors(NODE_LIMIT, nbSince).catch(err => {
+      const neighborPromise = want('neighbors') ? fetchNeighbors(NODE_LIMIT, nbSince, { responsePromise: bootResponse('neighbors') }).catch(err => {
         console.warn('neighbor refresh failed; continuing without connections', err);
         return [];
-      });
-      const telemetryPromise = fetchTelemetry(NODE_LIMIT, telSince).catch(err => {
+      }) : Promise.resolve([]);
+      const telemetryPromise = want('telemetry') ? fetchTelemetry(NODE_LIMIT, telSince, { responsePromise: bootResponse('telemetry') }).catch(err => {
         console.warn('telemetry refresh failed; continuing without telemetry', err);
         return [];
-      });
-      const positionsPromise = fetchPositions(NODE_LIMIT, posSince).catch(err => {
+      }) : Promise.resolve([]);
+      const positionsPromise = want('positions') ? fetchPositions(NODE_LIMIT, posSince, { responsePromise: bootResponse('positions') }).catch(err => {
         console.warn('position refresh failed; continuing without updates', err);
         return [];
-      });
-      const tracesPromise = fetchTraces(TRACE_LIMIT, trSince).catch(err => {
+      }) : Promise.resolve([]);
+      const tracesPromise = want('traces') ? fetchTraces(TRACE_LIMIT, trSince, { responsePromise: bootResponse('traces') }).catch(err => {
         console.warn('trace refresh failed; continuing without traceroutes', err);
         return [];
-      });
-      const encryptedMessagesPromise = fetchMessages(MESSAGE_LIMIT, { encrypted: true, since: msgSince }).catch(err => {
+      }) : Promise.resolve([]);
+      const encryptedMessagesPromise = want('messages') ? fetchMessages(MESSAGE_LIMIT, { encrypted: true, since: msgSince, responsePromise: bootResponse('encryptedMessages') }).catch(err => {
         console.warn('encrypted message refresh failed; continuing without encrypted entries', err);
         return [];
-      });
+      }) : Promise.resolve([]);
       // Fan-out all requests simultaneously; nodes are the primary resource and
       // must succeed for rendering to proceed.
       const [
@@ -3963,11 +4692,16 @@ export function initializeApp(config) {
         incomingTelemetry,
         incomingEncryptedMessages
       ] = await Promise.all([
-        fetchNodes(NODE_LIMIT, nodeSince),
+        want('nodes') ? fetchNodes(NODE_LIMIT, nodeSince, { responsePromise: bootResponse('nodes') }) : Promise.resolve([]),
         positionsPromise,
         neighborPromise,
         tracesPromise,
-        fetchMessages(MESSAGE_LIMIT, { since: msgSince }),
+        // Always fetch a single newest page here so the first paint is fast
+        // (issue #802); the rest of the seven-day window streams in afterwards
+        // via backfillChatHistory().  ``msgSince`` is 0 on the first load (so
+        // this is the newest page) and the slice past the high-water mark on
+        // every refresh after.
+        want('messages') ? fetchMessages(MESSAGE_LIMIT, { since: msgSince, responsePromise: bootResponse('messages') }) : Promise.resolve([]),
         telemetryPromise,
         encryptedMessagesPromise
       ]);
@@ -3975,6 +4709,11 @@ export function initializeApp(config) {
       // Update high-water marks for incremental fetching.
       const incomingNodeTs = maxRecordTimestamp(incomingNodes, ['last_heard']);
       const incomingMsgTs = maxRecordTimestamp(incomingMessages, ['rx_time']);
+      // Record the oldest row of this delta page as the backfill's live frontier
+      // (see {@link chatLiveFrontier}); the newest delta page is what the
+      // one-shot backfill must extend backward from.
+      const incomingMsgOldest = minRecordTimestamp(incomingMessages, ['rx_time']);
+      if (incomingMsgOldest > 0) chatLiveFrontier = incomingMsgOldest;
       const incomingEncMsgTs = maxRecordTimestamp(incomingEncryptedMessages, ['rx_time']);
       const incomingPosTs = maxRecordTimestamp(incomingPositions, ['rx_time', 'position_time']);
       const incomingTelTs = maxRecordTimestamp(incomingTelemetry, ['rx_time', 'telemetry_time']);
@@ -3988,82 +4727,133 @@ export function initializeApp(config) {
       if (incomingNbTs > lastNeighborTimestamp) lastNeighborTimestamp = incomingNbTs;
       if (incomingTrTs > lastTraceTimestamp) lastTraceTimestamp = incomingTrTs;
 
-      // Merge incremental results with existing data.  On first load the
-      // existing arrays are empty so the merge is effectively a no-op.
-      // Merge incremental results with existing data then trim to the
-      // configured limits so long-running tabs do not accumulate stale
-      // entries beyond what the server would return on a fresh fetch.
-      const nodes = useSince ? mergeById(allNodes, incomingNodes, 'node_id') : incomingNodes;
-      const positions = useSince
-        ? trimToLimit(mergeById(allPositionEntries, incomingPositions, 'id'), NODE_LIMIT)
+      // Capture each bulk collection's live frontier (oldest cursor of the
+      // newest page) so the one-shot background backfill (issue #832) can page
+      // backward from there, exactly like chatLiveFrontier. Cold load only: a
+      // warm-cache load already has the deeper history seeded (and its useSince
+      // delta pages are short), and a *short* newest page means the window is
+      // already exhausted — both record 0 so no pointless backward request fires
+      // (avoids an empty, long-loading page). The cursor column matches each
+      // route's server-side ORDER BY: last_heard for nodes, rx_time for the rest.
+      if (!useSince) {
+        const frontierIfFull = (rows, cap, keys) =>
+          Array.isArray(rows) && rows.length >= cap ? minRecordTimestamp(rows, keys) : 0;
+        collectionLiveFrontiers = {
+          nodes: frontierIfFull(incomingNodes, NODE_LIMIT, ['last_heard']),
+          positions: frontierIfFull(incomingPositions, NODE_LIMIT, ['rx_time']),
+          telemetry: frontierIfFull(incomingTelemetry, NODE_LIMIT, ['rx_time']),
+          neighbors: frontierIfFull(incomingNeighbors, NODE_LIMIT, ['rx_time']),
+          traces: frontierIfFull(incomingTraces, TRACE_LIMIT, ['rx_time']),
+        };
+      }
+
+      // Merge incremental results into the module-level collections.  On first
+      // load the existing arrays are empty so the merge is effectively a no-op.
+      // The per-packet collections (positions/telemetry/neighbors/traces) are
+      // bounded by their server visibility window rather than a fixed row count
+      // (issue #832): a count cap would trim a background backfill's older pages
+      // straight back out on the next refresh tick. Windows mirror FC3 — 7 d for
+      // positions/telemetry (like messages), 28 d for neighbors/traces.
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const messageWindowFloor = nowSeconds - CHAT_RECENT_WINDOW_SECONDS;
+      const recentWindowFloor = nowSeconds - CHAT_RECENT_WINDOW_SECONDS;
+      const longWindowFloor = nowSeconds - TRACE_MAX_AGE_SECONDS;
+      allNodes = useSince ? mergeById(allNodes, incomingNodes, 'node_id') : incomingNodes;
+      allPositionEntries = useSince
+        ? trimToWindow(mergeById(allPositionEntries, incomingPositions, 'id'), recentWindowFloor)
         : incomingPositions;
-      const neighborTuples = useSince
-        ? mergeByCompositeKey(allNeighbors, incomingNeighbors, ['node_id', 'neighbor_id'])
-        : incomingNeighbors;
-      const telemetryEntries = useSince
-        ? trimToLimit(mergeById(allTelemetryEntries, incomingTelemetry, 'id'), NODE_LIMIT)
+      allTelemetryEntries = useSince
+        ? trimToWindow(mergeById(allTelemetryEntries, incomingTelemetry, 'id'), recentWindowFloor)
         : incomingTelemetry;
-      const traceEntries = useSince
-        ? trimToLimit(mergeById(allTraces, incomingTraces, 'id'), TRACE_LIMIT)
+      allNeighbors = useSince
+        ? trimToWindow(mergeByCompositeKey(allNeighbors, incomingNeighbors, ['node_id', 'neighbor_id']), longWindowFloor)
+        : incomingNeighbors;
+      allTraces = useSince
+        ? trimToWindow(mergeById(allTraces, incomingTraces, 'id'), longWindowFloor)
         : incomingTraces;
-      const messages = useSince
-        ? trimToLimit(mergeById(allMessages, incomingMessages, 'id'), MESSAGE_LIMIT)
-        : incomingMessages;
+      // Encrypted blobs only feed the mixed Log tab (itself capped), so a count
+      // cap is the right memory bound for them.
       const encryptedMessages = useSince
         ? trimToLimit(mergeById(allEncryptedMessages, incomingEncryptedMessages, 'id'), MESSAGE_LIMIT)
         : incomingEncryptedMessages;
+      // Plaintext chat is shown for the full seven-day window (issue #796), so
+      // bound the retained set by that window rather than a row count — a count
+      // cap would silently drop older-but-in-window messages on the next merge.
+      const messages = useSince
+        ? trimToWindow(mergeById(allMessages, incomingMessages, 'id'), messageWindowFloor)
+        : incomingMessages;
 
-      // Collapse per-source snapshot arrays into single merged records; the
-      // snapshot window de-duplicates entries from multiple ingestors.
-      const aggregatedNodes = aggregateNodeSnapshots(nodes);
-      const aggregatedPositions = aggregatePositionSnapshots(positions);
-      const aggregatedNeighbors = aggregateNeighborSnapshots(neighborTuples);
-      const aggregatedTelemetry = aggregateTelemetrySnapshots(telemetryEntries);
-      // Enrich merged node records with display name, position, distance, and
-      // telemetry before any rendering or filtering takes place.
-      aggregatedNodes.forEach(applyNodeNameFallback);
-      mergePositionsIntoNodes(aggregatedNodes, aggregatedPositions);
-      computeDistances(aggregatedNodes);
-      mergeTelemetryIntoNodes(aggregatedNodes, aggregatedTelemetry);
-      normalizeNodeCollection(aggregatedNodes);
-      allNodes = aggregatedNodes;
-      // Rebuild lookup maps after every refresh so marker updates and message
-      // hydration always resolve to the latest node objects.
-      rebuildNodeIndex(allNodes);
-      // Hydrate messages with node metadata in parallel; the node index must be
-      // rebuilt first so lookups find the freshly merged records.
+      // Aggregate per-source snapshots into locals and enrich the node collection
+      // from the merged sources.  Shared with the background backfill so a streamed
+      // page re-derives identically (issue #832).  The per-packet accumulators
+      // (allPositionEntries/allTelemetryEntries/allNeighbors) are left RAW so the
+      // Log keeps a stable entry per packet — re-storing the aggregated form would
+      // erode history on the next tick (bugfix A1).
+      rebuildNodeDerivedState();
+      // Hydrate messages with node metadata in parallel; the node index has just
+      // been rebuilt (inside rebuildNodeDerivedState) so lookups find the freshly
+      // merged records.
       const [chatMessages, encryptedChatMessages] = await Promise.all([
         messageNodeHydrator.hydrate(messages, nodesById),
         messageNodeHydrator.hydrate(encryptedMessages, nodesById)
       ]);
-      allMessages = Array.isArray(chatMessages) ? chatMessages : [];
+      const hydratedChat = Array.isArray(chatMessages) ? chatMessages : [];
+      // Re-merge into the *current* allMessages rather than replacing it: the
+      // background history backfill (issue #802) may have appended older pages
+      // while we awaited hydration, and a blind assignment would clobber them.
+      // The read-modify-write is synchronous, so it cannot interleave with a
+      // backfill commit.  First load has no backfill yet, so it just takes the
+      // newest page as-is.
+      allMessages = useSince
+        ? trimToWindow(mergeById(allMessages, hydratedChat, 'id'), messageWindowFloor)
+        : hydratedChat;
       allEncryptedMessages = Array.isArray(encryptedChatMessages) ? encryptedChatMessages : [];
-      allTelemetryEntries = aggregatedTelemetry;
-      allPositionEntries = aggregatedPositions;
-      allNeighbors = aggregatedNeighbors;
-      allTraces = Array.isArray(traceEntries) ? traceEntries : [];
       initialFetchDone = true;
       applyFilter();
-      if (statusEl) {
-        statusEl.textContent = 'updated ' + new Date().toLocaleTimeString();
+      // SPEC VF2/VF3/VF4: only an SSE-ping refresh flashes (refreshOptions.flash),
+      // and only after the table + map have rendered (applyFilter above), so the
+      // highlight lands on the final, placed element. useSince excludes the
+      // initial fill. A node/position/telemetry delta flashes the changed node.
+      if (refreshOptions.flash && useSince) {
+        flashChangedNodes(collectNodeIds(incomingNodes, incomingPositions, incomingTelemetry));
+        flashChangedMessages(collectMessageIds(incomingMessages, incomingEncryptedMessages));
+      }
+      // Persist the freshly-merged state for the next reload/revisit (SPEC FC2),
+      // throttled and fire-and-forget so it never blocks the paint.
+      writeBackCache();
+      // With the newest page on screen, stream the rest of the seven-day window
+      // in the background (issue #802) so older history fills in progressively
+      // instead of blocking the first paint on the whole backward pagination.
+      // Runs once after the first load — whether that load was cold or seeded
+      // from cache — so any window not already present in the cache is filled.
+      if (!chatHistoryBackfilled) {
+        chatHistoryBackfilled = true;
+        backfillPromise = backfillChatHistory();
+        void backfillPromise;
+      }
+      // Likewise stream the rest of every bulk collection's window in the
+      // background (issue #832) so the node table / map fill past the newest
+      // 1000-row page the server returns at once. One-shot after the first load;
+      // a no-op when no collection recorded a frontier (warm load / short page).
+      if (!collectionsBackfilled) {
+        collectionsBackfilled = true;
+        collectionBackfillPromise = backfillAllCollections();
+        void collectionBackfillPromise;
       }
     } catch (e) {
-      if (statusEl) {
-        statusEl.textContent = 'error: ' + e.message;
-      }
       console.error(e);
     }
   }
 
   // Kick off the first data load immediately then start the silent background
-  // auto-refresh timer.
-  refresh();
+  // auto-refresh timer. Paint from the persistent cache first (instant first
+  // paint, SPEC FC2), then refresh fetches only the delta; a disabled/empty
+  // cache makes seedFromCache a no-op so this is the normal cold load.
+  const initialLoadPromise = seedFromCache()
+    .catch(() => false)
+    .then(() => refresh());
+  void initialLoadPromise;
   restartAutoRefresh();
-
-  if (refreshBtn) {
-    // Manual refresh button bypasses the interval and runs a fetch right away.
-    refreshBtn.addEventListener('click', refresh);
-  }
 
   // --- Auto-refresh play/pause toggle ---
   if (autorefreshToggle) {
@@ -4074,10 +4864,11 @@ export function initializeApp(config) {
           clearInterval(refreshTimer);
           refreshTimer = null;
         }
+        // Also close the live stream so a paused dashboard makes no requests.
+        stopLiveUpdates();
         autorefreshToggle.textContent = '\u25B6';
         autorefreshToggle.setAttribute('aria-label', 'Resume auto-refresh');
         autorefreshToggle.setAttribute('aria-pressed', 'true');
-        if (statusEl) statusEl.textContent = 'Refresh paused.';
       } else {
         autorefreshToggle.textContent = '\u23F8';
         autorefreshToggle.setAttribute('aria-label', 'Pause auto-refresh');
@@ -4186,7 +4977,7 @@ export function initializeApp(config) {
    * Inner closures exposed for unit tests. Production callers should ignore
    * this return value.
    *
-   * @returns {{ _testUtils: { buildMapPopupHtml: Function, normalizeOverlaySource: Function, createAnnouncementEntry: Function, createMessageChatEntry: Function, buildDisplayContext: Function, rebuildNodeIndex: Function } }}
+   * @returns {{ _testUtils: { buildMapPopupHtml: Function, normalizeOverlaySource: Function, createAnnouncementEntry: Function, createMessageChatEntry: Function, buildChatLogEntryParts: Function, buildDisplayContext: Function, rebuildNodeIndex: Function } }}
    */
   return {
     _testUtils: {
@@ -4194,6 +4985,7 @@ export function initializeApp(config) {
       normalizeOverlaySource,
       createAnnouncementEntry,
       createMessageChatEntry,
+      buildChatLogEntryParts,
       buildDisplayContext,
       rebuildNodeIndex,
       makeRoleFilterKey,
@@ -4219,6 +5011,41 @@ export function initializeApp(config) {
       adjustStatsForHiddenProtocols,
       /** Whether auto-refresh is currently paused. */
       isAutorefreshPaused: () => autorefreshPaused,
+      /** Whether an SSE live-update stream is currently active (test hook). */
+      isLiveActive: () => liveActive,
+      /** The auto-refresh cadence last armed, in ms (test hook). */
+      getAutoRefreshIntervalMs: () => autoRefreshIntervalMs,
+      /** Count of flash rounds triggered by SSE pings (VF2 gating; test hook). */
+      getLiveFlashCount: () => liveFlashCount,
+      /** Node ids flashed by the most recent SSE-ping refresh (test hook). */
+      getLastFlashedNodeIds: () => lastFlashedNodeIds,
+      /** Flash (and wave) the given changed node ids — test hook for the LV5 wiring. */
+      flashChangedNodes,
+      /** Inject a marker into the node->marker map — test hook for the LV5 wiring. */
+      _setMarkerForTests: (id, marker) => markerByNodeId.set(id, marker),
+      /** Message ids flashed by the most recent SSE-ping refresh (test hook). */
+      getLastFlashedMessageIds: () => lastFlashedMessageIds,
+      /**
+       * Flush any pending debounced live refresh and await the latest
+       * live-driven refresh (test hook).
+       *
+       * @returns {Promise<void>}
+       */
+      flushLiveRefresh: async () => {
+        if (liveRefreshTimer) {
+          clearTimeout(liveRefreshTimer);
+          runLiveRefresh();
+        }
+        await liveRefreshPromise;
+      },
+      /** Stop the auto-refresh timer and close the live stream (test teardown). */
+      stopAutoRefresh: () => {
+        if (refreshTimer) {
+          clearInterval(refreshTimer);
+          refreshTimer = null;
+        }
+        stopLiveUpdates();
+      },
       /** Inject mock count span elements for legend protocol count tests. */
       _setProtocolCountElements(mc, mt) {
         meshcoreCountEl = mc;
@@ -4231,6 +5058,46 @@ export function initializeApp(config) {
       },
       /** Trigger a manual refresh cycle (test use only). */
       refresh,
+      /** Re-render the chat log from current state (test/verification hook). */
+      rerenderChatLog,
+      /**
+       * Chat-render instrumentation: how many entries have been materialised
+       * into DOM nodes so far. Idle re-renders should not increase this once
+       * incremental rendering is in place (issue: chat-log render).
+       *
+       * @returns {{ materialized: number }} Cumulative materialisation count.
+       */
+      getChatRenderStats: () => chatEntryCache.stats(),
+      /** Reset the chat-render materialisation counter (test use only). */
+      resetChatRenderStats: () => {
+        chatEntryCache.resetStats();
+      },
+      /** Number of plaintext chat messages currently loaded (test use only). */
+      getLoadedMessageCount: () => allMessages.length,
+      /** Number of node rows currently loaded into the table (test use only). */
+      getLoadedNodeCount: () => allNodes.length,
+      /** Number of position entries currently loaded (test use only). */
+      getLoadedPositionCount: () => allPositionEntries.length,
+      /** Number of telemetry entries currently loaded (test use only). */
+      getLoadedTelemetryCount: () => allTelemetryEntries.length,
+      /** Number of neighbour tuples currently loaded (test use only). */
+      getLoadedNeighborCount: () => allNeighbors.length,
+      /** Number of trace entries currently loaded (test use only). */
+      getLoadedTraceCount: () => allTraces.length,
+      /** The persistent data cache instance (test use only). */
+      dataCache,
+      /** Seed in-memory state from the persistent cache (test use only). */
+      seedFromCache,
+      /** Promise resolving once the initial seed + first refresh complete (test hook). */
+      initialLoad: initialLoadPromise,
+      /** Promise resolving once the latest cache write-back has flushed (test hook). */
+      flushCacheWrites: () => pendingCacheWrite,
+      /** Promise resolving once the one-shot chat-history backfill finishes (test hook). */
+      flushBackfill: () => backfillPromise,
+      /** Promise resolving once the one-shot bulk-collection backfill finishes (test hook). */
+      flushCollectionBackfills: () => collectionBackfillPromise,
+      /** Empty the persistent cache — the "clear cached data" control (FC4). */
+      clearDataCache,
       /** Project an original lat/lon + pixel offset into a display LatLng. */
       projectColocatedOffsetLatLng,
       /** Re-project every recorded co-located marker (no-op without a map). */

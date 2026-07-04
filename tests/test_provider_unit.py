@@ -15,12 +15,33 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
+import time
 import types
 from contextlib import suppress
 from pathlib import Path
 
 import pytest
+
+
+async def _wait_for_threading_event(evt: threading.Event, *, timeout: float) -> bool:
+    """Yield to the asyncio loop until *evt* is set or *timeout* elapses.
+
+    Uses :func:`asyncio.sleep` so the background ``_run_meshcore`` task running
+    on the same event loop gets scheduling opportunities while the test waits.
+    Returns ``True`` when the event was set in time, ``False`` on timeout —
+    callers can assert on the return value to surface a clear failure rather
+    than a hand-tuned spin count.
+    """
+    deadline = time.monotonic() + timeout
+    while not evt.is_set():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0)
+    return True
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -1146,6 +1167,67 @@ def test_store_meshcore_position_falls_back_to_rx_time_when_no_position_time(
 
     payload = posted[0]
     assert before <= payload["position_time"] <= after
+
+
+# Issue #782: MeshCore contact advertisements that report ``(0, 0)`` are the
+# "no GPS lock" sentinel and must be dropped wholesale rather than persisted
+# at the Gulf of Guinea.
+def test_store_meshcore_position_drops_paired_zero_sentinel(monkeypatch):
+    """``(lat=0, lon=0)`` advertisements are never queued."""
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append((route, payload)),
+    )
+
+    _store_meshcore_position("!aabbccdd", 0.0, 0.0, 1700001234, "!ingestor1")
+
+    assert posted == []
+
+
+def test_store_meshcore_position_collapses_zero_position_time(monkeypatch):
+    """``position_time = 0`` falls back to rx_time via the normalizer."""
+    import time as _time
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append(payload),
+    )
+
+    before = int(_time.time())
+    _store_meshcore_position("!aabbccdd", 51.5, -0.1, 0, None)
+    after = int(_time.time())
+
+    assert (
+        posted
+    ), "expected the post to land — zero pt is a normaliser miss, not a drop"
+    payload = posted[0]
+    assert before <= payload["position_time"] <= after
+
+
+def test_store_meshcore_position_equator_fix_preserved(monkeypatch):
+    """A real ``(0, lon != 0)`` equator advertisement survives."""
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append(payload),
+    )
+
+    _store_meshcore_position("!aabbccdd", 0.0, 13.5, 1700001234, None)
+
+    assert len(posted) == 1
+    payload = posted[0]
+    assert payload["latitude"] == 0.0
+    assert payload["longitude"] == pytest.approx(13.5)
 
 
 # ---------------------------------------------------------------------------
@@ -2826,6 +2908,7 @@ def _make_fake_meshcore_mod(
     fail_ensure_contacts: bool = False,
     disconnect_raises: bool = False,
     connect_stall_event=None,
+    on_ensure_contacts=None,
 ):
     """Build a minimal fake ``meshcore`` module for testing :func:`_run_meshcore`.
 
@@ -2838,6 +2921,10 @@ def _make_fake_meshcore_mod(
             the ``finally`` exception-suppression path.
         connect_stall_event: Optional :class:`asyncio.Event`; when set,
             ``connect()`` awaits it (never completes unless the event is set).
+        on_ensure_contacts: Optional zero-argument callable invoked inside
+            ``mc.ensure_contacts()`` (after the ``fail_ensure_contacts`` check)
+            so tests can populate ``iface._contacts`` mid-startup.  Used to
+            assert the startup ordering required by issue #788.
     """
     import enum
 
@@ -2851,6 +2938,7 @@ def _make_fake_meshcore_mod(
             "NEXT_CONTACT",
             "CHANNEL_MSG_RECV",
             "CONTACT_MSG_RECV",
+            "ADVERTISEMENT",
             "DISCONNECTED",
             "CONNECTED",
             "ACK",
@@ -2879,10 +2967,18 @@ def _make_fake_meshcore_mod(
         def __init__(self, cx):
             self._catch_all = None
             self.commands = _FakeCommands()
+            # Mirrors the upstream property the runner flips on to keep the
+            # contact roster live across re-adverts (meshcore adverts gap).
+            self.auto_update_contacts = False
+            # Records every non-catch-all subscription so tests can assert the
+            # runner wires the ADVERTISEMENT handler.
+            self.subscribed_events = []
 
         def subscribe(self, event_type, callback):
             if event_type is None:
                 self._catch_all = callback
+            else:
+                self.subscribed_events.append(event_type)
 
         async def connect(self):
             if connect_stall_event is not None:
@@ -2892,6 +2988,16 @@ def _make_fake_meshcore_mod(
         async def ensure_contacts(self):
             if fail_ensure_contacts:
                 raise RuntimeError("contacts unavailable")
+            if on_ensure_contacts is not None:
+                # Yield once before populating so tests observing
+                # ``connected_event`` mid-startup can race the populate the
+                # same way the real meshcore library does — its
+                # ``ensure_contacts`` awaits multiple serial round-trips
+                # before contacts land in ``iface._contacts``.
+                import asyncio as _aio
+
+                await _aio.sleep(0)
+                on_ensure_contacts()
 
         async def start_auto_message_fetching(self):
             pass
@@ -3086,28 +3192,128 @@ def test_run_meshcore_connect_returns_none_raises(monkeypatch):
 
 
 def test_run_meshcore_ensure_contacts_failure_continues(monkeypatch):
-    """ensure_contacts() raising must log a warning but not abort the connection."""
-    import asyncio
+    """ensure_contacts() raising must log a warning but not abort the connection.
+
+    Also pins down the ordering established by issue #788: the
+    ``connected_event`` must still be signalled *after* the
+    ``ensure_contacts`` warning is logged, even on the failure path.  A
+    regression that moves ``connected_event.set()`` back inside the
+    ``try:`` block (so it fires before the ``await mc.ensure_contacts()``)
+    must fail here.
+    """
     import data.mesh_ingestor.protocols.meshcore as _mod
 
-    logged: list = []
-    monkeypatch.setattr(
-        _mod.config,
-        "_debug_log",
-        lambda *_a, severity=None, **_k: logged.append(severity),
-    )
+    logged_severities: list = []
+    warning_observed_event_state: list = []
+
+    # Build the holder upfront so the closure below can inspect it the
+    # moment the warning is logged — which happens *inside* the inner
+    # ``ensure_contacts`` except block in runner.py, before
+    # ``connected_event.set()``.
+    iface = _MeshcoreInterface(target=None)
+    connected_event = threading.Event()
+    error_holder: list = [None]
+
+    def _record_log(*args, severity=None, **_kwargs):
+        logged_severities.append(severity)
+        if (
+            severity == "warning"
+            and args
+            and "Failed to fetch initial contacts" in str(args[0])
+        ):
+            warning_observed_event_state.append(connected_event.is_set())
+
+    monkeypatch.setattr(_mod.config, "_debug_log", _record_log)
     fake_mod = _make_fake_meshcore_mod(fail_ensure_contacts=True)
     _patch_meshcore_mod(monkeypatch, _mod, fake_mod)
 
-    iface = _MeshcoreInterface(target=None)
+    async def _runner() -> None:
+        task = asyncio.create_task(
+            _mod._run_meshcore(iface, "/dev/ttyUSB0", connected_event, error_holder)
+        )
+        assert await _wait_for_threading_event(
+            connected_event, timeout=2.0
+        ), "connected_event must be signalled even when ensure_contacts fails"
+        assert iface._stop_event is not None
+        iface._stop_event.set()
+        await task
 
-    connected_event, error_holder = asyncio.run(
-        _run_until_connected(iface, "/dev/ttyUSB0", fake_mod, _mod)
-    )
+    asyncio.run(_runner())
 
     assert connected_event.is_set()
     assert error_holder[0] is None
-    assert "warning" in logged
+    assert "warning" in logged_severities
+    assert warning_observed_event_state == [False], (
+        "ensure_contacts warning must be logged before connected_event is "
+        "set (issue #788); observed states: "
+        f"{warning_observed_event_state!r}"
+    )
+
+
+def test_run_meshcore_signals_connected_only_after_ensure_contacts(monkeypatch):
+    """Regression for issue #788: contacts must be populated before connected_event fires.
+
+    The MeshCore initial snapshot in :func:`daemon._try_send_snapshot` runs as
+    soon as :func:`MeshcoreProvider.connect` returns, which itself returns as
+    soon as ``connected_event`` is set.  If ``connected_event`` fires before
+    ``ensure_contacts()`` finishes populating ``iface._contacts``, the
+    daemon's first snapshot is empty, ``processed_any`` stays ``False``, and
+    ``state.initial_snapshot_sent`` is not flipped (daemon.py:428).  The
+    snapshot is retried on the next ``_loop_iteration`` pass, so the impact
+    is a ``SNAPSHOT_SECS`` delay before known contacts appear rather than a
+    permanent failure — but the dashboard is empty in the meantime, which
+    is what issue #788 reports.
+
+    This test drives :func:`_run_meshcore` with a fake ``ensure_contacts``
+    that injects a contact into the interface, then exercises
+    :meth:`MeshcoreProvider.node_snapshot_items` — the call the daemon
+    actually makes — at the precise moment ``connected_event`` is observed.
+    The snapshot must already contain the contact.
+    """
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    monkeypatch.setattr(_mod.config, "_debug_log", lambda *_a, **_k: None)
+
+    iface = _MeshcoreInterface(target=None)
+    pub_key = "aabbccdd" + "00" * 28
+
+    def _populate_contacts() -> None:
+        iface._update_contact(
+            {"public_key": pub_key, "adv_name": "Repeater", "last_advert": 1000}
+        )
+
+    fake_mod = _make_fake_meshcore_mod(on_ensure_contacts=_populate_contacts)
+    _patch_meshcore_mod(monkeypatch, _mod, fake_mod)
+
+    connected_event = threading.Event()
+    error_holder: list = [None]
+    snapshot_at_signal: list = []
+
+    async def _runner() -> None:
+        task = asyncio.create_task(
+            _mod._run_meshcore(iface, "/dev/ttyUSB0", connected_event, error_holder)
+        )
+        assert await _wait_for_threading_event(connected_event, timeout=2.0), (
+            "connected_event was not signalled within the timeout — runner "
+            "may be deadlocked"
+        )
+        # Go through the full provider helper, not iface.contacts_snapshot()
+        # directly, so a future regression that drops contacts from
+        # node_snapshot_items() is also caught.
+        snapshot_at_signal.extend(MeshcoreProvider().node_snapshot_items(iface))
+        assert iface._stop_event is not None
+        iface._stop_event.set()
+        await task
+
+    asyncio.run(_runner())
+
+    assert error_holder[0] is None
+    assert snapshot_at_signal, (
+        "connected_event must not fire before ensure_contacts() populates "
+        "iface._contacts (issue #788)"
+    )
+    node_ids = {nid for nid, _ in snapshot_at_signal}
+    assert "!aabbccdd" in node_ids
 
 
 def test_run_meshcore_ensure_channel_names_failure_continues(monkeypatch):
@@ -3224,3 +3430,92 @@ def test_run_meshcore_on_unhandled_skips_known_records_unknown(monkeypatch):
 
     assert len(recorded) == 1, "only the unknown event should be recorded"
     assert "UNKNOWN_EVT" in recorded[0]
+
+
+# ---------------------------------------------------------------------------
+# MeshCore adverts from non-roster nodes (issue: meshcore adverts gap)
+# ---------------------------------------------------------------------------
+
+
+def test_advert_to_node_dict_minimal_heard_fields():
+    """_advert_to_node_dict builds a name-less 'heard now' node for a bare advert."""
+    from data.mesh_ingestor.protocols.meshcore import _advert_to_node_dict
+
+    pub_key = "aabbccdd" + "11" * 28
+    node = _advert_to_node_dict(pub_key)
+
+    assert isinstance(node["lastHeard"], int) and node["lastHeard"] > 0
+    assert node["protocol"] == "meshcore"
+    assert node["user"]["publicKey"] == pub_key
+    # Short name tracks the node id, consistent with _contact_to_node_dict.
+    assert node["user"]["shortName"] == "aabb"
+    # A bare advert carries no name, type, or position — only the pubkey.
+    assert "longName" not in node["user"]
+    assert "position" not in node
+
+
+def test_is_known_contact_reflects_snapshot():
+    """is_known_contact returns True only for public keys already in the roster."""
+    iface = _MeshcoreInterface(target=None)
+    pub_key = "aabbccdd" + "00" * 28
+    assert iface.is_known_contact(pub_key) is False
+    assert iface.is_known_contact("") is False
+    iface._update_contact({"public_key": pub_key, "adv_name": "Alice"})
+    assert iface.is_known_contact(pub_key) is True
+
+
+def test_on_advertisement_upserts_unknown_node(monkeypatch):
+    """A bare ADVERTISEMENT from a non-roster node upserts a heard-now placeholder."""
+    import asyncio
+
+    _captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    pub_key = "aabbccdd" + "22" * 28
+    asyncio.run(hmap["ADVERTISEMENT"](_FakeEvt({"public_key": pub_key})))
+
+    assert len(upserted) == 1
+    node_id, node_dict = upserted[0]
+    assert node_id == "!aabbccdd"
+    assert node_dict["user"]["publicKey"] == pub_key
+
+
+def test_on_advertisement_skips_known_contact(monkeypatch):
+    """A re-advert from a roster node is left to the auto-update re-fetch (no upsert)."""
+    import asyncio
+
+    pub_key = "aabbccdd" + "33" * 28
+    _captured, upserted, _iface, hmap = _setup_channel_msg_handlers(
+        monkeypatch, contacts=[{"public_key": pub_key, "adv_name": "Bob"}]
+    )
+    asyncio.run(hmap["ADVERTISEMENT"](_FakeEvt({"public_key": pub_key})))
+
+    assert upserted == []
+
+
+def test_on_advertisement_ignores_unmappable_pubkey(monkeypatch):
+    """An advert whose public key cannot map to a node id is dropped."""
+    import asyncio
+
+    _captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    asyncio.run(hmap["ADVERTISEMENT"](_FakeEvt({"public_key": "ab"})))
+    asyncio.run(hmap["ADVERTISEMENT"](_FakeEvt({})))
+
+    assert upserted == []
+
+
+def test_run_meshcore_enables_auto_update_and_subscribes_advert(monkeypatch):
+    """_run_meshcore must enable contact auto-update and subscribe the advert handler."""
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    monkeypatch.setattr(_mod.config, "_debug_log", lambda *_a, **_k: None)
+    fake_mod = _make_fake_meshcore_mod()
+    _patch_meshcore_mod(monkeypatch, _mod, fake_mod)
+
+    iface = _MeshcoreInterface(target=None)
+    _connected, error_holder = asyncio.run(
+        _run_until_connected(iface, "/dev/ttyUSB0", fake_mod, _mod)
+    )
+
+    assert error_holder[0] is None
+    assert iface._mc.auto_update_contacts is True
+    assert fake_mod.EventType.ADVERTISEMENT in iface._mc.subscribed_events

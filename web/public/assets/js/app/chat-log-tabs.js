@@ -23,6 +23,50 @@ import { extractModemMetadata } from './node-modem-metadata.js';
 export const MAX_CHANNEL_INDEX = 255;
 
 /**
+ * Matches a throwaway "test" channel by the presence of the standalone word
+ * ``ping``, ``test``, or ``bot`` (case-insensitive).  The ``\b`` word boundaries
+ * are deliberate: they keep legitimate channels whose names merely *contain*
+ * those letters — "Camping", "Robotics", "Contest", "Botswana" — out of the test
+ * tier, trading the odd concatenated form ("MyBot", "test2") for zero false
+ * positives (SPEC F2).
+ * @type {RegExp}
+ */
+const TEST_CHANNEL_PATTERN = /\b(?:ping|test|bot)\b/i;
+
+/**
+ * Decide whether a channel label denotes a deprioritized "test" channel.
+ *
+ * Used by {@link buildChatTabModel} to sink ``#test`` / ``#ping`` / ``#bot``
+ * style channels below the community's real channels (SPEC F1/F2).  Matching is
+ * on the resolved display label the operator sees, case-insensitive and bounded
+ * to whole words so substrings never trigger a false positive.
+ *
+ * @param {string} label Resolved channel display label.
+ * @returns {boolean} ``true`` when the label contains a standalone test keyword.
+ */
+export function isTestChannelLabel(label) {
+  if (typeof label !== 'string') return false;
+  return TEST_CHANNEL_PATTERN.test(label);
+}
+
+/**
+ * Classify a channel bucket into its display-ordering tier (SPEC F1/F3).
+ * Lower tiers sort first:
+ *
+ *   0 — default/primary channel (index 0). Always leads and is **never** demoted
+ *       to the test tier, even if its label matches a keyword (SPEC F3).
+ *   2 — test channel: a non-primary channel whose label names ping/test/bot.
+ *   1 — any other custom (non-primary, non-test) channel.
+ *
+ * @param {{ index: number, label: string }} channel Channel bucket.
+ * @returns {number} Ordering tier (0, 1, or 2).
+ */
+function channelPriorityTier(channel) {
+  if (channel.index === 0) return 0;
+  return isTestChannelLabel(channel.label) ? 2 : 1;
+}
+
+/**
  * Discrete event types that can appear in the chat activity log.
  *
  * @type {{
@@ -31,7 +75,9 @@ export const MAX_CHANNEL_INDEX = 255;
  *   TELEMETRY: 'telemetry',
  *   POSITION: 'position',
  *   NEIGHBOR: 'neighbor',
- *   TRACE: 'trace'
+ *   TRACE: 'trace',
+ *   MESSAGE: 'message',
+ *   MESSAGE_ENCRYPTED: 'message-encrypted'
  * }}
  */
 export const CHAT_LOG_ENTRY_TYPES = Object.freeze({
@@ -41,7 +87,24 @@ export const CHAT_LOG_ENTRY_TYPES = Object.freeze({
   POSITION: 'position',
   NEIGHBOR: 'neighbor',
   TRACE: 'trace',
+  MESSAGE: 'message',
   MESSAGE_ENCRYPTED: 'message-encrypted'
+});
+
+/**
+ * Reason annotations for {@link CHAT_LOG_ENTRY_TYPES.NODE_INFO} entries.
+ *
+ * A node-info entry renders as "Updated node info (<reason>)".  ``advert`` is
+ * the generic "this node was heard / its record updated" fallback emitted only
+ * when no more-specific event already represents that heard; ``message`` records
+ * a decrypted chat message as a node-info update so the message body never
+ * reaches the Log feed (only its channel tab).
+ *
+ * @type {{ ADVERT: 'advert', MESSAGE: 'message' }}
+ */
+export const NODE_INFO_REASONS = Object.freeze({
+  ADVERT: 'advert',
+  MESSAGE: 'message'
 });
 
 /**
@@ -111,36 +174,49 @@ export function buildChatTabModel({
   const channelBuckets = new Map();
   const primaryChannelEnvLabel = normalisePrimaryChannelEnvLabel(primaryChannelFallbackLabel);
   const nodeById = new Map();
-  const nodeByNum = new Map();
-  const nodeInfoKeys = new Set();
 
-  const buildNodeInfoKey = (nodeId, nodeNum, ts) => `${nodeId ?? ''}:${nodeNum ?? ''}:${ts ?? ''}`;
-  const recordNodeInfoEntry = (ts, nodeId, nodeNum) => {
-    if (ts == null) return;
-    const key = buildNodeInfoKey(nodeId, nodeNum, ts);
-    if (nodeInfoKeys.has(key)) return;
-    const node = nodeId && nodeById.has(nodeId)
-      ? nodeById.get(nodeId)
-      : (nodeNum != null && nodeByNum.has(nodeNum) ? nodeByNum.get(nodeNum) : null);
-    if (!node) return;
-    nodeInfoKeys.add(key);
-    logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.NODE_INFO, node, nodeId, nodeNum });
+  // A heard is "claimed" by the most-specific event that represents it
+  // (position / telemetry / neighbor / trace / decrypted message).  A node's
+  // generic "updated node info (advert)" entry is suppressed when its
+  // last_heard is already claimed, so each heard yields exactly one Log entry
+  // and message bodies are recorded as node-info updates, never echoed (LV7).
+  const claimedHeards = new Set();
+  // A heard is claimed by its canonical node id + ts. The canonical ``!%08x`` id
+  // is derived from ``node_num`` when a record carries only the number
+  // ({@link normaliseNodeId}), so the id alone identifies a node across every
+  // event shape. The prior key folded in ``node_num`` and required BOTH to match,
+  // so a specific event carrying only ``node_id`` (``node_num`` is int|nil per
+  // CONTRACTS, and is commonly nil — notably for MeshCore) failed to claim the
+  // node record's heard and leaked a redundant "Updated node info (advert)" line
+  // (bugfix A2).
+  const claimKey = (nodeId, ts) => `${nodeId}:${ts}`;
+  // Every call site validates ``ts`` (>= cutoff) before claiming, so no ts guard.
+  // An id-less event (no node_id and no derivable node_num) claims nothing — it
+  // cannot identify a node, so it must not suppress another node's advert.
+  const claimHeard = (ts, nodeId) => {
+    if (nodeId) claimedHeards.add(claimKey(nodeId, ts));
   };
+  // True when a more-specific event already claimed this node's heard at ``ts``.
+  const heardClaimed = (nodeId, ts) => Boolean(nodeId) && claimedHeards.has(claimKey(nodeId, ts));
+  // A node's last_heard yields an "updated node info (advert)" entry unless a
+  // more-specific event claims that timestamp.  Collected up front and resolved
+  // after every specific event is processed, so source ordering is irrelevant.
+  const advertCandidates = [];
+  // Dedup for decrypted-message node-info entries (one per sender per second).
+  const messageInfoKeys = new Set();
 
   for (const node of nodes || []) {
     if (!node) continue;
     const nodeId = normaliseNodeId(node);
     const nodeNum = normaliseNodeNum(node);
     if (nodeId) nodeById.set(nodeId, node);
-    if (nodeNum != null) nodeByNum.set(nodeNum, node);
     const firstTs = resolveTimestampSeconds(node.first_heard ?? node.firstHeard, node.first_heard_iso ?? node.firstHeardIso);
     if (firstTs != null && firstTs >= cutoff) {
       logEntries.push({ ts: firstTs, type: CHAT_LOG_ENTRY_TYPES.NODE_NEW, node, nodeId, nodeNum });
     }
     const lastTs = resolveTimestampSeconds(node.last_heard ?? node.lastHeard, node.last_seen_iso ?? node.lastSeenIso);
     if (lastTs != null && lastTs >= cutoff) {
-      logEntries.push({ ts: lastTs, type: CHAT_LOG_ENTRY_TYPES.NODE_INFO, node, nodeId, nodeNum });
-      nodeInfoKeys.add(buildNodeInfoKey(nodeId, nodeNum, lastTs));
+      advertCandidates.push({ ts: lastTs, node, nodeId, nodeNum });
     }
   }
 
@@ -156,7 +232,7 @@ export function buildChatTabModel({
       const nodeId = normaliseNodeId(snapshot);
       const nodeNum = normaliseNodeNum(snapshot);
       logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.TELEMETRY, telemetry: snapshot, nodeId, nodeNum });
-      recordNodeInfoEntry(ts, nodeId, nodeNum);
+      claimHeard(ts, nodeId);
     }
   }
 
@@ -172,7 +248,7 @@ export function buildChatTabModel({
       const nodeId = normaliseNodeId(snapshot);
       const nodeNum = normaliseNodeNum(snapshot);
       logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.POSITION, position: snapshot, nodeId, nodeNum });
-      recordNodeInfoEntry(ts, nodeId, nodeNum);
+      claimHeard(ts, nodeId);
     }
   }
 
@@ -186,7 +262,7 @@ export function buildChatTabModel({
       const nodeNum = normaliseNodeNum(snapshot);
       const neighborId = normaliseNeighborId(snapshot);
       logEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.NEIGHBOR, neighbor: snapshot, nodeId, nodeNum, neighborId });
-      recordNodeInfoEntry(ts, nodeId, nodeNum);
+      claimHeard(ts, nodeId);
     }
   }
 
@@ -216,7 +292,7 @@ export function buildChatTabModel({
       nodeId: firstHop.id ?? null,
       nodeNum: firstHop.num ?? null
     });
-    recordNodeInfoEntry(ts, firstHop.id ?? null, firstHop.num ?? null);
+    claimHeard(ts, firstHop.id ?? null);
   }
 
   const encryptedLogEntries = [];
@@ -233,6 +309,11 @@ export function buildChatTabModel({
         encryptedLogKeys.add(key);
         encryptedLogEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.MESSAGE_ENCRYPTED, message });
       }
+      // The "🔒 encrypted message" line is this sender's Log representation for the
+      // heard (the sender id is known even though the body is encrypted), so claim
+      // it — a decrypted message does the same — suppressing the redundant
+      // "(advert)" line for the same node + ts (LV7).
+      claimHeard(ts, normaliseNodeId(message.from_id ?? message.fromId));
       continue;
     }
 
@@ -285,6 +366,29 @@ export function buildChatTabModel({
     }
 
     bucket.entries.push({ ts, message });
+    // The decrypted body lives ONLY in its channel tab.  In the mixed Log feed
+    // the message is recorded as a node-info update (reason "message") for its
+    // sender, so message bodies never reach the Log (LV7).  A message whose
+    // sender cannot be identified appears only in its channel tab.
+    const fromId = normaliseNodeId(message.from_id ?? message.fromId);
+    if (fromId) {
+      const senderNode = nodeById.get(fromId)
+        ?? (message.node && typeof message.node === 'object' ? message.node : null);
+      const fromNum = senderNode ? normaliseNodeNum(senderNode) : null;
+      const infoKey = `${fromId}:${ts}`;
+      if (!messageInfoKeys.has(infoKey)) {
+        messageInfoKeys.add(infoKey);
+        logEntries.push({
+          ts,
+          type: CHAT_LOG_ENTRY_TYPES.NODE_INFO,
+          reason: NODE_INFO_REASONS.MESSAGE,
+          node: senderNode,
+          nodeId: fromId,
+          nodeNum: fromNum
+        });
+      }
+      claimHeard(ts, fromId);
+    }
   }
 
   const extraLogMessages = Array.isArray(logOnlyMessages) ? logOnlyMessages : [];
@@ -298,10 +402,31 @@ export function buildChatTabModel({
     }
     encryptedLogKeys.add(key);
     encryptedLogEntries.push({ ts, type: CHAT_LOG_ENTRY_TYPES.MESSAGE_ENCRYPTED, message });
+    // Claim the sender's heard so the redundant "(advert)" line is suppressed,
+    // matching the main message loop (LV7).
+    claimHeard(ts, normaliseNodeId(message.from_id ?? message.fromId));
   }
 
   if (encryptedLogEntries.length > 0) {
     logEntries.push(...encryptedLogEntries);
+  }
+
+  // Emit "updated node info (advert)" for every heard not already represented
+  // by a more-specific event (position / telemetry / neighbor / trace /
+  // decrypted message), realising the "unless another specific type was already
+  // emitted" rule.
+  for (const candidate of advertCandidates) {
+    if (heardClaimed(candidate.nodeId, candidate.ts)) {
+      continue;
+    }
+    logEntries.push({
+      ts: candidate.ts,
+      type: CHAT_LOG_ENTRY_TYPES.NODE_INFO,
+      reason: NODE_INFO_REASONS.ADVERT,
+      node: candidate.node,
+      nodeId: candidate.nodeId,
+      nodeNum: candidate.nodeNum
+    });
   }
 
   logEntries.sort((a, b) => a.ts - b.ts);
@@ -311,14 +436,16 @@ export function buildChatTabModel({
     channel.entries.sort((a, b) => a.ts - b.ts);
     channel.messageCount = channel.entries.length;
   }
-  // Sort channels into two tiers:
-  //   1. Primary channels (channel index 0 — LongFast, MediumFast, Public, etc.)
-  //      ordered by activity desc so the most-active protocol leads within the tier.
-  //   2. Secondary channels (index > 0) ordered by activity desc, then alpha.
-  // Within each tier, ties on messageCount are broken alphabetically by label.
+  // Sort channels into three priority tiers (SPEC F1):
+  //   0. Default/primary channels (index 0 — LongFast, MediumFast, Public, …),
+  //      never demoted even if the name matches a test keyword (SPEC F3).
+  //   1. Custom channels (index > 0) that are not test channels.
+  //   2. Test channels (index > 0 whose label names ping/test/bot) — sunk last.
+  // Within each tier the prior ordering is preserved unchanged: activity
+  // (7-day message count) descending, then label alphabetical.
   const channels = Array.from(channelBuckets.values()).sort((a, b) => {
-    const aTier = a.index === 0 ? 0 : 1;
-    const bTier = b.index === 0 ? 0 : 1;
+    const aTier = channelPriorityTier(a);
+    const bTier = channelPriorityTier(b);
     if (aTier !== bTier) return aTier - bTier;
     return b.messageCount - a.messageCount || a.label.localeCompare(b.label);
   });

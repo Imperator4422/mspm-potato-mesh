@@ -62,6 +62,15 @@ export function makeLeafletStub() {
       clearLayers() {
         group._layers.length = 0;
         return group;
+      },
+      addLayer(layer) {
+        group._layers.push(layer);
+        return group;
+      },
+      removeLayer(layer) {
+        const index = group._layers.indexOf(layer);
+        if (index >= 0) group._layers.splice(index, 1);
+        return group;
       }
     };
     recorded.layerGroups.push(group);
@@ -94,6 +103,9 @@ export function makeLeafletStub() {
         eventHandlers.get(event).push(handler);
         return marker;
       },
+      getLatLng() {
+        return marker._latLng;
+      },
       _eventHandlers: eventHandlers
     };
     return marker;
@@ -124,9 +136,9 @@ export function makeLeafletStub() {
 
   /**
    * Construct a tile-layer stub.  ``initializeApp`` registers
-   * ``tileloadstart`` / ``tileload`` / ``load`` / ``tileerror`` handlers but
-   * never fires them in the test environment, so the stub just stores the
-   * registration for completeness.
+   * ``tileload`` / ``load`` / ``tileerror`` handlers but never fires them in
+   * the test environment, so the stub just stores the registration for
+   * completeness.
    *
    * @param {string} url Tile URL template (ignored).
    * @param {Object} [options] Tile options.
@@ -272,21 +284,6 @@ export function setupAppWithLeaflet(opts = {}) {
   const env = createDomEnvironment({ includeBody: true });
   const mapContainer = env.createElement('div', 'map');
   env.registerElement('map', mapContainer);
-
-  // ``applyFiltersToAllTiles`` writes to ``document.body.style`` via
-  // ``setProperty``; the bare ``MockElement`` only exposes an empty object,
-  // so extend it with the method.  The ``style.cssText`` accumulator is
-  // diagnostic-only — production code never reads it back, but having it
-  // lets tests inspect what filters were applied if needed.
-  const bodyStyle = (env.window && env.window.document && env.window.document.body)
-    ? env.window.document.body.style
-    : null;
-  if (bodyStyle && typeof bodyStyle.setProperty !== 'function') {
-    bodyStyle._properties = bodyStyle._properties || {};
-    bodyStyle.setProperty = (name, value) => {
-      bodyStyle._properties[name] = value;
-    };
-  }
 
   // ``initializeApp`` calls ``window.matchMedia`` to set up a responsive
   // legend listener.  The base DOM mock does not provide it, so we install

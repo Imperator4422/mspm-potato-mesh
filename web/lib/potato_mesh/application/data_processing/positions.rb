@@ -56,7 +56,7 @@ module PotatoMesh
         lora_freq = coerce_integer(payload["lora_freq"] || payload["loraFrequency"])
         modem_preset = string_or_nil(payload["modem_preset"] || payload["modemPreset"])
         ingestor = string_or_nil(payload["ingestor"])
-        protocol = resolve_protocol(db, ingestor, cache: protocol_cache)
+        protocol = resolve_record_protocol(db, payload, ingestor, cache: protocol_cache)
 
         ensure_unknown_node(db, node_id || node_num, node_num, heard_time: rx_time, protocol: protocol)
         touch_node_last_seen(
@@ -87,10 +87,20 @@ module PotatoMesh
           end
         alt ||= coerce_float(position_section.dig("raw", "altitude"))
 
-        position_time = coerce_integer(
+        # Issue #782: paired `(lat=0, lon=0)` is the Meshtastic "no GPS lock"
+        # sentinel; collapse to NULL on both axes (and drop altitude /
+        # locationSource which would otherwise be meaningless without a fix).
+        # Equator / prime-meridian fixes with one non-zero axis survive.
+        lat, lon = normalize_lat_lon(lat, lon)
+        if lat.nil? && lon.nil?
+          alt = nil
+        end
+
+        position_time = normalize_position_time(
           payload["position_time"] ||
             position_section["time"] ||
             position_section.dig("raw", "time"),
+          now: now,
         )
 
         location_source = string_or_nil(
@@ -100,6 +110,9 @@ module PotatoMesh
             position_section["locationSource"] ||
             position_section.dig("raw", "location_source"),
         )
+        # Drop a stale location source when the coordinate pair collapsed —
+        # see the matching guard in +update_node_from_position+.
+        location_source = nil if lat.nil? && lon.nil?
 
         precision_bits = coerce_integer(
           payload["precision_bits"] ||

@@ -16,7 +16,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { maxRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit } from '../incremental-helpers.js';
+import { maxRecordTimestamp, minRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit, trimToWindow } from '../incremental-helpers.js';
 
 // ---------------------------------------------------------------------------
 // maxRecordTimestamp
@@ -78,6 +78,57 @@ test('maxRecordTimestamp skips null and non-object entries', () => {
 test('maxRecordTimestamp ignores non-number timestamp values', () => {
   const records = [{ rx_time: 'abc' }, { rx_time: 50 }];
   assert.equal(maxRecordTimestamp(records), 50);
+});
+
+// ---------------------------------------------------------------------------
+// minRecordTimestamp
+// ---------------------------------------------------------------------------
+
+test('minRecordTimestamp returns 0 for an empty array', () => {
+  assert.equal(minRecordTimestamp([]), 0);
+});
+
+test('minRecordTimestamp returns 0 for non-array input', () => {
+  assert.equal(minRecordTimestamp(null), 0);
+  assert.equal(minRecordTimestamp(undefined), 0);
+  assert.equal(minRecordTimestamp('string'), 0);
+});
+
+test('minRecordTimestamp extracts the lowest positive rx_time by default', () => {
+  // The middle row exercises both branches of the running-minimum test: 100
+  // lowers the floor from 300, then 200 (>= 100) leaves it unchanged.
+  const records = [{ rx_time: 300 }, { rx_time: 100 }, { rx_time: 200 }];
+  assert.equal(minRecordTimestamp(records), 100);
+});
+
+test('minRecordTimestamp inspects last_heard by default', () => {
+  const records = [{ last_heard: 500 }, { last_heard: 250 }];
+  assert.equal(minRecordTimestamp(records), 250);
+});
+
+test('minRecordTimestamp returns 0 when records lack timestamp fields', () => {
+  const records = [{ node_id: '!abc' }, { node_id: '!def' }];
+  assert.equal(minRecordTimestamp(records), 0);
+});
+
+test('minRecordTimestamp accepts custom field names', () => {
+  const records = [{ telemetry_time: 800 }, { telemetry_time: 400 }];
+  assert.equal(minRecordTimestamp(records, ['telemetry_time']), 400);
+});
+
+test('minRecordTimestamp picks the min across multiple fields', () => {
+  const records = [{ rx_time: 400, position_time: 150 }];
+  assert.equal(minRecordTimestamp(records, ['rx_time', 'position_time']), 150);
+});
+
+test('minRecordTimestamp skips null and non-object entries', () => {
+  const records = [null, undefined, 42, { rx_time: 10 }];
+  assert.equal(minRecordTimestamp(records), 10);
+});
+
+test('minRecordTimestamp ignores non-number and non-positive timestamps', () => {
+  const records = [{ rx_time: 'abc' }, { rx_time: 0 }, { rx_time: -5 }, { rx_time: 70 }];
+  assert.equal(minRecordTimestamp(records), 70);
 });
 
 // ---------------------------------------------------------------------------
@@ -209,4 +260,50 @@ test('trimToLimit handles records with missing timestamp fields', () => {
   const result = trimToLimit(records, 2);
   assert.equal(result.length, 2);
   assert.equal(result[0].id, 3);
+});
+
+// ---------------------------------------------------------------------------
+// trimToWindow (issue #796)
+// ---------------------------------------------------------------------------
+
+test('trimToWindow drops records older than the floor and keeps the boundary', () => {
+  const records = [
+    { id: 1, rx_time: 90 },
+    { id: 2, rx_time: 100 }, // exactly at the floor → kept
+    { id: 3, rx_time: 150 },
+  ];
+  const result = trimToWindow(records, 100);
+  assert.deepEqual(result.map(r => r.id), [2, 3]);
+});
+
+test('trimToWindow retains records with a missing or non-numeric timestamp', () => {
+  const records = [
+    { id: 1 },
+    { id: 2, rx_time: 'nope' },
+    { id: 3, rx_time: 50 },
+    { id: 4, rx_time: 500 },
+  ];
+  const result = trimToWindow(records, 100);
+  assert.deepEqual(result.map(r => r.id), [1, 2, 4]);
+});
+
+test('trimToWindow uses a custom timestamp field', () => {
+  const records = [
+    { id: 1, last_heard: 10 },
+    { id: 2, last_heard: 200 },
+  ];
+  const result = trimToWindow(records, 100, 'last_heard');
+  assert.deepEqual(result.map(r => r.id), [2]);
+});
+
+test('trimToWindow returns the input unchanged for an unusable floor', () => {
+  const records = [{ id: 1, rx_time: 10 }];
+  assert.equal(trimToWindow(records, 0), records);
+  assert.equal(trimToWindow(records, Number.NaN), records);
+  assert.equal(trimToWindow(records, -5), records);
+});
+
+test('trimToWindow returns input for non-array values', () => {
+  assert.equal(trimToWindow(null, 100), null);
+  assert.equal(trimToWindow(undefined, 100), undefined);
 });

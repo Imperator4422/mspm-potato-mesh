@@ -113,7 +113,15 @@ async def _run_meshcore(
             )
 
         iface.isConnected = True
-        connected_event.set()
+
+        # Keep the contact roster live: with auto-update enabled the meshcore
+        # library re-fetches changed contacts whenever an ADVERTISEMENT /
+        # PATH_UPDATE push arrives (its built-in _contact_change handler), so a
+        # re-advert from a known node refreshes its position / last_advert
+        # without waiting for a reconnect.  Combined with the ADVERTISEMENT
+        # handler (which surfaces non-roster nodes), this closes the adverts gap
+        # where only startup-roster and auto-added contacts were captured.
+        mc.auto_update_contacts = True
 
         try:
             await mc.ensure_contacts()
@@ -125,6 +133,11 @@ async def _run_meshcore(
                 always=True,
                 error=str(exc),
             )
+
+        # Signal readiness only after the initial contact roster has been
+        # fetched so the daemon's first ``_try_send_snapshot()`` observes a
+        # populated ``_contacts`` dict instead of an empty one (issue #788).
+        connected_event.set()
 
         try:
             await _ensure_channel_names(mc)

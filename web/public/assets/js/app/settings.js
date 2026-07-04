@@ -20,6 +20,9 @@
  * @type {{
  *   refreshMs: number,
  *   refreshIntervalSeconds: number,
+ *   liveUpdatesEnabled: boolean,
+ *   liveUpdatesPath: string,
+ *   safetyPollMs: number,
  *   chatEnabled: boolean,
  *   channel: string,
  *   frequency: string,
@@ -27,13 +30,15 @@
  *   contactLinkUrl: string | null,
  *   mapCenter: { lat: number, lon: number },
  *   mapZoom: number | null,
- *   maxDistanceKm: number,
- *   tileFilters: { light: string, dark: string }
+ *   maxDistanceKm: number
  * }}
  */
 export const DEFAULT_CONFIG = {
   refreshMs: 60_000,
   refreshIntervalSeconds: 60,
+  liveUpdatesEnabled: true,
+  liveUpdatesPath: '/api/events',
+  safetyPollMs: 300_000,
   chatEnabled: true,
   channel: '#LongFast',
   frequency: '915MHz',
@@ -41,11 +46,7 @@ export const DEFAULT_CONFIG = {
   contactLinkUrl: 'https://matrix.to/#/#potatomesh:dod.ngo',
   mapCenter: { lat: 38.761944, lon: -27.090833 },
   mapZoom: null,
-  maxDistanceKm: 42,
-  tileFilters: {
-    light: 'grayscale(1) saturate(0) brightness(0.92) contrast(1.05)',
-    dark: 'grayscale(1) invert(1) brightness(0.9) contrast(1.08)'
-  }
+  maxDistanceKm: 42
 };
 
 /**
@@ -60,10 +61,6 @@ export function mergeConfig(raw) {
     lat: Number(raw?.mapCenter?.lat ?? DEFAULT_CONFIG.mapCenter.lat),
     lon: Number(raw?.mapCenter?.lon ?? DEFAULT_CONFIG.mapCenter.lon)
   };
-  config.tileFilters = {
-    light: raw?.tileFilters?.light || DEFAULT_CONFIG.tileFilters.light,
-    dark: raw?.tileFilters?.dark || DEFAULT_CONFIG.tileFilters.dark
-  };
   const refreshIntervalSeconds = Number(
     raw?.refreshIntervalSeconds ?? DEFAULT_CONFIG.refreshIntervalSeconds
   );
@@ -72,6 +69,12 @@ export function mergeConfig(raw) {
     : DEFAULT_CONFIG.refreshIntervalSeconds;
   const refreshMs = Number(raw?.refreshMs ?? config.refreshIntervalSeconds * 1000);
   config.refreshMs = Number.isFinite(refreshMs) ? refreshMs : DEFAULT_CONFIG.refreshMs;
+  config.liveUpdatesEnabled = Boolean(raw?.liveUpdatesEnabled ?? DEFAULT_CONFIG.liveUpdatesEnabled);
+  config.liveUpdatesPath = raw?.liveUpdatesPath || DEFAULT_CONFIG.liveUpdatesPath;
+  const safetyPollMs = Number(raw?.safetyPollMs ?? DEFAULT_CONFIG.safetyPollMs);
+  config.safetyPollMs = Number.isFinite(safetyPollMs) && safetyPollMs > 0
+    ? safetyPollMs
+    : DEFAULT_CONFIG.safetyPollMs;
   config.chatEnabled = Boolean(raw?.chatEnabled ?? DEFAULT_CONFIG.chatEnabled);
   config.channel = raw?.channel || DEFAULT_CONFIG.channel;
   config.frequency = raw?.frequency || DEFAULT_CONFIG.frequency;

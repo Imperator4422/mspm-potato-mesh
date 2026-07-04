@@ -59,9 +59,12 @@ require_relative "application/meshtastic/payload_decoder"
 require_relative "application/data_processing"
 require_relative "application/filesystem"
 require_relative "application/api_cache"
+require_relative "application/pubsub"
 require_relative "application/pages"
 require_relative "application/instances"
+require_relative "application/retention"
 require_relative "application/routes/api"
+require_relative "application/routes/events"
 require_relative "application/routes/ingest"
 require_relative "application/routes/root"
 
@@ -78,6 +81,7 @@ module PotatoMesh
     extend App::DataProcessing
     extend App::Filesystem
     extend App::Pages
+    extend App::Retention
 
     helpers App::Helpers
     include App::Database
@@ -90,8 +94,10 @@ module PotatoMesh
     include App::DataProcessing
     include App::Filesystem
     include App::Pages
+    include App::Retention
 
     register App::Routes::Api
+    register App::Routes::Events
     register App::Routes::Ingest
     register App::Routes::Root
 
@@ -111,7 +117,46 @@ module PotatoMesh
       logger = settings.logger
       return unless logger
 
-      logger.level = PotatoMesh::Config.debug? ? Logger::DEBUG : Logger::WARN
+      logger.level = PotatoMesh::Config.debug? ? Logger::DEBUG : Logger::INFO
+    end
+
+    # Close every live-update SSE subscriber so their streaming +pump+ loops
+    # exit promptly. Invoked from the shutdown signal handler (idempotent) so
+    # an open +/api/events+ connection cannot block Puma's graceful shutdown,
+    # which would otherwise gate the at_exit federation/retention teardown.
+    #
+    # @return [void]
+    def self.close_live_update_subscribers!
+      PotatoMesh::App::PubSub.reset!
+    rescue StandardError
+      nil
+    end
+
+    # Install INT/TERM handlers that close the live-update SSE subscribers when
+    # the process is asked to stop, so the streaming requests end and Puma can
+    # shut down without waiting out the SSE lifetime. The handler spawns a
+    # thread because the close path takes a Mutex, which is unsafe directly in
+    # trap context. Sinatra's own trap (installed by +run!+) chains to whatever
+    # handler already exists, so installing this *before* +run!+ keeps both.
+    #
+    # @param signals [Array<Symbol>] signals to trap.
+    # @param trap [#call] trap installer (injected in tests).
+    # @return [void]
+    def self.install_pubsub_shutdown_signal_handlers!(signals: %i[INT TERM], trap: Signal.method(:trap))
+      signals.each do |signal|
+        trap.call(signal) { Thread.new { close_live_update_subscribers! } }
+      end
+    end
+
+    # Boot the HTTP server: install the SSE-shutdown signal handlers (so Ctrl+C
+    # closes the live-update streams and Puma can drain) and then hand off to
+    # Sinatra's +run!+. Factored out of +app.rb+ so the bootstrap wiring is unit
+    # testable without actually starting Puma.
+    #
+    # @return [void]
+    def self.run_server!
+      install_pubsub_shutdown_signal_handlers!
+      run!
     end
 
     # Determine the port the application should listen on by honouring the
@@ -148,8 +193,24 @@ module PotatoMesh
       set :federation_worker_pool, nil
       set :federation_shutdown_requested, false
       set :federation_shutdown_hook_installed, false
+      set :retention_thread, nil
+      set :retention_shutdown_requested, false
+      set :retention_shutdown_hook_installed, false
       set :port, resolve_port
       set :bind, DEFAULT_BIND_ADDRESS
+      # Size the Puma worker-thread pool in code (default 16:96, env
+      # MIN_THREADS/MAX_THREADS). Each /api/events SSE stream pins one request
+      # thread for its lifetime, so the pool is kept well above the SSE
+      # subscriber cap (PubSub::MAX_SUBSCRIBERS) plus a reserve, ensuring live
+      # updates can never starve API/ingest/federation traffic (SPEC PS9);
+      # Puma's MRI default of 5 is far too small for that. force_shutdown_after
+      # bounds Puma's graceful-shutdown wait so a long-lived SSE stream cannot
+      # block Ctrl+C (the signal handler closes subscribers; this backstops
+      # anything still in flight after the window).
+      set :server_settings, {
+        force_shutdown_after: PotatoMesh::Config.puma_force_shutdown_seconds,
+        Threads: PotatoMesh::Config.puma_threads_setting,
+      }
 
       app_logger = PotatoMesh::Logging.build_logger($stdout)
       set :logger, app_logger
@@ -171,6 +232,8 @@ module PotatoMesh
       ensure_self_instance_record!
       update_all_prometheus_metrics_from_nodes
 
+      start_retention_worker_if_active!
+
       if federation_enabled?
         ensure_federation_worker_pool!
       else
@@ -178,6 +241,13 @@ module PotatoMesh
       end
 
       if federation_announcements_active?
+        info_log(
+          "Federation enabled",
+          context: "federation",
+          seed_count: PotatoMesh::Config.federation_seed_domains.length,
+          announcement_interval_seconds: PotatoMesh::Config.federation_announcement_interval,
+          worker_pool_size: PotatoMesh::Config.federation_worker_pool_size,
+        )
         start_initial_federation_announcement!
         start_federation_announcer!
       elsif federation_enabled?
@@ -187,8 +257,8 @@ module PotatoMesh
           reason: "test environment",
         )
       else
-        debug_log(
-          "Federation announcements disabled",
+        info_log(
+          "Federation disabled",
           context: "federation",
           reason: "configuration",
         )
@@ -216,6 +286,7 @@ SELF_INSTANCE_ID = PotatoMesh::Application::SELF_INSTANCE_ID unless defined?(SEL
   PotatoMesh::App::Queries,
   PotatoMesh::App::DataProcessing,
   PotatoMesh::App::Pages,
+  PotatoMesh::App::Retention,
 ].each do |mod|
   Object.include(mod) unless Object < mod
 end

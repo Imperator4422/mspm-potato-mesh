@@ -293,15 +293,65 @@ test('hydrate falls back to the default cap for invalid concurrency values', asy
   }
 });
 
-test('factory rejects missing fetch and fallback dependencies', () => {
-  assert.throws(
-    () => createMessageNodeHydrator({ applyNodeFallback: () => {} }),
-    TypeError,
-  );
+test('factory requires applyNodeFallback but allows an absent fetcher', () => {
+  // applyNodeFallback is mandatory.
   assert.throws(
     () => createMessageNodeHydrator({ fetchNodeById: async () => null }),
     TypeError,
   );
+  // fetchNodeById is optional — omitting it selects map-only mode rather than
+  // throwing (issue: node hydration).
+  assert.doesNotThrow(() => createMessageNodeHydrator({ applyNodeFallback: () => {} }));
+});
+
+test('map-only hydrate binds cached nodes and performs no lookups', async () => {
+  const node = { node_id: '!abc', short_name: 'Node' };
+  const nodesById = new Map([[node.node_id, node]]);
+  // No fetchNodeById supplied → map-only mode.
+  const hydrator = createMessageNodeHydrator({ applyNodeFallback: () => {} });
+
+  const result = await hydrator.hydrate([{ node_id: '!abc', text: 'hi' }], nodesById);
+
+  assert.strictEqual(result[0].node, node);
+});
+
+test('map-only hydrate renders an id placeholder for misses, no network', async () => {
+  let fallbackCalls = 0;
+  const hydrator = createMessageNodeHydrator({
+    applyNodeFallback: node => {
+      fallbackCalls += 1;
+      if (!node.short_name) {
+        node.short_name = 'Fallback';
+      }
+    },
+  });
+  const nodesById = new Map();
+
+  const result = await hydrator.hydrate(
+    [{ from_id: '!missing', text: 'hi', protocol: 'meshcore' }],
+    nodesById,
+  );
+
+  assert.equal(fallbackCalls, 1);
+  assert.equal(result[0].node.node_id, '!missing');
+  // Protocol is stamped onto the placeholder so the badge palette matches.
+  assert.equal(result[0].node.protocol, 'meshcore');
+  // The placeholder is not written back into the bulk map.
+  assert.equal(nodesById.has('!missing'), false);
+});
+
+test('map-only placeholder omits protocol when the message has none', async () => {
+  let observedProtocol = 'sentinel';
+  const hydrator = createMessageNodeHydrator({
+    applyNodeFallback: node => {
+      observedProtocol = node.protocol;
+    },
+  });
+
+  const result = await hydrator.hydrate([{ from_id: '!unknown', text: 'hi' }], new Map());
+
+  assert.equal(observedProtocol, undefined);
+  assert.equal(Object.prototype.hasOwnProperty.call(result[0].node, 'protocol'), false);
 });
 
 test('hydrate skips non-object entries and senderless messages', async () => {
@@ -321,6 +371,45 @@ test('hydrate skips non-object entries and senderless messages', async () => {
   assert.equal(fetchCalls, 0);
   assert.equal(result.length, 3);
   assert.strictEqual(senderless.node, null);
+});
+
+test('hydrate copies message.protocol onto placeholder when fetch returns null', async () => {
+  // Reproduces the regression where a MeshCore chat message with a 404'd
+  // sender id used to render the placeholder with a hardcoded Meshtastic
+  // label.  The hydrator should now stamp the message protocol onto the
+  // placeholder so applyNodeFallback can derive the correct prefix and the
+  // downstream badge palette matches the source channel.
+  let observedProtocol;
+  const hydrator = createMessageNodeHydrator({
+    fetchNodeById: async () => null,
+    applyNodeFallback: node => {
+      observedProtocol = node.protocol;
+    },
+  });
+  const messages = [{ from_id: '!mc404', text: 'hi', protocol: 'meshcore' }];
+
+  const result = await hydrator.hydrate(messages, new Map());
+
+  assert.equal(observedProtocol, 'meshcore');
+  assert.equal(result[0].node.node_id, '!mc404');
+  assert.equal(result[0].node.protocol, 'meshcore');
+});
+
+test('hydrate leaves placeholder protocol unset when message has none', async () => {
+  let observedProtocol;
+  const hydrator = createMessageNodeHydrator({
+    fetchNodeById: async () => null,
+    applyNodeFallback: node => {
+      observedProtocol = node.protocol;
+    },
+  });
+  const messages = [{ from_id: '!unknown', text: 'hi' }];
+
+  const result = await hydrator.hydrate(messages, new Map());
+
+  assert.equal(observedProtocol, undefined);
+  assert.equal(result[0].node.node_id, '!unknown');
+  assert.equal(Object.prototype.hasOwnProperty.call(result[0].node, 'protocol'), false);
 });
 
 test('hydrate dedupes duplicate senders without exceeding the cap', async () => {

@@ -175,22 +175,26 @@ module PotatoMesh
         domain_value = sanitize_instance_domain(app_constant(:INSTANCE_DOMAIN))
 
         payload = {
-          publicKey: app_constant(:INSTANCE_PUBLIC_KEY_PEM),
-          name: sanitized_site_name,
-          version: app_constant(:APP_VERSION),
-          domain: domain_value,
-          lastUpdate: last_update,
+          "public_key" => app_constant(:INSTANCE_PUBLIC_KEY_PEM),
+          "name" => sanitized_site_name,
+          "version" => app_constant(:APP_VERSION),
+          "domain" => domain_value,
+          "last_update" => last_update,
         }
 
-        signed_payload = JSON.generate(payload, sort_keys: true)
+        # Shared snake_case canonicalizer (SPEC FS1/FS4, U0) stamps
+        # signature_version inside the signed bytes so the format cannot be
+        # silently downgraded.
+        signed_payload = canonical_signed_payload(payload)
         signature = Base64.strict_encode64(
           app_constant(:INSTANCE_PRIVATE_KEY).sign(OpenSSL::Digest::SHA256.new, signed_payload),
         )
 
         document = payload.merge(
-          signature: signature,
-          signatureAlgorithm: PotatoMesh::Config.instance_signature_algorithm,
-          signedPayload: Base64.strict_encode64(signed_payload),
+          "signature_version" => PotatoMesh::Config.federation_signature_version,
+          "signature" => signature,
+          "signature_algorithm" => PotatoMesh::Config.instance_signature_algorithm,
+          "signed_payload" => Base64.strict_encode64(signed_payload),
         )
 
         json_output = JSON.pretty_generate(document)
@@ -242,12 +246,17 @@ module PotatoMesh
 
       # Retrieve the latest node update timestamp from the database.
       #
+      # Opted-out nodes are excluded so the +/version+ cache hint and the
+      # federation self-record do not leak the freshness of nodes that have
+      # asked to stay hidden.
+      #
       # @return [Integer, nil] Unix timestamp or nil when unavailable.
       def latest_node_update_timestamp
         return nil unless File.exist?(PotatoMesh::Config.db_path)
 
         db = open_database(readonly: true)
-        value = db.get_first_value("SELECT MAX(last_heard) FROM nodes")
+        sql = "SELECT MAX(last_heard) FROM nodes WHERE #{opt_out_self_filter}"
+        value = db.get_first_value(sql, opt_out_marker_params)
         value&.to_i
       rescue SQLite3::Exception
         nil

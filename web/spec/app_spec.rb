@@ -112,6 +112,39 @@ RSpec.describe "Potato Mesh Sinatra app" do
     ensure_self_instance_record!
   end
 
+  # Walk a bulk collection endpoint backward with the +before+ cursor the way an
+  # API client must, returning the set of unique record ids recovered.  Generic
+  # over the route path, the id field used for client-side de-duplication, and
+  # the primary sort field the cursor advances on (SPEC BP1-BP3).
+  #
+  # @param path [String] collection route, e.g. ``"/api/positions"``.
+  # @param id_key [String] response field uniquely identifying a row.
+  # @param sort_key [String] response field the +before+ cursor bounds.
+  # @return [Array] the de-duplicated ids recovered across every page.
+  def walk_before(path, id_key:, sort_key:)
+    cap = PotatoMesh::App::Queries::MAX_QUERY_LIMIT
+    seen = {}
+    cursor = nil
+    pages = 0
+    loop do
+      url = "#{path}?limit=#{cap}"
+      url += "&before=#{cursor}" if cursor
+      get url
+      expect(last_response).to be_ok
+      rows = JSON.parse(last_response.body)
+      # The per-request cap is never exceeded by a single response.
+      expect(rows.size).to be <= cap
+      added = rows.reject { |row| seen.key?(row[id_key]) }
+      added.each { |row| seen[row[id_key]] = true }
+      pages += 1
+      break if rows.size < cap # window exhausted
+      break if added.empty?    # no progress (server ignoring `before`)
+      break if pages >= 10     # hard safety bound against an infinite loop
+      cursor = rows.map { |row| row[sort_key] }.min
+    end
+    seen.keys
+  end
+
   # Retrieve the number of rows stored in the instances table.
   #
   # @return [Integer] count of stored instance records.
@@ -181,10 +214,22 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
   # Assemble the expected row persisted in the nodes table.
   #
+  # `position_time = 0` is a Meshtastic "no GPS lock" sentinel; the write
+  # boundary (`upsert_node`) normalises it to SQL `NULL` per issue #782, so
+  # the canonical expectation here mirrors that behaviour by collapsing zero
+  # to nil.  Lat/lon are intentionally left untouched here because the
+  # fixture never contains the paired `(0, 0)` Null Island sentinel.
+  #
   # @param node [Hash] node attributes from the fixture dataset.
   # @return [Hash] expected database row for assertions.
   def expected_node_row(node)
     final_last = expected_last_heard(node)
+    raw_position_time = node["position_time"]
+    canonical_position_time = if raw_position_time.is_a?(Numeric) && raw_position_time <= 0
+        nil
+      else
+        raw_position_time
+      end
     {
       "node_id" => node["node_id"],
       "short_name" => node["short_name"],
@@ -199,7 +244,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
       "uptime_seconds" => node["uptime_seconds"],
       "channel_utilization" => node["channel_utilization"],
       "air_util_tx" => node["air_util_tx"],
-      "position_time" => node["position_time"],
+      "position_time" => canonical_position_time,
       "location_source" => node["location_source"],
       "precision_bits" => node["precision_bits"],
       "latitude" => node["latitude"],
@@ -208,6 +253,17 @@ RSpec.describe "Potato Mesh Sinatra app" do
       "lora_freq" => node["lora_freq"],
       "modem_preset" => node["modem_preset"],
     }
+  end
+
+  # Canonical API view of a node fixture.  Identical to +expected_node_row+
+  # now that the write boundary applies the same sentinel normalisation; the
+  # alias is preserved so future divergence (e.g. API-only field omission via
+  # +compact_api_row+) has a natural home.
+  #
+  # @param node [Hash] node attributes from the fixture dataset.
+  # @return [Hash] expected API response row for assertions.
+  def expected_api_node_row(node)
+    expected_node_row(node)
   end
 
   # Assert equality while supporting tolerance for floating point comparisons.
@@ -300,7 +356,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
     nodes_fixture.each do |node|
       payload = { node["node_id"] => build_node_payload(node) }
       post "/api/nodes", payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
     end
   end
@@ -312,7 +368,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
     messages_fixture.each do |message|
       payload = message.reject { |key, _| key == "node" }
       post "/api/messages", payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
     end
   end
@@ -324,7 +380,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
   def import_positions_fixture(limit: positions_fixture.size)
     positions_fixture.first(limit).each do |position|
       post "/api/positions", position.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
     end
   end
@@ -1012,26 +1068,23 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       it "returns the sanitized domain when configuration is present" do
         ENV.delete("APP_ENV")
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", " Example.Org ") do
-          expect(application_class.self_instance_domain).to eq("example.org")
-        end
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", " Example.Org ")
+        expect(application_class.self_instance_domain).to eq("example.org")
       end
 
       it "returns nil when the domain is unavailable outside production" do
         ENV["APP_ENV"] = "development"
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", nil) do
-          expect(application_class.self_instance_domain).to be_nil
-        end
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", nil)
+        expect(application_class.self_instance_domain).to be_nil
       end
 
       it "raises when the domain is unavailable in production" do
         ENV["APP_ENV"] = "production"
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", nil) do
-          expect { application_class.self_instance_domain }.to raise_error(
-            RuntimeError,
-            "INSTANCE_DOMAIN could not be determined",
-          )
-        end
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", nil)
+        expect { application_class.self_instance_domain }.to raise_error(
+          RuntimeError,
+          "INSTANCE_DOMAIN could not be determined",
+        )
       end
     end
 
@@ -1039,67 +1092,60 @@ RSpec.describe "Potato Mesh Sinatra app" do
       let(:domain) { "spec.mesh.test" }
 
       it "rejects registration when the domain source is not the environment" do
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :reverse_dns) do
-          allowed, reason = application_class.self_instance_registration_decision(domain)
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :reverse_dns)
+        allowed, reason = application_class.self_instance_registration_decision(domain)
 
-          expect(allowed).to be(false)
-          expect(reason).to eq("INSTANCE_DOMAIN source is reverse_dns")
-        end
+        expect(allowed).to be(false)
+        expect(reason).to eq("INSTANCE_DOMAIN source is reverse_dns")
       end
 
       it "rejects registration when the domain is invalid" do
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment) do
-          allowed, reason = application_class.self_instance_registration_decision(nil)
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment)
+        allowed, reason = application_class.self_instance_registration_decision(nil)
 
-          expect(allowed).to be(false)
-          expect(reason).to eq("INSTANCE_DOMAIN missing or invalid")
-        end
+        expect(allowed).to be(false)
+        expect(reason).to eq("INSTANCE_DOMAIN missing or invalid")
       end
 
       it "rejects registration when the domain resolves to a restricted IP" do
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment) do
-          allowed, reason = application_class.self_instance_registration_decision("127.0.0.1")
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment)
+        allowed, reason = application_class.self_instance_registration_decision("127.0.0.1")
 
-          expect(allowed).to be(false)
-          expect(reason).to eq("INSTANCE_DOMAIN resolves to restricted IP")
-        end
+        expect(allowed).to be(false)
+        expect(reason).to eq("INSTANCE_DOMAIN resolves to restricted IP")
       end
 
       it "accepts registration when configuration is valid" do
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment) do
-          allowed, reason = application_class.self_instance_registration_decision(domain)
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment)
+        allowed, reason = application_class.self_instance_registration_decision(domain)
 
-          expect(allowed).to be(true)
-          expect(reason).to be_nil
-        end
+        expect(allowed).to be(true)
+        expect(reason).to be_nil
       end
     end
 
     describe ".ensure_self_instance_record!" do
       it "persists the self instance when registration is allowed" do
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment) do
-          stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", "self.mesh") do
-            with_db do |db|
-              db.execute("DELETE FROM instances")
-            end
-
-            application_class.ensure_self_instance_record!
-
-            expect(instance_count).to eq(1)
-          end
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :environment)
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", "self.mesh")
+        with_db do |db|
+          db.execute("DELETE FROM instances")
         end
+
+        application_class.ensure_self_instance_record!
+
+        expect(instance_count).to eq(1)
       end
 
       it "skips persistence when registration is not allowed" do
-        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :reverse_dns) do
-          with_db do |db|
-            db.execute("DELETE FROM instances")
-          end
-
-          application_class.ensure_self_instance_record!
-
-          expect(instance_count).to eq(0)
+        stub_const("PotatoMesh::Application::INSTANCE_DOMAIN_SOURCE", :reverse_dns)
+        with_db do |db|
+          db.execute("DELETE FROM instances")
         end
+
+        application_class.ensure_self_instance_record!
+
+        expect(instance_count).to eq(0)
       end
     end
   end
@@ -1189,6 +1235,23 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       expect(application_class.latest_node_update_timestamp).to be_nil
     end
+
+    it "ignores opted-out nodes when computing the freshness hint" do
+      marker = PotatoMesh::Config.node_opt_out_marker
+      with_db do |db|
+        db.execute("DELETE FROM nodes")
+        db.execute(
+          "INSERT INTO nodes (node_id, long_name, last_heard) VALUES (?, ?, ?)",
+          ["!visible", "Visible Node", 100],
+        )
+        db.execute(
+          "INSERT INTO nodes (node_id, long_name, last_heard) VALUES (?, ?, ?)",
+          ["!silenced", "Silenced #{marker} Node", 500],
+        )
+      end
+
+      expect(application_class.latest_node_update_timestamp).to eq(100)
+    end
   end
 
   describe ".build_well_known_document" do
@@ -1198,16 +1261,22 @@ RSpec.describe "Potato Mesh Sinatra app" do
         db.execute("INSERT INTO nodes (node_id, last_heard) VALUES (?, ?)", ["node-z", 321])
       end
 
-      stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", "Example.NET") do
-        json_output, signature = application_class.build_well_known_document
-        document = JSON.parse(json_output)
+      # NOTE: stub_const does not take a block (the previous block form silently
+      # skipped every assertion below).  Stub for the example, then assert inline.
+      stub_const("PotatoMesh::Application::INSTANCE_DOMAIN", "Example.NET")
+      json_output, signature = application_class.build_well_known_document
+      document = JSON.parse(json_output)
 
-        expect(document["domain"]).to eq("example.net")
-        expect(document["lastUpdate"]).to eq(321)
-        expect(document["signatureAlgorithm"]).to eq("rsa-sha256")
-        expect(signature).to be_a(String)
-        expect(signature).not_to be_empty
-      end
+      # v2 well-known is snake_case with a signature_version marker (SPEC FS1/FS3).
+      expect(document["domain"]).to eq("example.net")
+      expect(document["last_update"]).to eq(321)
+      expect(document["signature_algorithm"]).to eq("rsa-sha256")
+      expect(document["signature_version"]).to eq(2)
+      expect(document["public_key"]).to eq(application_class::INSTANCE_PUBLIC_KEY_PEM)
+      expect(document).not_to have_key("lastUpdate")
+      expect(document).not_to have_key("signatureAlgorithm")
+      expect(signature).to be_a(String)
+      expect(signature).not_to be_empty
     end
   end
 
@@ -1244,8 +1313,11 @@ RSpec.describe "Potato Mesh Sinatra app" do
       Sinatra::Application.apply_logger_level!
     end
 
-    it "defaults to WARN when debug logging is disabled" do
-      expect(Sinatra::Application.settings.logger.level).to eq(Logger::WARN)
+    it "defaults to INFO when debug logging is disabled" do
+      # WARN-only hid operational milestones (e.g. retention purges already
+      # promoted to info_log) and made federation cycles invisible to
+      # operators.  INFO is the documented default; DEBUG=1 raises verbosity.
+      expect(Sinatra::Application.settings.logger.level).to eq(Logger::INFO)
     end
 
     it "switches to DEBUG when debug logging is enabled" do
@@ -1297,6 +1369,18 @@ RSpec.describe "Potato Mesh Sinatra app" do
     it "responds successfully" do
       get "/"
       expect(last_response).to be_ok
+    end
+
+    it "does not render the Refresh button or last-updated field" do
+      get "/"
+
+      expect(last_response).to be_ok
+      # Live SSE updates replace manual refresh + a timestamp (VF1).
+      expect(last_response.body).not_to include('id="refreshBtn"')
+      expect(last_response.body).not_to include('id="status"')
+      expect(last_response.body).not_to include('class="refresh-timestamp"')
+      # The play/pause toggle is kept.
+      expect(last_response.body).to include('id="autorefreshToggle"')
     end
 
     it "includes the application version in the footer" do
@@ -1380,8 +1464,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('id="map"')
       expect(last_response.body).to include('id="filterInput"')
       expect(last_response.body).not_to include('id="autoRefresh"')
-      expect(last_response.body).to include('id="refreshBtn"')
-      expect(last_response.body).to include('id="status"')
+      expect(last_response.body).not_to include('id="refreshBtn"')
+      expect(last_response.body).not_to include('id="status"')
+      expect(last_response.body).to include('id="autorefreshToggle"')
       expect(last_response.body).not_to include('id="fitBounds"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
     end
@@ -1437,8 +1522,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('class="chat-panel chat-panel--full"')
       expect(last_response.body).to include('id="filterInput"')
       expect(last_response.body).not_to include('id="autoRefresh"')
-      expect(last_response.body).to include('id="refreshBtn"')
-      expect(last_response.body).to include('id="status"')
+      expect(last_response.body).not_to include('id="refreshBtn"')
+      expect(last_response.body).not_to include('id="status"')
+      expect(last_response.body).to include('id="autorefreshToggle"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
     end
 
@@ -1461,8 +1547,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('id="nodes"')
       expect(last_response.body).to include('id="filterInput"')
       expect(last_response.body).not_to include('id="autoRefresh"')
-      expect(last_response.body).to include('id="refreshBtn"')
-      expect(last_response.body).to include('id="status"')
+      expect(last_response.body).not_to include('id="refreshBtn"')
+      expect(last_response.body).not_to include('id="status"')
+      expect(last_response.body).to include('id="autorefreshToggle"')
       expect(last_response.body).not_to include('<footer class="app-footer">')
     end
   end
@@ -1660,6 +1747,32 @@ RSpec.describe "Potato Mesh Sinatra app" do
           db&.close
         end
         true
+      end
+    end
+
+    it "accepts snake_case optional fields on POST /api/instances" do
+      contact = "#room:example.org"
+      signed_attrs = instance_attributes.merge(contact_link: contact)
+      signature = Base64.strict_encode64(
+        instance_key.sign(OpenSSL::Digest::SHA256.new, canonical_instance_payload(signed_attrs)),
+      )
+      # snake_case contact_link plus the existing camelCase keys — third-party
+      # callers may send either casing (the camelCase keys stay accepted too).
+      snake_payload = instance_payload.merge(
+        "contact_link" => contact,
+        "signature" => signature,
+      )
+
+      post "/api/instances", snake_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+      expect(last_response.status).to eq(201)
+      with_db(readonly: true) do |db|
+        db.results_as_hash = true
+        row = db.get_first_row(
+          "SELECT contact_link FROM instances WHERE id = ?",
+          [instance_attributes[:id]],
+        )
+        expect(row["contact_link"]).to eq(contact)
       end
     end
 
@@ -2669,8 +2782,13 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       expect(self_entry).not_to be_nil
       expect(self_entry["domain"]).not_to be_nil
-      expect(self_entry["isPrivate"]).to eq(false)
+      expect(self_entry["is_private"]).to eq(false)
       expect(self_entry["signature"]).not_to be_nil
+      expect(self_entry["signature_version"]).to eq(2)
+      # FS-A4: wire is snake_case only — no camelCase keys leak through.
+      expect(self_entry).not_to have_key("isPrivate")
+      expect(self_entry).not_to have_key("lastUpdateTime")
+      expect(self_entry).not_to have_key("nodesCount")
     end
 
     it "exposes validated instance records from fixture data" do
@@ -2723,7 +2841,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       expect(remote_entry).not_to be_nil
       expect(remote_entry["domain"]).to eq("remote.example")
-      expect(remote_entry["isPrivate"]).to eq(false)
+      expect(remote_entry["is_private"]).to eq(false)
       expect(remote_entry["signature"]).to eq(remote_signature)
     end
 
@@ -2990,7 +3108,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/nodes", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       with_db(readonly: true) do |db|
         db.results_as_hash = true
@@ -3025,7 +3143,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/nodes", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       with_db(readonly: true) do |db|
         db.results_as_hash = true
@@ -3059,7 +3177,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/nodes", nodeinfo_payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       with_db(readonly: true) do |db|
         db.results_as_hash = true
@@ -3119,7 +3237,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/nodes", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -3154,7 +3272,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/nodes", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
       expect(call_count).to be >= 2
 
@@ -3202,21 +3320,21 @@ RSpec.describe "Potato Mesh Sinatra app" do
       it "does not overwrite a real name with a meshtastic generic fallback" do
         seed_node(long_name: "Peter's Node")
         post_long_name("Meshtastic BEEF")
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(stored_long_name).to eq("Peter's Node")
       end
 
       it "writes a generic fallback when no name is on record" do
         seed_node
         post_long_name("Meshtastic BEEF")
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(stored_long_name).to eq("Meshtastic BEEF")
       end
 
       it "overwrites a generic fallback with a real name" do
         seed_node(long_name: "Meshtastic BEEF")
         post_long_name("Peter's Node")
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(stored_long_name).to eq("Peter's Node")
       end
 
@@ -3228,7 +3346,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
              auth_headers
         seed_node(long_name: "Peter's Node")
         post_long_name("Meshcore BEEF", ingestor: ingestor_id)
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(stored_long_name).to eq("Peter's Node")
       end
     end
@@ -3376,9 +3494,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
     def post_twice_for_ingestor(endpoint, first_payload, second_payload)
       post endpoint, first_payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       post endpoint, second_payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
     end
 
     it "persists messages from fixture data" do
@@ -3444,9 +3562,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
       }
 
       post "/api/messages", parent_payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       post "/api/messages", reaction_payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       with_db(readonly: true) do |db|
         db.results_as_hash = true
@@ -3508,7 +3626,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -3543,7 +3661,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       with_db(readonly: true) do |db|
         count = db.get_first_value("SELECT COUNT(*) FROM nodes WHERE node_id = '!ffffffff'")
         expect(count).to eq(0)
@@ -3566,7 +3684,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -3635,7 +3753,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         }
 
         post "/api/nodes", node_payload.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
 
         rx_time = reference_time.to_i - 120
         position_time = rx_time - 30
@@ -3667,7 +3785,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/positions", position_payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -3731,7 +3849,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/positions", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
 
         with_db(readonly: true) do |db|
           db.results_as_hash = true
@@ -3760,7 +3878,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/positions", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -3824,7 +3942,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/positions", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
 
         with_db(readonly: true) do |db|
           db.results_as_hash = true
@@ -3900,7 +4018,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/neighbors", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -3974,7 +4092,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/neighbors", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -3997,7 +4115,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/neighbors", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -4035,9 +4153,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
         }
 
         post "/api/neighbors", seed_payload.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         post "/api/neighbors", empty_payload.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
 
         with_db(readonly: true) do |db|
           remaining = db.get_first_value(SELECT_NEIGHBOR_COUNT_BY_NODE_SQL, [NEIGHBOR_EMPTY_UPDATE_ROOT_ID])
@@ -4093,9 +4211,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
         }
 
         post "/api/neighbors", initial.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         post "/api/neighbors", update.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
 
         with_db(readonly: true) do |db|
           db.results_as_hash = true
@@ -4126,9 +4244,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
         }
 
         post "/api/neighbors", initial.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         post "/api/neighbors", update.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
 
         with_db(readonly: true) do |db|
           count = db.get_first_value(
@@ -4167,7 +4285,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/neighbors", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -4186,7 +4304,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/telemetry", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -4368,7 +4486,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/telemetry", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect_stored_telemetry_type(24_001, "device")
       end
 
@@ -4384,7 +4502,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/telemetry", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect_stored_telemetry_type(24_002, "environment")
       end
 
@@ -4402,7 +4520,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/telemetry", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect_stored_telemetry_type(24_003, "power")
       end
 
@@ -4418,7 +4536,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/telemetry", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
 
         get "/api/telemetry/!teltype04", {}, auth_headers
 
@@ -4441,7 +4559,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/telemetry", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect_stored_telemetry_type(24_005, "air_quality")
       end
 
@@ -4458,7 +4576,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/telemetry", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         # Invalid explicit type must be discarded; device_metrics inference takes over.
         expect_stored_telemetry_type(24_006, "device")
       end
@@ -4484,7 +4602,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/traces", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -4554,7 +4672,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/traces", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -4645,7 +4763,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
       }
 
       post "/api/nodes", node_payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       messages_payload = [
         {
@@ -4665,7 +4783,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", messages_payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -4745,9 +4863,9 @@ RSpec.describe "Potato Mesh Sinatra app" do
       receiver_payload["num"] = receiver_num
 
       post "/api/nodes", { sender_id => sender_payload }.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       post "/api/nodes", { receiver_id => receiver_payload }.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       encrypted_b64 = Base64.strict_encode64("secret message")
       payload = {
@@ -4766,7 +4884,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -4845,7 +4963,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/messages", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -4925,7 +5043,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
         post "/api/messages", payload.to_json, auth_headers
 
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         with_db(readonly: true) do |db|
@@ -5019,7 +5137,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -5173,7 +5291,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -5915,7 +6033,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -5939,7 +6057,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", payload.to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -5978,7 +6096,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
       post "/api/messages", base_payload.merge("from_id" => nil).to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -6000,7 +6118,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         "from_id" => " ",
       ).to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -6021,7 +6139,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         "from" => "!spec-sender",
       ).to_json, auth_headers
 
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
       expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
       with_db(readonly: true) do |db|
@@ -6037,6 +6155,204 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "GET /api/nodes" do
+    # Regression-style coverage for SPEC BP1-BP6: more than MAX_QUERY_LIMIT
+    # nodes inside the seven-day window must all remain reachable by paging
+    # backward with an inclusive `before` cursor (the `meshint` 1000-node cap).
+    it "exposes every in-window node through before pagination" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+
+      cap = PotatoMesh::App::Queries::MAX_QUERY_LIMIT
+      total = cap + 500
+      # Seed more than one page of nodes, all inside the seven-day window, each
+      # with a distinct last_heard so the keyset cursor is unambiguous.
+      with_db do |db|
+        db.transaction do
+          total.times do |i|
+            lh = now - 60 - i * 30
+            db.execute(
+              "INSERT INTO nodes(node_id, num, short_name, long_name, hw_model, role, last_heard, first_heard) VALUES(?,?,?,?,?,?,?,?)",
+              ["!%08x" % (0x1000 + i), 0x1000 + i, "n#{i}", "Node #{i}", "TBEAM", "CLIENT", lh, lh],
+            )
+          end
+        end
+      end
+
+      # Walk the listing the way an external client (l5yth/meshint) must: pull a
+      # page, then ask for everything at-or-before the oldest last_heard already
+      # seen.  Without an upper-bound cursor the server cannot return anything
+      # past the newest `cap` rows, so the walk would stall before reaching them.
+      recovered = walk_before("/api/nodes", id_key: "node_id", sort_key: "last_heard")
+
+      expect(recovered.size).to eq(total)
+    end
+
+    it "before cannot widen the window past the floor and ignores a non-positive cursor" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      stale_last = now - (PotatoMesh::Config.week_seconds + 4 * 60 * 60)
+      fresh_last = now - 30
+
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard) VALUES(?,?,?,?,?,?,?)",
+          ["!stalenode", "stal", "Stale", "TBEAM", "CLIENT", stale_last, stale_last],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard) VALUES(?,?,?,?,?,?,?)",
+          ["!freshnode", "frsh", "Fresh", "TBEAM", "CLIENT", fresh_last, fresh_last],
+        )
+      end
+
+      # A `before` at "now" cannot reach the stale row: the seven-day floor still
+      # clamps the lower bound, so `before` only ever narrows, never widens.
+      get "/api/nodes?before=#{now}"
+      expect(last_response).to be_ok
+      ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+      expect(ids).to include("!freshnode")
+      expect(ids).not_to include("!stalenode")
+
+      # A `before` older than the floor returns nothing beyond the floor (the only
+      # in-window row is newer than this ceiling, so the result is empty).
+      get "/api/nodes?before=#{stale_last}"
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body)).to be_empty
+
+      # A non-positive / non-integer `before` is ignored (treated as absent), so
+      # the fresh row still comes back rather than being filtered by a bogus
+      # ceiling — parity with the /api/messages coercion.
+      ["0", "-5", "abc"].each do |bogus|
+        get "/api/nodes?before=#{bogus}"
+        expect(last_response).to be_ok
+        ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+        expect(ids).to include("!freshnode"), "before=#{bogus} should be ignored"
+      end
+    end
+
+    it "before pagination boundary is inclusive and protocol-neutral" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      boundary = now - 100
+
+      with_db do |db|
+        # Two nodes sharing the exact boundary last_heard, one per protocol, plus
+        # a newer node above the boundary.
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard, protocol) VALUES(?,?,?,?,?,?,?,?)",
+          ["!edgecore0", "ec", "Edge Core", "TBEAM", "CLIENT", boundary, boundary, "meshcore"],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard, protocol) VALUES(?,?,?,?,?,?,?,?)",
+          ["!edgetast0", "et", "Edge Tastic", "TBEAM", "CLIENT", boundary, boundary, "meshtastic"],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard, protocol) VALUES(?,?,?,?,?,?,?,?)",
+          ["!newer0001", "nw", "Newer", "TBEAM", "CLIENT", now - 10, now - 10, "meshcore"],
+        )
+      end
+
+      # Inclusive <= ceiling: both rows sharing the boundary second are returned
+      # when the boundary is used as `before` (the one-row overlap a client dedups).
+      get "/api/nodes?before=#{boundary}"
+      expect(last_response).to be_ok
+      ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+      expect(ids).to include("!edgecore0", "!edgetast0")
+      expect(ids).not_to include("!newer0001")
+
+      # `before` composes with `protocol`, privileging neither protocol.
+      get "/api/nodes?before=#{boundary}&protocol=meshcore"
+      expect(last_response).to be_ok
+      ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+      expect(ids).to eq(["!edgecore0"])
+    end
+
+    it "before pagination honors privacy and opt-out filters" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      marker = PotatoMesh::Config.node_opt_out_marker
+
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard) VALUES(?,?,?,?,?,?,?)",
+          ["!plainnode", "pln", "Plain", "TBEAM", "CLIENT", now - 50, now - 50],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard) VALUES(?,?,?,?,?,?,?)",
+          ["!optoutnod", "opt", "Quiet #{marker} One", "TBEAM", "CLIENT", now - 60, now - 60],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, last_heard, first_heard) VALUES(?,?,?,?,?,?,?)",
+          ["!hiddennod", "hid", "Hidden", "TBEAM", "CLIENT_HIDDEN", now - 70, now - 70],
+        )
+      end
+
+      # A backward-paginated request still applies the opt-out filter: a node
+      # carrying the marker never appears even when within the `before` ceiling.
+      get "/api/nodes?before=#{now}"
+      expect(last_response).to be_ok
+      ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+      expect(ids).to include("!plainnode")
+      expect(ids).not_to include("!optoutnod")
+
+      # In private mode the CLIENT_HIDDEN exclusion also still applies under a
+      # `before` walk — narrowing can never surface a hidden row (Invariant II).
+      allow(PotatoMesh::Config).to receive(:private_mode_enabled?).and_return(true)
+      get "/api/nodes?before=#{now}"
+      expect(last_response).to be_ok
+      ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+      expect(ids).to include("!plainnode")
+      expect(ids).not_to include("!hiddennod")
+      expect(ids).not_to include("!optoutnod")
+    end
+
+    it "before bypasses the response cache" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      # Start from a clean cache so a prior example's entry cannot mask the
+      # behaviour under test (the store is process-global with a monotonic TTL).
+      PotatoMesh::App::ApiCache.invalidate_all
+
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, last_heard, first_heard) VALUES(?,?,?)",
+          ["!cacheaaaa", now - 50, now - 50],
+        )
+      end
+
+      # Prime the newest-page cache with just node A.
+      get "/api/nodes?limit=3"
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body).map { |r| r["node_id"] }).to eq(["!cacheaaaa"])
+
+      # Insert node B directly (no POST, so the cache is not invalidated).
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, last_heard, first_heard) VALUES(?,?,?)",
+          ["!cachebbbb", now - 40, now - 40],
+        )
+      end
+
+      # A plain request is still served the cached page (proves the cache is live).
+      get "/api/nodes?limit=3"
+      expect(JSON.parse(last_response.body).map { |r| r["node_id"] }).to eq(["!cacheaaaa"])
+
+      # A `before` request bypasses the cache and sees the fresh node B.
+      get "/api/nodes?limit=3&before=#{now}"
+      expect(last_response).to be_ok
+      before_ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+      expect(before_ids).to include("!cacheaaaa", "!cachebbbb")
+
+      # Issuing the `before` request did not overwrite the hot newest-page cache
+      # entry — a subsequent plain request still returns the cached page.
+      get "/api/nodes?limit=3"
+      expect(JSON.parse(last_response.body).map { |r| r["node_id"] }).to eq(["!cacheaaaa"])
+    end
+
     it "returns the stored nodes with derived timestamps" do
       import_nodes_fixture
 
@@ -6051,7 +6367,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
       end
 
       nodes_fixture.each do |node|
-        expected = expected_node_row(node)
+        expected = expected_api_node_row(node)
         actual_row = actual_by_id.fetch(node["node_id"])
 
         expected.each do |key, value|
@@ -6065,11 +6381,13 @@ RSpec.describe "Potato Mesh Sinatra app" do
           expect(actual_row).not_to have_key("last_seen_iso")
         end
 
-        if node["position_time"]
-          expected_pos_iso = Time.at(node["position_time"]).utc.iso8601
-          expect(actual_row["pos_time_iso"]).to eq(expected_pos_iso)
-        else
-          expect(actual_row).not_to have_key("pos_time_iso")
+        raw_position_time = node["position_time"]
+        # I2: the redundant position ISO key is dropped — only `position_time`
+        # (unix int) is emitted; clients format it. The 0-sentinel still yields no
+        # `position_time` at all (issue #782, `coerce_positive_or_nil`).
+        expect(actual_row).not_to have_key("pos_time_iso")
+        if raw_position_time.is_a?(Numeric) && raw_position_time > 0
+          expect(actual_row["position_time"]).to eq(raw_position_time)
         end
       end
     end
@@ -6200,6 +6518,99 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(payload).not_to have_key("short_name")
       expect(payload).not_to have_key("hw_model")
     end
+
+    # Regression for issue #782: when a legacy row stores `position_time = 0`
+    # (the Meshtastic "no GPS lock" sentinel), the API used to leak the field
+    # back as `"1970-01-01T00:00:00Z"` because Ruby treated `0` as truthy in
+    # the guard around `Time.at(pt).iso8601`.  After routing the column through
+    # `coerce_positive_or_nil`, neither `position_time` nor `pos_time_iso` may
+    # appear in the JSON response.
+    it "never leaks 1970-01-01 ISO strings for sentinel position_time = 0" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, num, short_name, role, last_heard, first_heard, position_time, latitude, longitude) " \
+          "VALUES(?,?,?,?,?,?,?,?,?)",
+          ["!sentinel", 0x5e_57_1e_71, "snt", "CLIENT", now, now, 0, 0.0, 0.0],
+        )
+      end
+
+      get "/api/nodes"
+
+      expect(last_response).to be_ok
+      body = last_response.body
+      expect(body).not_to include("1970-01-01")
+      entry = JSON.parse(body).find { |row| row["node_id"] == "!sentinel" }
+      expect(entry).not_to be_nil
+      expect(entry).not_to have_key("pos_time_iso")
+      expect(entry).not_to have_key("position_time")
+    end
+  end
+
+  describe "API casing consistency" do
+    it "exposes the /version config block in snake_case" do
+      get "/version"
+      expect(last_response).to be_ok
+      payload = JSON.parse(last_response.body)
+      cfg = payload["config"]
+      expect(cfg).to include(
+        "site_name", "map_center", "private_mode", "instance_domain",
+        "contact_link", "contact_link_url", "max_distance_km",
+        "refresh_interval_seconds"
+      )
+      expect(cfg["map_center"]).to include("lat", "lon")
+      # The pre-0.7.0 camelCase config keys are gone (breaking /version change).
+      %w[siteName mapCenter privateMode instanceDomain contactLink contactLinkUrl maxDistanceKm refreshIntervalSeconds].each do |camel|
+        expect(cfg).not_to have_key(camel)
+      end
+      expect(payload).to have_key("last_node_update")
+      expect(payload).not_to have_key("lastNodeUpdate")
+    end
+
+    it "accepts snake_case node fields on POST /api/nodes alongside camelCase" do
+      now = reference_time.to_i
+      payload = {
+        "!aabbccdd" => {
+          "num" => 0xAABBCCDD,
+          "last_heard" => now,
+          "user" => { "short_name" => "SNAK", "long_name" => "Snake Case Node", "hw_model" => "TBEAM" },
+          "device_metrics" => { "battery_level" => 77 },
+          "position" => { "latitude" => 52.0, "longitude" => 13.0 },
+        },
+      }
+      post "/api/nodes", payload.to_json, auth_headers
+      expect(last_response.status).to eq(201)
+
+      get "/api/nodes?limit=1000"
+      row = JSON.parse(last_response.body).find { |r| r["node_id"] == "!aabbccdd" }
+      expect(row).not_to be_nil
+      expect(row["short_name"]).to eq("SNAK")
+      expect(row["long_name"]).to eq("Snake Case Node")
+      expect(row["hw_model"]).to eq("TBEAM")
+      expect(row["battery_level"]).to eq(77)
+    end
+  end
+
+  describe "POST ingest status codes" do
+    it "returns 201 Created on a successful node ingest (consistent with /api/instances)" do
+      payload = { "!c0debabe" => { "num" => 0xC0DEBABE, "last_heard" => reference_time.to_i } }
+      post "/api/nodes", payload.to_json, auth_headers
+      expect(last_response.status).to eq(201)
+      expect(JSON.parse(last_response.body)).to eq("status" => "ok")
+    end
+  end
+
+  describe "POST payload validation" do
+    %w[messages positions telemetry neighbors traces].each do |endpoint|
+      it "rejects a non-array/non-object payload on /api/#{endpoint} with 400" do
+        post "/api/#{endpoint}", '"garbage"', auth_headers
+        expect(last_response.status).to eq(400)
+        expect(JSON.parse(last_response.body)).to eq("error" => "invalid payload")
+      end
+    end
   end
 
   describe "GET /api/stats" do
@@ -6246,24 +6657,94 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       payload = JSON.parse(last_response.body)
       expect(payload["sampled"]).to eq(false)
-      expect(payload["active_nodes"]).to include(
+      expect(payload["total"]["nodes"]).to include(
         "hour" => 1005,
         "day" => 1005,
         "week" => 1006,
         "month" => 1007,
       )
-      expect(payload["meshcore"]).to include(
+      expect(payload["meshcore"]["nodes"]).to include(
         "hour" => 5,
         "day" => 5,
         "week" => 5,
         "month" => 5,
       )
-      expect(payload["meshtastic"]).to include(
+      expect(payload["meshtastic"]["nodes"]).to include(
         "hour" => 1000,
         "day" => 1000,
         "week" => 1001,
         "month" => 1002,
       )
+      # The pre-0.7.0 flat key is gone (breaking change).
+      expect(payload).not_to have_key("active_nodes")
+      # reticulum is an always-zero forward-looking stub.
+      expect(payload["reticulum"]["nodes"].values).to all(eq(0))
+      expect(payload["reticulum"]["messages"].values).to all(eq(0))
+      expect(payload["reticulum"]["telemetry"].values).to all(eq(0))
+    end
+
+    it "counts messages and the telemetry umbrella with per-protocol breakdowns" do
+      clear_database
+      now = reference_time.to_i
+      allow(Time).to receive(:now).and_return(reference_time)
+      rx_iso = reference_time.utc.iso8601
+
+      with_db do |db|
+        # Seed the nodes the neighbor row references (neighbors has FK → nodes,
+        # and app_spec enables PRAGMA foreign_keys = ON).
+        db.execute("INSERT INTO nodes(node_id, num, last_heard, first_heard, role) VALUES (?,?,?,?,?)", ["!bbbb0001", 0xBBBB0001, now, now, "CLIENT"])
+        db.execute("INSERT INTO nodes(node_id, num, last_heard, first_heard, role) VALUES (?,?,?,?,?)", ["!cccc0001", 0xCCCC0001, now, now, "CLIENT"])
+        db.execute(
+          "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text, protocol) VALUES (?,?,?,?,?,?,?,?)",
+          [1, now, rx_iso, "!aaaa0001", "!ffffffff", 0, "mc hi", "meshcore"],
+        )
+        db.execute(
+          "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text, protocol) VALUES (?,?,?,?,?,?,?,?)",
+          [2, now, rx_iso, "!bbbb0001", "!ffffffff", 0, "mt hi", "meshtastic"],
+        )
+        # Telemetry umbrella: one row in each contributing table (meshtastic default).
+        db.execute("INSERT INTO positions(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!bbbb0001"])
+        db.execute("INSERT INTO telemetry(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!bbbb0001"])
+        db.execute("INSERT INTO neighbors(node_id, neighbor_id, rx_time) VALUES (?,?,?)", ["!bbbb0001", "!cccc0001", now])
+        db.execute("INSERT INTO traces(id, rx_time, rx_iso, src, dest) VALUES (?,?,?,?,?)", [1, now, rx_iso, 1, 2])
+      end
+
+      get "/api/stats"
+      payload = JSON.parse(last_response.body)
+
+      expect(payload["total"]["messages"]["hour"]).to eq(2)
+      expect(payload["meshcore"]["messages"]["hour"]).to eq(1)
+      expect(payload["meshtastic"]["messages"]["hour"]).to eq(1)
+      # positions + telemetry + neighbors + traces, all meshtastic-default → 4.
+      expect(payload["total"]["telemetry"]["hour"]).to eq(4)
+      expect(payload["meshtastic"]["telemetry"]["hour"]).to eq(4)
+    end
+
+    it "zeroes message counts but keeps node counts in private mode" do
+      ENV["PRIVATE"] = "1"
+      clear_database
+      now = reference_time.to_i
+      allow(Time).to receive(:now).and_return(reference_time)
+      rx_iso = reference_time.utc.iso8601
+
+      with_db do |db|
+        db.execute(
+          INSERT_NODE_WITH_METADATA_SQL,
+          ["!node0001", 1, "n", "Node", "TBEAM", "CLIENT", now, now],
+        )
+        db.execute(
+          "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES (?,?,?,?,?,?,?)",
+          [1, now, rx_iso, "!node0001", "!ffffffff", 0, "secret"],
+        )
+      end
+
+      get "/api/stats"
+      payload = JSON.parse(last_response.body)
+
+      # PRIVATE=1 forces every message count to zero (SPEC S5 / Invariant II)...
+      expect(payload["total"]["messages"].values).to all(eq(0))
+      # ...while node counts remain visible.
+      expect(payload["total"]["nodes"]["hour"]).to eq(1)
     end
   end
 
@@ -6372,7 +6853,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
         }
 
         post "/api/messages", payload.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
         expect(JSON.parse(last_response.body)).to eq("status" => "ok")
 
         get "/api/messages"
@@ -6458,6 +6939,81 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response).to be_ok
       scoped_since = JSON.parse(last_response.body)
       expect(scoped_since.map { |row| row["id"] }).to eq([2])
+    end
+
+    # Regression for issue #796: more than MAX_QUERY_LIMIT messages inside the
+    # seven-day window must all remain reachable.  Before the fix the feed had
+    # no upper-bound cursor, so paging stalled at the newest 1000 rows and every
+    # older in-window message was invisible.
+    it "exposes every in-window message through backward pagination (issue #796)" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+
+      cap = PotatoMesh::App::Queries::MAX_QUERY_LIMIT
+      total = cap + 500
+      # Seed more than one page of messages, all comfortably inside the
+      # seven-day window, each with a distinct rx_time so the keyset cursor is
+      # unambiguous.
+      with_db do |db|
+        db.transaction do
+          total.times do |i|
+            rx = now - 60 - i * 30
+            db.execute(
+              "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, portnum, text) VALUES(?,?,?,?,?,?,?,?)",
+              [1000 + i, rx, Time.at(rx).utc.iso8601, "!a", "!b", 0, "TEXT_MESSAGE_APP", "msg #{i}"],
+            )
+          end
+        end
+      end
+
+      # Walk the feed the way the dashboard client does: pull a page, then ask
+      # for everything at-or-before the oldest row already seen.  Without an
+      # upper-bound cursor the server cannot return anything past the newest
+      # `cap` rows, so the loop stalls and never reaches the older messages.
+      seen = {}
+      cursor = nil
+      pages = 0
+      loop do
+        url = "/api/messages?limit=#{cap}"
+        url += "&before=#{cursor}" if cursor
+        get url
+        expect(last_response).to be_ok
+        rows = JSON.parse(last_response.body)
+        # The per-request cap is unchanged: a single response never exceeds it.
+        expect(rows.size).to be <= cap
+        added = rows.reject { |row| seen.key?(row["id"]) }
+        added.each { |row| seen[row["id"]] = true }
+        pages += 1
+        break if rows.size < cap # window exhausted
+        break if added.empty?    # no progress (unfixed server ignores `before`)
+        break if pages >= 10     # hard safety bound against an infinite loop
+        cursor = rows.map { |row| row["rx_time"] }.min
+      end
+
+      expect(seen.size).to eq(total)
+    end
+
+    it "treats a non-positive before cursor as absent (issue #796)" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      with_db do |db|
+        db.execute(
+          "INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES(?,?,?,?,?,?,?)",
+          [42, now - 30, Time.at(now - 30).utc.iso8601, "!a", "!b", 0, "hi"],
+        )
+      end
+
+      # before=0 and before=-5 must be ignored (not used as a ceiling), so the
+      # row still comes back rather than being filtered out by a bogus cursor.
+      get "/api/messages?before=0"
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body).map { |r| r["id"] }).to eq([42])
+
+      get "/api/messages?before=-5"
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body).map { |r| r["id"] }).to eq([42])
     end
 
     it "clamps an explicit since older than the seven-day floor up to the floor" do
@@ -6586,6 +7142,65 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(ids).not_to include("!hidden")
     end
 
+    it "filters opted-out nodes (\u{1F6D1} in name) from the nodes API" do
+      clear_database
+      now = reference_time.to_i
+      marker = PotatoMesh::Config.node_opt_out_marker
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, snr, last_heard, first_heard) VALUES(?,?,?,?,?,?,?,?)",
+          ["!quiet001", "QT", "Quiet #{marker} Node", "TBEAM", "CLIENT", 1.0, now, now],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, hw_model, role, snr, last_heard, first_heard) VALUES(?,?,?,?,?,?,?,?)",
+          ["!loud0001", "LD", "Loud Node", "TBEAM", "CLIENT", 1.0, now, now],
+        )
+      end
+
+      get "/api/nodes?limit=10"
+      expect(last_response).to be_ok
+      ids = JSON.parse(last_response.body).map { |row| row["node_id"] }
+      expect(ids).to include("!loud0001")
+      expect(ids).not_to include("!quiet001")
+
+      # Per-id lookup must also pretend the opted-out node does not exist.
+      get "/api/nodes/!quiet001"
+      expect(last_response.status).to eq(404)
+    end
+
+    it "still ingests opted-out node data even though the API hides it" do
+      clear_database
+      marker = PotatoMesh::Config.node_opt_out_marker
+      payload = {
+        "!silenced" => {
+          "num" => 0xdead0001,
+          "lastHeard" => reference_time.to_i,
+          "user" => {
+            "shortName" => "SL",
+            "longName" => "Silenced #{marker} Node",
+          },
+        },
+      }
+      post "/api/nodes", payload.to_json, auth_headers
+      expect(last_response.status).to eq(201)
+
+      # The row exists in the database — opt-out is a display-time filter,
+      # not an ingestion-time refusal.
+      with_db(readonly: true) do |db|
+        row = db.execute("SELECT node_id, long_name FROM nodes WHERE node_id = ?", ["!silenced"]).first
+        expect(row).not_to be_nil
+        expect(row[1]).to include(marker)
+      end
+
+      # Bulk and per-id endpoints both omit the opted-out node.
+      get "/api/nodes"
+      ids = JSON.parse(last_response.body).map { |r| r["node_id"] }
+      expect(ids).not_to include("!silenced")
+
+      get "/api/nodes/!silenced"
+      expect(last_response.status).to eq(404)
+    end
+
     it "removes the chat interface from the homepage" do
       get "/"
 
@@ -6596,9 +7211,38 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(body).not_to include("Track nodes, messages, and coverage in real time.")
       expect(body).to include("Track nodes and coverage in real time.")
     end
+
+    it "tells the cold-load boot prefetch to skip message endpoints" do
+      get "/"
+
+      expect(last_response).to be_ok
+      # The boot prefetch reads data-pm-chat; in private mode it must be false so
+      # the early prefetch never requests /api/messages (mirrors the 404, PS6).
+      expect(last_response.body).to include('data-pm-chat="false"')
+    end
   end
 
   describe "GET /api/positions" do
+    it "exposes every in-window row through before pagination" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      total = PotatoMesh::App::Queries::MAX_QUERY_LIMIT + 5
+      with_db do |db|
+        db.transaction do
+          total.times do |i|
+            rx = now - 60 - i * 30
+            db.execute(
+              "INSERT INTO positions(id, node_id, rx_time, rx_iso, latitude, longitude) VALUES(?,?,?,?,?,?)",
+              [1000 + i, "!pos00001", rx, Time.at(rx).utc.iso8601, 1.0, 2.0],
+            )
+          end
+        end
+      end
+      recovered = walk_before("/api/positions", id_key: "id", sort_key: "rx_time")
+      expect(recovered.size).to eq(total)
+    end
+
     it "returns stored positions ordered by receive time" do
       node_id = "!specfetch"
       rx_times = [reference_time.to_i - 50, reference_time.to_i - 10]
@@ -6616,7 +7260,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
           "payload_b64" => "AQI=",
         }
         post "/api/positions", payload.to_json, auth_headers
-        expect(last_response).to be_ok
+        expect(last_response.status).to eq(201)
       end
 
       get "/api/positions?limit=1"
@@ -6630,7 +7274,8 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(entry["rx_time"]).to eq(rx_times.last)
       expect(entry["rx_iso"]).to eq(Time.at(rx_times.last).utc.iso8601)
       expect(entry["position_time"]).to eq(rx_times.last - 5)
-      expect(entry["position_time_iso"]).to eq(Time.at(rx_times.last - 5).utc.iso8601)
+      # I2: position ISO key dropped — only `position_time` (unix int) is emitted.
+      expect(entry).not_to have_key("position_time_iso")
       expect(entry["latitude"]).to eq(53.0)
       expect(entry["longitude"]).to eq(14.0)
       expect(entry["location_source"]).to eq("LOC_TEST")
@@ -6752,6 +7397,31 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "GET /api/neighbors" do
+    it "exposes every in-window row through before pagination" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      total = PotatoMesh::App::Queries::MAX_QUERY_LIMIT + 5
+      with_db do |db|
+        db.transaction do
+          # neighbors carries FK(node_id) and FK(neighbor_id) -> nodes(node_id),
+          # so both endpoints must exist as nodes before the relationship rows.
+          db.execute("INSERT INTO nodes(node_id, last_heard, first_heard) VALUES(?,?,?)", ["!nbr00001", now, now])
+          total.times do |i|
+            rx = now - 60 - i * 30
+            nbr = "!%08x" % (0x20000 + i)
+            db.execute("INSERT INTO nodes(node_id, last_heard, first_heard) VALUES(?,?,?)", [nbr, rx, rx])
+            db.execute(
+              "INSERT INTO neighbors(node_id, neighbor_id, rx_time) VALUES(?,?,?)",
+              ["!nbr00001", nbr, rx],
+            )
+          end
+        end
+      end
+      recovered = walk_before("/api/neighbors", id_key: "neighbor_id", sort_key: "rx_time")
+      expect(recovered.size).to eq(total)
+    end
+
     it "excludes neighbor records older than twenty-eight days from both bulk and per-id queries" do
       clear_database
       allow(Time).to receive(:now).and_return(reference_time)
@@ -6891,9 +7561,29 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "GET /api/telemetry" do
+    it "exposes every in-window row through before pagination" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      total = PotatoMesh::App::Queries::MAX_QUERY_LIMIT + 5
+      with_db do |db|
+        db.transaction do
+          total.times do |i|
+            rx = now - 60 - i * 30
+            db.execute(
+              "INSERT INTO telemetry(id, node_id, rx_time, rx_iso) VALUES(?,?,?,?)",
+              [1000 + i, "!tel00001", rx, Time.at(rx).utc.iso8601],
+            )
+          end
+        end
+      end
+      recovered = walk_before("/api/telemetry", id_key: "id", sort_key: "rx_time")
+      expect(recovered.size).to eq(total)
+    end
+
     it "returns stored telemetry ordered by receive time" do
       post "/api/telemetry", telemetry_fixture.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       get "/api/telemetry?limit=2"
 
@@ -7115,7 +7805,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
   describe "GET /api/telemetry/aggregated" do
     it "returns aggregated telemetry buckets for the requested interval" do
       post "/api/telemetry", telemetry_fixture.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       get "/api/telemetry/aggregated?windowSeconds=86400&bucketSeconds=300"
 
@@ -7164,7 +7854,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
 
     it "applies default window and bucket sizes when parameters are omitted" do
       post "/api/telemetry", telemetry_fixture.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       get "/api/telemetry/aggregated"
 
@@ -7295,13 +7985,45 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.status).to eq(400)
       expect(JSON.parse(last_response.body)).to eq("error" => "bucketSeconds too small for requested window")
     end
+
+    it "clamps windowSeconds to the 28-day visibility cap" do
+      # A 10-year window is well beyond four_weeks_seconds; the bucket size
+      # is selected so that under the natural 10-year window the bucket count
+      # would explode past MAX_QUERY_LIMIT and the route would return 400.
+      # When the cap kicks in correctly the request succeeds with HTTP 200.
+      huge_window = 10 * 365 * 24 * 60 * 60
+      bucket = PotatoMesh::Config.four_weeks_seconds / 100
+      get "/api/telemetry/aggregated?windowSeconds=#{huge_window}&bucketSeconds=#{bucket}"
+
+      expect(last_response).to be_ok
+    end
   end
 
   describe "GET /api/traces" do
+    it "exposes every in-window row through before pagination" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      total = PotatoMesh::App::Queries::MAX_QUERY_LIMIT + 5
+      with_db do |db|
+        db.transaction do
+          total.times do |i|
+            rx = now - 60 - i * 30
+            db.execute(
+              "INSERT INTO traces(id, rx_time, rx_iso) VALUES(?,?,?)",
+              [1000 + i, rx, Time.at(rx).utc.iso8601],
+            )
+          end
+        end
+      end
+      recovered = walk_before("/api/traces", id_key: "id", sort_key: "rx_time")
+      expect(recovered.size).to eq(total)
+    end
+
     it "returns stored traces ordered by receive time" do
       clear_database
       post "/api/traces", trace_fixture.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       get "/api/traces"
 
@@ -7326,7 +8048,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
     it "filters traces by node reference across sources" do
       clear_database
       post "/api/traces", trace_fixture.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       get "/api/traces/#{trace_fixture.first["src"]}"
 
@@ -7361,7 +8083,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
       ]
 
       post "/api/traces", payload.to_json, auth_headers
-      expect(last_response).to be_ok
+      expect(last_response.status).to eq(201)
 
       get "/api/traces"
 
@@ -7403,6 +8125,26 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "GET /api/ingestors" do
+    it "exposes every in-window row through before pagination" do
+      clear_database
+      allow(Time).to receive(:now).and_return(reference_time)
+      now = reference_time.to_i
+      total = PotatoMesh::App::Queries::MAX_QUERY_LIMIT + 5
+      with_db do |db|
+        db.transaction do
+          total.times do |i|
+            ls = now - 60 - i * 30
+            db.execute(
+              "INSERT INTO ingestors(node_id, start_time, last_seen_time, version) VALUES(?,?,?,?)",
+              ["!%08x" % (0x30000 + i), ls, ls, "1.0.0"],
+            )
+          end
+        end
+      end
+      recovered = walk_before("/api/ingestors", id_key: "node_id", sort_key: "last_seen_time")
+      expect(recovered.size).to eq(total)
+    end
+
     it "uses the twenty-eight-day extended window so slow-tick ingestors stay visible" do
       clear_database
       allow(Time).to receive(:now).and_return(reference_time)
@@ -7461,6 +8203,62 @@ RSpec.describe "Potato Mesh Sinatra app" do
     it "returns 404 when the node cannot be located" do
       get "/nodes/!deadbeef"
       expect(last_response.status).to eq(404)
+    end
+  end
+
+  describe "request-thread budget" do
+    it "sizes the Puma thread pool above the SSE subscriber cap (PS9)" do
+      threads = PotatoMesh::Application.settings.server_settings[:Threads]
+      expect(threads).to eq(PotatoMesh::Config.puma_threads_setting)
+      _min, max = threads.split(":").map(&:to_i)
+      expect(max).to be > PotatoMesh::App::PubSub::MAX_SUBSCRIBERS
+      expect(max - PotatoMesh::App::PubSub::MAX_SUBSCRIBERS).to be >= PotatoMesh::Config.sse_thread_reserve
+    end
+  end
+
+  describe "live-update shutdown handling" do
+    before { PotatoMesh::App::PubSub.reset! }
+
+    it "exposes force_shutdown_after to Puma via server_settings" do
+      expect(PotatoMesh::Application.settings.server_settings).to include(
+        force_shutdown_after: PotatoMesh::Config.puma_force_shutdown_seconds,
+      )
+    end
+
+    it "close_live_update_subscribers! closes every open SSE subscriber" do
+      PotatoMesh::App::PubSub.subscribe
+      PotatoMesh::App::PubSub.subscribe
+      expect(PotatoMesh::App::PubSub.subscriber_count).to eq(2)
+      PotatoMesh::Application.close_live_update_subscribers!
+      expect(PotatoMesh::App::PubSub.subscriber_count).to eq(0)
+    end
+
+    it "traps INT/TERM and the handler closes the SSE subscribers" do
+      trapped = {}
+      fake_trap = ->(signal, &block) { trapped[signal] = block }
+      PotatoMesh::Application.install_pubsub_shutdown_signal_handlers!(trap: fake_trap)
+      expect(trapped.keys).to contain_exactly(:INT, :TERM)
+
+      PotatoMesh::App::PubSub.subscribe
+      trapped.fetch(:INT).call # spawns a thread that closes subscribers
+      50.times do
+        break if PotatoMesh::App::PubSub.subscriber_count.zero?
+        sleep 0.01
+      end
+      expect(PotatoMesh::App::PubSub.subscriber_count).to eq(0)
+    end
+
+    it "close_live_update_subscribers! swallows errors from reset!" do
+      allow(PotatoMesh::App::PubSub).to receive(:reset!).and_raise(StandardError, "boom")
+      expect { PotatoMesh::Application.close_live_update_subscribers! }.not_to raise_error
+    end
+
+    it "run_server! installs the shutdown signal handlers, then runs" do
+      calls = []
+      allow(PotatoMesh::Application).to receive(:install_pubsub_shutdown_signal_handlers!) { calls << :install }
+      allow(PotatoMesh::Application).to receive(:run!) { calls << :run }
+      PotatoMesh::Application.run_server!
+      expect(calls).to eq(%i[install run])
     end
   end
 end

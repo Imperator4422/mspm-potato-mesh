@@ -155,17 +155,36 @@ module PotatoMesh
       # @param n [Hash] node payload extracted from the ingestor.
       # @param protocol [String] protocol identifier (default +meshtastic+).
       # @return [void]
+      # Read +hash[primary]+, falling back to the first present alias key. Lets the
+      # node ingest contract accept snake_case fields in addition to the Meshtastic
+      # camelCase the collector emits today; nil-aware so a boolean +false+ from the
+      # primary key is never discarded in favour of an alias.
+      #
+      # @param hash [Object] candidate mapping (ignored unless a Hash).
+      # @param primary [String] preferred key.
+      # @param aliases [Array<String>] fallback keys, tried in order.
+      # @return [Object, nil] first non-nil value, or nil.
+      def pick_alias(hash, primary, *aliases)
+        return nil unless hash.is_a?(Hash)
+        return hash[primary] unless hash[primary].nil?
+        aliases.each { |key| return hash[key] unless hash[key].nil? }
+        nil
+      end
+
       def upsert_node(db, node_id, n, protocol: "meshtastic")
         user = n["user"] || {}
-        met = n["deviceMetrics"] || {}
+        met = pick_alias(n, "deviceMetrics", "device_metrics") || {}
         pos = n["position"] || {}
         # nil when user info absent; COALESCE in the conflict clause preserves
         # the stored role rather than overwriting with a default.
         role = user["role"]
-        lh = coerce_integer(n["lastHeard"])
-        pt = coerce_integer(pos["time"])
+        lh = coerce_integer(pick_alias(n, "lastHeard", "last_heard"))
         now = Time.now.to_i
-        pt = nil if pt && pt > now
+        # Issue #782: drop Meshtastic "no GPS lock" sentinels at the write
+        # boundary so neither the nodes row nor downstream readers ever see
+        # a `position_time = 0` epoch leak.  +normalize_position_time+ also
+        # absorbs future-dated clock-skew values.
+        pt = normalize_position_time(pos["time"], now: now)
         lh = now if lh && lh > now
         # 0 is truthy in Ruby — `lh ||= now` won't replace it, leaving the
         # 7-day list filter to evaluate `0 >= now-7days` → false (node hidden).
@@ -174,8 +193,24 @@ module PotatoMesh
         # (would re-introduce the same zero-timestamp exclusion bug for lh).
         lh = pt if pt && pt > 0 && (!lh || lh < pt)
         lh ||= now
+        # Issue #782: paired `(lat=0, lon=0)` is the firmware Null Island
+        # sentinel; collapse to NULL on both axes (and drop altitude /
+        # locationSource which would otherwise be meaningless).  Single-axis
+        # zero on the equator / prime meridian is preserved.
+        lat, lon = normalize_lat_lon(pos["latitude"], pos["longitude"])
+        if lat.nil? && lon.nil?
+          alt = nil
+          loc_source = nil
+        else
+          alt = pos["altitude"]
+          loc_source = pick_alias(pos, "locationSource", "location_source")
+        end
         node_num = resolve_node_num(node_id, n)
 
+        # The prometheus helper still receives the raw `pos` so that gauges
+        # not affected by sentinel handling (e.g. precision_bits) keep
+        # updating; the latitude/longitude guards inside +update_prometheus_metrics+
+        # are responsible for skipping sentinel coordinates.
         update_prometheus_metrics(node_id, user, role, met, pos)
 
         lora_freq = coerce_integer(n["lora_freq"] || n["loraFrequency"])
@@ -183,7 +218,7 @@ module PotatoMesh
         # Synthetic flag: true for placeholder nodes created from channel message
         # sender names before the real contact advertisement is received.
         synthetic = user["synthetic"] ? 1 : 0
-        long_name = user["longName"]
+        long_name = pick_alias(user, "longName", "long_name")
 
         # If the incoming long name is a generic placeholder, prefer any real
         # name already on record so we never stomp known data with fallback
@@ -205,33 +240,33 @@ module PotatoMesh
         row = [
           node_id,
           node_num,
-          user["shortName"],
+          pick_alias(user, "shortName", "short_name"),
           long_name,
           user["macaddr"],
-          user["hwModel"] || n["hwModel"],
+          pick_alias(user, "hwModel", "hw_model") || pick_alias(n, "hwModel", "hw_model"),
           role,
-          user["publicKey"],
-          coerce_bool(user["isUnmessagable"]),
-          coerce_bool(n["isFavorite"]),
-          n["hopsAway"],
+          pick_alias(user, "publicKey", "public_key"),
+          coerce_bool(pick_alias(user, "isUnmessagable", "is_unmessagable")),
+          coerce_bool(pick_alias(n, "isFavorite", "is_favorite")),
+          pick_alias(n, "hopsAway", "hops_away"),
           n["snr"],
           lh,
           lh,
-          met["batteryLevel"],
+          pick_alias(met, "batteryLevel", "battery_level"),
           met["voltage"],
-          met["channelUtilization"],
-          met["airUtilTx"],
-          met["uptimeSeconds"],
+          pick_alias(met, "channelUtilization", "channel_utilization"),
+          pick_alias(met, "airUtilTx", "air_util_tx"),
+          pick_alias(met, "uptimeSeconds", "uptime_seconds"),
           pt,
-          pos["locationSource"],
+          loc_source,
           coerce_integer(
             pos["precisionBits"] ||
               pos["precision_bits"] ||
               pos.dig("raw", "precision_bits"),
           ),
-          pos["latitude"],
-          pos["longitude"],
-          pos["altitude"],
+          lat,
+          lon,
+          alt,
           lora_freq,
           modem_preset,
           protocol,
@@ -323,6 +358,7 @@ module PotatoMesh
             "UPDATE messages SET from_id = ? WHERE from_id = ?",
             [real_node_id, synthetic_id],
           )
+          carry_last_heard_to_real_node(db, synthetic_id, real_node_id)
           db.execute(
             "DELETE FROM nodes WHERE node_id = ? AND synthetic = 1",
             [synthetic_id],
@@ -368,9 +404,32 @@ module PotatoMesh
           "UPDATE messages SET from_id = ? WHERE from_id = ?",
           [real_node_id, synthetic_node_id],
         )
+        carry_last_heard_to_real_node(db, synthetic_node_id, real_node_id)
         db.execute(
           "DELETE FROM nodes WHERE node_id = ? AND synthetic = 1",
           [synthetic_node_id],
+        )
+      end
+
+      # Advance a real node's +last_heard+ to a merged synthetic placeholder's
+      # value when the placeholder was heard more recently, so a node heard only
+      # via MeshCore channel chat keeps a fresh "last seen" after its contact
+      # advertisement reconciles the placeholder (issues #803 / #755).  +MAX+
+      # makes the carry forward-only — the merge can never move +last_heard+
+      # backward — and a missing/already-deleted synthetic row (subquery yields
+      # NULL → 0) leaves the real node untouched.  Must run *before* the synthetic
+      # row is deleted so the subquery can still read it.
+      #
+      # @param db [SQLite3::Database] open database connection.
+      # @param synthetic_node_id [String] node id of the synthetic being merged away.
+      # @param real_node_id [String] node id of the surviving real contact.
+      # @return [void]
+      def carry_last_heard_to_real_node(db, synthetic_node_id, real_node_id)
+        db.execute(
+          "UPDATE nodes SET last_heard = MAX(COALESCE(last_heard, 0), " \
+          "COALESCE((SELECT last_heard FROM nodes WHERE node_id = ?), 0)) " \
+          "WHERE node_id = ?",
+          [synthetic_node_id, real_node_id],
         )
       end
 
@@ -400,15 +459,22 @@ module PotatoMesh
         now = Time.now.to_i
         rx = coerce_integer(rx_time) || now
         rx = now if rx && rx > now
-        pos_time = coerce_integer(position_time)
-        pos_time = nil if pos_time && pos_time > now
+        # Issue #782: drop Meshtastic "no GPS lock" sentinels at the write
+        # boundary so a sentinel position update can never overwrite a real
+        # fix via the position-time tie-break below.
+        pos_time = normalize_position_time(position_time, now: now)
         last_heard = [rx, pos_time].compact.max || rx
         last_heard = now if last_heard && last_heard > now
 
         loc = string_or_nil(location_source)
-        lat = coerce_float(latitude)
-        lon = coerce_float(longitude)
-        alt = coerce_float(altitude)
+        lat, lon = normalize_lat_lon(latitude, longitude)
+        # Drop altitude when the coordinate pair collapsed; altitude alone
+        # without coordinates is meaningless and would otherwise carry a
+        # sentinel `0.0` past this gate.
+        alt = (lat.nil? && lon.nil?) ? nil : coerce_float(altitude)
+        # Likewise, an upsert with no coordinates should not refresh the
+        # location source — keep whatever the row already had.
+        loc = nil if lat.nil? && lon.nil?
         precision = coerce_integer(precision_bits)
         snr_val = coerce_float(snr)
 
@@ -418,12 +484,23 @@ module PotatoMesh
           "altitude" => alt,
         })
 
+        # When a position packet carries real coordinates but no usable
+        # `position_time` (either omitted or collapsed by the sentinel guard
+        # above), the `excluded.position_time IS NOT NULL` clauses below would
+        # otherwise reject the entire update.  Mirror the MeshCore handler
+        # (`protocols/meshcore/position.py:65`) and substitute the receive
+        # time so the new fix still wins the freshness tie-break.  We only
+        # do this when there *are* coordinates to write — otherwise the
+        # bound timestamp would persist a synthetic anchor on a no-op row.
+        bound_pos_time = pos_time
+        bound_pos_time = rx if pos_time.nil? && (!lat.nil? || !lon.nil?)
+
         row = [
           id,
           num,
           last_heard,
           last_heard,
-          pos_time,
+          bound_pos_time,
           loc,
           precision,
           lat,
@@ -431,6 +508,13 @@ module PotatoMesh
           alt,
           snr_val,
         ]
+        # The CASE guards below previously read
+        # `COALESCE(excluded.position_time,0) >= COALESCE(nodes.position_time,0)`,
+        # which let a sentinel `0` excluded value win the comparison whenever
+        # the stored value was also `NULL` (coalesces to `0`).  After
+        # normalisation, sentinel inputs collapse to `NULL`, so we require an
+        # explicit `IS NOT NULL` to authorise the overwrite — a normalised-nil
+        # excluded value is never preferred over real stored data.  See #782.
         with_busy_retry do
           db.execute <<~SQL, row
                        INSERT INTO nodes(node_id,num,last_heard,first_heard,position_time,location_source,precision_bits,latitude,longitude,altitude,snr)
@@ -441,36 +525,42 @@ module PotatoMesh
                          last_heard=MAX(COALESCE(nodes.last_heard,0),COALESCE(excluded.last_heard,0)),
                          first_heard=COALESCE(nodes.first_heard, excluded.first_heard, excluded.last_heard),
                          position_time=CASE
-                           WHEN COALESCE(excluded.position_time,0) >= COALESCE(nodes.position_time,0)
+                           WHEN excluded.position_time IS NOT NULL
+                                AND excluded.position_time >= COALESCE(nodes.position_time,0)
                              THEN excluded.position_time
                            ELSE nodes.position_time
                          END,
                          location_source=CASE
-                           WHEN COALESCE(excluded.position_time,0) >= COALESCE(nodes.position_time,0)
+                           WHEN excluded.position_time IS NOT NULL
+                                AND excluded.position_time >= COALESCE(nodes.position_time,0)
                                 AND excluded.location_source IS NOT NULL
                              THEN excluded.location_source
                            ELSE nodes.location_source
                          END,
                          precision_bits=CASE
-                           WHEN COALESCE(excluded.position_time,0) >= COALESCE(nodes.position_time,0)
+                           WHEN excluded.position_time IS NOT NULL
+                                AND excluded.position_time >= COALESCE(nodes.position_time,0)
                                 AND excluded.precision_bits IS NOT NULL
                              THEN excluded.precision_bits
                            ELSE nodes.precision_bits
                          END,
                          latitude=CASE
-                           WHEN COALESCE(excluded.position_time,0) >= COALESCE(nodes.position_time,0)
+                           WHEN excluded.position_time IS NOT NULL
+                                AND excluded.position_time >= COALESCE(nodes.position_time,0)
                                 AND excluded.latitude IS NOT NULL
                              THEN excluded.latitude
                            ELSE nodes.latitude
                          END,
                          longitude=CASE
-                           WHEN COALESCE(excluded.position_time,0) >= COALESCE(nodes.position_time,0)
+                           WHEN excluded.position_time IS NOT NULL
+                                AND excluded.position_time >= COALESCE(nodes.position_time,0)
                                 AND excluded.longitude IS NOT NULL
                              THEN excluded.longitude
                            ELSE nodes.longitude
                          END,
                          altitude=CASE
-                           WHEN COALESCE(excluded.position_time,0) >= COALESCE(nodes.position_time,0)
+                           WHEN excluded.position_time IS NOT NULL
+                                AND excluded.position_time >= COALESCE(nodes.position_time,0)
                                 AND excluded.altitude IS NOT NULL
                              THEN excluded.altitude
                            ELSE nodes.altitude

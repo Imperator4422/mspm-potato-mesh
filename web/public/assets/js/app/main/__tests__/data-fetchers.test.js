@@ -18,6 +18,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  fetchAllMessages,
+  paginateCollection,
+  paginateMessages,
   fetchMessages,
   fetchNeighbors,
   fetchNodeById,
@@ -340,6 +343,414 @@ test('fetchMessages propagates HTTP errors', async () => {
   const stub = withFetchStub({ ok: false, status: 500 });
   try {
     await assert.rejects(() => fetchMessages(10), /HTTP 500/);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchMessages forwards a positive before cursor and omits a non-positive one', async () => {
+  const stub = withFetchStub({ ok: true, body: [] });
+  try {
+    await fetchMessages(10, { before: 1234 });
+    assert.ok(stub.calls[0].url.includes('before=1234'));
+    await fetchMessages(10, { before: 0 });
+    assert.ok(!stub.calls[1].url.includes('before='));
+  } finally {
+    stub.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// fetchAllMessages (issue #796 backward pagination)
+// ---------------------------------------------------------------------------
+
+test('fetchAllMessages pages backward until a short page and de-duplicates by id', async () => {
+  // limit=2; the inclusive cursor re-returns the boundary row, which must be
+  // de-duplicated rather than counted twice.
+  const stub = withFetchStub((url) => {
+    if (url.includes('before=40')) {
+      return { ok: true, body: [{ id: 4, rx_time: 40 }, { id: 3, rx_time: 30 }] };
+    }
+    if (url.includes('before=30')) {
+      return { ok: true, body: [{ id: 3, rx_time: 30 }] }; // short page → stop
+    }
+    return { ok: true, body: [{ id: 5, rx_time: 50 }, { id: 4, rx_time: 40 }] };
+  });
+  try {
+    const all = await fetchAllMessages(2, {});
+    assert.deepEqual(all.map(m => m.id), [5, 4, 3]);
+    assert.equal(stub.calls.length, 3);
+    assert.ok(stub.calls[1].url.includes('before=40'));
+    assert.ok(stub.calls[2].url.includes('before=30'));
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchAllMessages stops when the server ignores the cursor (no progress)', async () => {
+  // The stub returns the same full page regardless of the cursor; without the
+  // no-progress guard this would loop forever.
+  const stub = withFetchStub({ ok: true, body: [{ id: 5, rx_time: 50 }, { id: 4, rx_time: 40 }] });
+  try {
+    const all = await fetchAllMessages(2, {});
+    assert.deepEqual(all.map(m => m.id), [5, 4]);
+    assert.equal(stub.calls.length, 2); // page 1 + one no-progress page, then stop
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchAllMessages returns [] and makes one call for an empty window', async () => {
+  const stub = withFetchStub({ ok: true, body: [] });
+  try {
+    const all = await fetchAllMessages(2, {});
+    assert.deepEqual(all, []);
+    assert.equal(stub.calls.length, 1);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchAllMessages stops when no row carries a usable timestamp cursor', async () => {
+  // A full page whose rows lack rx_time cannot advance the cursor; the loop must
+  // still terminate (and keep the rows it found).
+  const stub = withFetchStub({ ok: true, body: [{ id: 7 }, { id: 8 }] });
+  try {
+    const all = await fetchAllMessages(2, {});
+    assert.deepEqual(all.map(m => m.id), [7, 8]);
+    assert.equal(stub.calls.length, 1);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchAllMessages skips rows without an id and forwards retrieval flags', async () => {
+  const stub = withFetchStub({ ok: true, body: [{ rx_time: 40 }] }); // no id → skipped, short page
+  try {
+    const all = await fetchAllMessages(2, { encrypted: true });
+    assert.deepEqual(all, []);
+    assert.equal(stub.calls.length, 1);
+    assert.ok(stub.calls[0].url.includes('encrypted=true'));
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchAllMessages honours the maxPages backstop against a runaway feed', async () => {
+  // Every page is full and strictly older, so only maxPages bounds the walk.
+  let n = 0;
+  const stub = withFetchStub(() => {
+    n += 1;
+    return { ok: true, body: [{ id: 100 - n, rx_time: 100 - n }] };
+  });
+  try {
+    const all = await fetchAllMessages(1, { maxPages: 3 });
+    assert.equal(all.length, 3);
+    assert.equal(stub.calls.length, 3);
+  } finally {
+    stub.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// paginateMessages (issue #802 progressive backward pagination)
+// ---------------------------------------------------------------------------
+
+test('paginateMessages yields each page of fresh rows separately as it pages back', async () => {
+  // Two full pages then a short page; the inclusive cursor re-returns the
+  // boundary row, which must be de-duplicated out of the later yield.
+  const stub = withFetchStub((url) => {
+    if (url.includes('before=30')) {
+      return { ok: true, body: [{ id: 3, rx_time: 30 }] }; // short → stop (all seen)
+    }
+    if (url.includes('before=40')) {
+      return { ok: true, body: [{ id: 4, rx_time: 40 }, { id: 3, rx_time: 30 }] };
+    }
+    return { ok: true, body: [{ id: 5, rx_time: 50 }, { id: 4, rx_time: 40 }] };
+  });
+  try {
+    const pages = [];
+    for await (const batch of paginateMessages(2, {})) {
+      pages.push(batch.map(m => m.id));
+    }
+    // One array per page, each carrying only that page's newly-seen ids — proof
+    // the caller can render progressively instead of awaiting the whole window.
+    assert.deepEqual(pages, [[5, 4], [3]]);
+    assert.equal(stub.calls.length, 3);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('paginateMessages seeds its first request from a positive before cursor', async () => {
+  // A single short page so the walk stops after the seeded request.
+  const stub = withFetchStub({ ok: true, body: [{ id: 9, rx_time: 90 }] });
+  try {
+    const pages = [];
+    for await (const batch of paginateMessages(2, { before: 500 })) {
+      pages.push(batch);
+    }
+    assert.equal(stub.calls.length, 1);
+    assert.ok(stub.calls[0].url.includes('before=500'), stub.calls[0].url);
+    assert.deepEqual(pages.flat().map(m => m.id), [9]);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('paginateMessages ignores a non-finite before seed', async () => {
+  const stub = withFetchStub({ ok: true, body: [{ id: 1, rx_time: 10 }] });
+  try {
+    const pages = [];
+    for await (const batch of paginateMessages(2, { before: Number.NaN })) {
+      pages.push(batch);
+    }
+    assert.equal(stub.calls.length, 1);
+    assert.ok(!stub.calls[0].url.includes('before='), stub.calls[0].url);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('paginateMessages stops cleanly when a page is not an array', async () => {
+  // A malformed (non-array) JSON body must end the walk rather than throw.
+  const stub = withFetchStub({ ok: true, body: { error: 'nope' } });
+  try {
+    const pages = [];
+    for await (const batch of paginateMessages(2, {})) {
+      pages.push(batch);
+    }
+    assert.deepEqual(pages, []);
+    assert.equal(stub.calls.length, 1);
+  } finally {
+    stub.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// before cursor forwarding (issue #832 backward pagination)
+// ---------------------------------------------------------------------------
+
+for (const [name, fn, path] of [
+  ['fetchNodes', fetchNodes, '/api/nodes'],
+  ['fetchPositions', fetchPositions, '/api/positions'],
+  ['fetchTelemetry', fetchTelemetry, '/api/telemetry'],
+  ['fetchNeighbors', fetchNeighbors, '/api/neighbors'],
+  ['fetchTraces', fetchTraces, '/api/traces'],
+]) {
+  test(`${name} forwards a positive before cursor and omits a non-positive one`, async () => {
+    const stub = withFetchStub({ ok: true, body: [] });
+    try {
+      await fn(50, 0, { before: 4242 });
+      assert.ok(stub.calls[0].url.startsWith(`${path}?`));
+      assert.ok(stub.calls[0].url.includes('before=4242'), stub.calls[0].url);
+      await fn(50, 0, { before: 0 });
+      assert.ok(!stub.calls[1].url.includes('before='), stub.calls[1].url);
+    } finally {
+      stub.restore();
+    }
+  });
+}
+
+test('fetchTraces with applyAgeFilter:false returns rows verbatim (raw page length preserved)', async () => {
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const stub = withFetchStub({
+    ok: true,
+    body: [
+      { id: 1, rx_time: nowSeconds },
+      { id: 2, rx_time: nowSeconds - 365 * 24 * 3600 }, // expired — kept when the filter is off
+    ],
+  });
+  try {
+    const raw = await fetchTraces(50, 0, { applyAgeFilter: false });
+    assert.deepEqual(raw.map(t => t.id), [1, 2]);
+  } finally {
+    stub.restore();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// paginateCollection (issue #832 generic backward pager)
+// ---------------------------------------------------------------------------
+
+test('paginateCollection pages backward by cursor and de-duplicates by id', async () => {
+  // limit=2; the inclusive cursor re-returns the boundary row, which must be
+  // de-duplicated out of the later page.
+  const pages = {
+    0: [{ id: 5, t: 50 }, { id: 4, t: 40 }],
+    40: [{ id: 4, t: 40 }, { id: 3, t: 30 }],
+    30: [{ id: 3, t: 30 }], // short → stop (all seen)
+  };
+  const seenBefore = [];
+  const fetchPage = async (limit, before) => {
+    seenBefore.push(before);
+    return pages[before] || pages[0];
+  };
+  const out = [];
+  for await (const batch of paginateCollection(fetchPage, { limit: 2, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch.map(r => r.id));
+  }
+  assert.deepEqual(out, [[5, 4], [3]]);
+  assert.deepEqual(seenBefore, [0, 40, 30]);
+});
+
+test('paginateCollection seeds the first request from a positive before and stops on a short page', async () => {
+  const calls = [];
+  const fetchPage = async (limit, before) => {
+    calls.push(before);
+    return before === 500 ? [{ id: 9, t: 90 }] : [];
+  };
+  const out = [];
+  for await (const batch of paginateCollection(fetchPage, { limit: 2, before: 500, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch.map(r => r.id));
+  }
+  assert.deepEqual(out, [[9]]);
+  assert.deepEqual(calls, [500]);
+});
+
+test('paginateCollection ignores a non-finite before seed', async () => {
+  const calls = [];
+  const fetchPage = async (limit, before) => {
+    calls.push(before);
+    return [{ id: 1, t: 10 }];
+  };
+  const out = [];
+  for await (const batch of paginateCollection(fetchPage, { limit: 2, before: Number.NaN, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch);
+  }
+  assert.equal(calls[0], 0);
+});
+
+test('paginateCollection makes one call and yields nothing for an empty window', async () => {
+  let calls = 0;
+  const out = [];
+  for await (const batch of paginateCollection(async () => { calls += 1; return []; }, { limit: 2, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch);
+  }
+  assert.deepEqual(out, []);
+  assert.equal(calls, 1);
+});
+
+test('paginateCollection stops on a no-progress page (server ignored the cursor)', async () => {
+  // The same full page is returned regardless of the cursor; without the
+  // no-progress guard this would loop forever.
+  const out = [];
+  for await (const batch of paginateCollection(async () => [{ id: 5, t: 50 }, { id: 4, t: 40 }], { limit: 2, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch.map(r => r.id));
+  }
+  assert.deepEqual(out, [[5, 4]]);
+});
+
+test('paginateCollection stops when no row carries a usable cursor', async () => {
+  const calls = [];
+  const fetchPage = async (limit, before) => {
+    calls.push(before);
+    return [{ id: 7 }, { id: 8 }]; // full page, no cursor field
+  };
+  const out = [];
+  for await (const batch of paginateCollection(fetchPage, { limit: 2, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch.map(r => r.id));
+  }
+  assert.deepEqual(out, [[7, 8]]);
+  assert.equal(calls.length, 1); // oldest stayed 0 → stop after one page
+});
+
+test('paginateCollection skips rows without an id and then stops (no progress)', async () => {
+  let calls = 0;
+  const out = [];
+  for await (const batch of paginateCollection(async () => { calls += 1; return [{ t: 40 }, { t: 30 }]; }, { limit: 2, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch);
+  }
+  assert.deepEqual(out, []);
+  assert.equal(calls, 1);
+});
+
+test('paginateCollection honours the maxPages backstop against a runaway feed', async () => {
+  let n = 0;
+  const fetchPage = async () => { n += 1; return [{ id: 100 - n, t: 100 - n }]; }; // always full, strictly older
+  let pages = 0;
+  // eslint-disable-next-line no-unused-vars
+  for await (const _ of paginateCollection(fetchPage, { limit: 1, maxPages: 3, idOf: r => r.id, cursorOf: r => r.t })) {
+    pages += 1;
+  }
+  assert.equal(pages, 3);
+});
+
+test('paginateCollection stops cleanly when a page is not an array', async () => {
+  const out = [];
+  for await (const batch of paginateCollection(async () => ({ error: 'nope' }), { limit: 2, idOf: r => r.id, cursorOf: r => r.t })) {
+    out.push(batch);
+  }
+  assert.deepEqual(out, []);
+});
+
+// ---------------------------------------------------------------------------
+// responsePromise (cold-load boot prefetch consumption)
+// ---------------------------------------------------------------------------
+
+/** Build a Response-like resolved value with the given JSON body. */
+function jsonResponse(body, { ok = true, status = 200 } = {}) {
+  return { ok, status, json: async () => body };
+}
+
+test('fetchNodes consumes a supplied responsePromise without hitting the network', async () => {
+  const stub = withFetchStub({ ok: true, body: [{ node_id: '!net' }] });
+  try {
+    const boot = Promise.resolve(jsonResponse([{ node_id: '!boot' }]));
+    const nodes = await fetchNodes(NODE_LIMIT, 0, { responsePromise: boot });
+    assert.deepEqual(nodes, [{ node_id: '!boot' }]);
+    assert.equal(stub.calls.length, 0, 'the prefetched response is used, no fetch issued');
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchTraces still applies the recency filter to a prefetched response', async () => {
+  const stub = withFetchStub({ ok: true, body: [] });
+  try {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const boot = Promise.resolve(jsonResponse([
+      { id: 1, rx_time: nowSeconds },              // recent — kept
+      { id: 2, rx_time: nowSeconds - 40 * 86400 }, // older than the 28-day TRACE_MAX_AGE — dropped
+    ]));
+    const traces = await fetchTraces(TRACE_LIMIT, 0, { responsePromise: boot });
+    assert.deepEqual(traces.map(t => t.id), [1]);
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('fetchMessages consumes a supplied responsePromise', async () => {
+  const stub = withFetchStub({ ok: true, body: [] });
+  try {
+    const boot = Promise.resolve(jsonResponse([{ id: 7, text: 'boot' }]));
+    const messages = await fetchMessages(NODE_LIMIT, { responsePromise: boot });
+    assert.deepEqual(messages, [{ id: 7, text: 'boot' }]);
+    assert.equal(stub.calls.length, 0);
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a rejected responsePromise falls back to a fresh network fetch', async () => {
+  const stub = withFetchStub({ ok: true, body: [{ node_id: '!fallback' }] });
+  try {
+    const boot = Promise.reject(new Error('prefetch died'));
+    const nodes = await fetchNodes(NODE_LIMIT, 0, { responsePromise: boot });
+    assert.deepEqual(nodes, [{ node_id: '!fallback' }]);
+    assert.equal(stub.calls.length, 1, 'a failed prefetch re-fetches so data is never lost');
+    assert.ok(stub.calls[0].url.startsWith('/api/nodes?'));
+  } finally {
+    stub.restore();
+  }
+});
+
+test('a prefetched non-ok response throws like a failed fetch', async () => {
+  const stub = withFetchStub({ ok: true, body: [] });
+  try {
+    const boot = Promise.resolve(jsonResponse(null, { ok: false, status: 503 }));
+    await assert.rejects(() => fetchPositions(NODE_LIMIT, 0, { responsePromise: boot }), /HTTP 503/);
   } finally {
     stub.restore();
   }

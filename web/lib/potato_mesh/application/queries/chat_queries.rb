@@ -23,8 +23,10 @@ module PotatoMesh
       # @param node_ref [String, Integer, nil] optional node reference to scope results.
       # @param include_encrypted [Boolean] when true, include encrypted payloads in the response.
       # @param since [Integer] unix timestamp threshold; messages with rx_time older than this are excluded.
+      # @param before [Integer, nil] inclusive upper-bound rx_time cursor used for
+      #   backward pagination (issue #796); messages newer than this are excluded.
       # @return [Array<Hash>] compacted message rows safe for API responses.
-      def query_messages(limit, node_ref: nil, include_encrypted: false, since: 0, protocol: nil)
+      def query_messages(limit, node_ref: nil, include_encrypted: false, since: 0, before: nil, protocol: nil)
         limit = coerce_query_limit(limit)
         now = Time.now.to_i
         # Default the chat feed to the same seven-day window the dashboard uses
@@ -42,6 +44,12 @@ module PotatoMesh
         where_clauses << "m.rx_time >= ?"
         params << since_threshold
 
+        # Inclusive upper-bound cursor for backward pagination (issue #796;
+        # SPEC BP1-BP3), shared with every bulk collection via the helper.  It
+        # only ever *narrows*, so the seven-day floor above still bounds the
+        # window — callers cannot use +before+ to reach further back.
+        append_before_filter(where_clauses, params, before, column: "m.rx_time")
+
         unless include_encrypted
           where_clauses << "COALESCE(TRIM(m.encrypted), '') = ''"
         end
@@ -53,6 +61,11 @@ module PotatoMesh
           params.concat(clause.last)
         end
 
+        # Hide chat lines that originate from or are addressed to opted-out
+        # nodes. Both endpoints are filtered so reactions/replies aimed at a
+        # silenced participant do not leak the conversation half.
+        append_opt_out_filter(where_clauses, params, opt_out_node_id_filter("m.from_id"))
+        append_opt_out_filter(where_clauses, params, opt_out_node_id_filter("m.to_id"))
         append_protocol_filter(where_clauses, params, protocol, table_alias: "m")
 
         sql = <<~SQL

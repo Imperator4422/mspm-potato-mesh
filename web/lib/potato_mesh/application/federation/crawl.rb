@@ -25,8 +25,11 @@ module PotatoMesh
       def remote_active_node_count_from_stats(payload, max_age_seconds:)
         return nil unless payload.is_a?(Hash)
 
-        active_nodes = payload["active_nodes"]
-        return nil unless active_nodes.is_a?(Hash)
+        # Prefer the 0.7.0 shape (counts under total.nodes); fall back to the
+        # pre-0.7.0 flat active_nodes for older peers (one-way federation
+        # compatibility, SPEC S7).
+        node_windows = remote_stats_node_windows(payload)
+        return nil unless node_windows.is_a?(Hash)
 
         age = coerce_integer(max_age_seconds) || 0
         key = if age <= 3600
@@ -39,10 +42,38 @@ module PotatoMesh
             "month"
           end
 
-        value = coerce_integer(active_nodes[key])
+        value = coerce_integer(node_windows[key])
         return nil unless value
 
         [value, 0].max
+      end
+
+      # Resolve the total node-activity window hash from either /api/stats shape.
+      #
+      # @param payload [Hash] decoded /api/stats payload.
+      # @return [Hash, nil] +{ "hour", "day", "week", "month" }+ counts, or nil
+      #   when neither the 0.7.0 (+total.nodes+) nor legacy (+active_nodes+) shape
+      #   is present.
+      def remote_stats_node_windows(payload)
+        new_shape = payload.dig("total", "nodes")
+        return new_shape if new_shape.is_a?(Hash)
+
+        legacy = payload["active_nodes"]
+        legacy if legacy.is_a?(Hash)
+      end
+
+      # Resolve a protocol's 24h node count from either /api/stats shape.
+      #
+      # Reads the 0.7.0 +<protocol>.nodes.day+ value, falling back to the
+      # pre-0.7.0 flat +<protocol>.day+ for older peers.
+      #
+      # @param payload [Hash] decoded /api/stats payload.
+      # @param protocol [String] protocol scope name (e.g. "meshcore").
+      # @return [Integer, nil] node count active in the last day, or nil.
+      def remote_stats_protocol_day(payload, protocol)
+        value = payload.dig(protocol, "nodes", "day")
+        value = payload.dig(protocol, "day") if value.nil?
+        coerce_integer(value)
       end
 
       # Parse a remote federation instance payload into canonical attributes.
@@ -61,16 +92,20 @@ module PotatoMesh
         domain = sanitize_instance_domain(payload["domain"])
         return [nil, nil, "missing instance domain"] unless domain
 
-        pubkey = sanitize_public_key_pem(payload["pubkey"])
+        # Accept both the v2 (snake_case) and legacy v1 (camelCase) wire keys so
+        # the verifier can reconstruct either canonical, and so the parsed
+        # attributes carry the signed counts needed to rebuild the v2 blob
+        # (SPEC FS1/FS2/FS4).
+        pubkey = sanitize_public_key_pem(payload["public_key"] || payload["pubkey"])
         return [nil, nil, "missing instance public key"] unless pubkey
 
         signature = string_or_nil(payload["signature"])
         return [nil, nil, "missing instance signature"] unless signature
 
-        private_value = if payload.key?("isPrivate")
-            payload["isPrivate"]
-          else
+        private_value = if payload.key?("is_private")
             payload["is_private"]
+          elsif payload.key?("isPrivate")
+            payload["isPrivate"]
           end
         private_flag = coerce_boolean(private_value)
         if private_flag.nil?
@@ -88,9 +123,13 @@ module PotatoMesh
           frequency: string_or_nil(payload["frequency"]),
           latitude: coerce_float(payload["latitude"]),
           longitude: coerce_float(payload["longitude"]),
-          last_update_time: coerce_integer(payload["lastUpdateTime"]),
+          last_update_time: coerce_integer(payload["last_update"] || payload["lastUpdateTime"]),
           is_private: private_flag,
-          contact_link: string_or_nil(payload["contactLink"]),
+          contact_link: string_or_nil(payload["contactLink"] || payload["contact_link"]),
+          nodes_count: coerce_integer(payload["nodes_count"] || payload["nodesCount"]),
+          meshcore_nodes_count: coerce_integer(payload["meshcore_nodes_count"] || payload["meshcoreNodesCount"]),
+          meshtastic_nodes_count: coerce_integer(payload["meshtastic_nodes_count"] || payload["meshtasticNodesCount"]),
+          reticulum_nodes_count: coerce_integer(payload["reticulum_nodes_count"]),
         }
 
         [attributes, signature, nil]
@@ -291,14 +330,16 @@ module PotatoMesh
             stats_payload,
             max_age_seconds: PotatoMesh::Config.remote_instance_max_node_age,
           )
-          attributes[:nodes_count] = stats_count if stats_count
+          # Keep the SIGNED counts from the verified entry verbatim (SPEC FS2/(a)
+          # — relay-consistent); only fall back to the peer's live /api/stats when
+          # the entry carried no count.
+          attributes[:nodes_count] = stats_count if stats_count && attributes[:nodes_count].nil?
 
-          # Extract per-protocol 24h counts (informational, not signed).
           if stats_payload.is_a?(Hash)
-            mc_day = stats_payload.dig("meshcore", "day")
-            mt_day = stats_payload.dig("meshtastic", "day")
-            attributes[:meshcore_nodes_count] = coerce_integer(mc_day) if mc_day
-            attributes[:meshtastic_nodes_count] = coerce_integer(mt_day) if mt_day
+            mc_day = remote_stats_protocol_day(stats_payload, "meshcore")
+            mt_day = remote_stats_protocol_day(stats_payload, "meshtastic")
+            attributes[:meshcore_nodes_count] = mc_day if mc_day && attributes[:meshcore_nodes_count].nil?
+            attributes[:meshtastic_nodes_count] = mt_day if mt_day && attributes[:meshtastic_nodes_count].nil?
           end
 
           nodes_since_path = "/api/nodes?since=#{recent_cutoff}&limit=1000"
