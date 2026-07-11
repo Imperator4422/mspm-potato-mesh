@@ -99,7 +99,7 @@ module PotatoMesh
       ALLOWED_TAGS = Set.new(%w[
         h1 h2 h3 h4 h5 h6 p a em strong b i u s del code pre br hr
         ul ol li dl dt dd blockquote table thead tbody tfoot tr th td
-        img span div sup sub abbr mark small details summary
+        img iframe span div section sup sub abbr mark small details summary
       ]).freeze
 
       @pages_cache = nil
@@ -379,10 +379,17 @@ module PotatoMesh
             :all => %w[id class title alt],
             "a" => %w[href],
             "img" => %w[src width height loading decoding],
+            "iframe" => %w[src width height allow allowfullscreen frameborder sandbox loading referrerpolicy style],
+            "div" => %w[style],
+            "section" => %w[style],
           },
           protocols: {
             "a" => { "href" => ["http", "https", "mailto"] },
             "img" => { "src" => ["http", "https"] },
+            "iframe" => { "src" => ["http", "https"] },
+          },
+          css: {
+            properties: %w[width height border display margin padding gap justify-content align-items position left right top bottom box-sizing],
           },
         )
       end
