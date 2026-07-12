@@ -4947,8 +4947,8 @@ export function initializeApp(config) {
   /**
    * Hide/show UI elements based on per-protocol activity in the past 7 days.
    *
-   * Hides the Charts nav link when meshtastic has no active nodes, and hides
-   * legend columns for protocols with zero weekly activity.
+   * Hides any remaining /charts nav links unconditionally, and hides legend
+   * columns for protocols with zero weekly activity.
    *
    * @param {{meshcore?: {week: number}, meshtastic?: {week: number}}} stats Stats from /api/stats.
    * @returns {void}
@@ -4967,9 +4967,9 @@ export function initializeApp(config) {
     if (protocolToggleMeshcore) protocolToggleMeshcore.hidden = !bothActive;
     if (protocolToggleMeshtastic) protocolToggleMeshtastic.hidden = !bothActive;
 
-    // Charts is meshtastic-only; hide the nav link when no meshtastic activity.
+    // Always hide any /charts links in the nav to keep the page hidden.
     document.querySelectorAll('a[href="/charts"]').forEach(el => {
-      el.style.display = meshtasticWeek === 0 ? 'none' : '';
+      el.style.display = 'none';
     });
   }
 
