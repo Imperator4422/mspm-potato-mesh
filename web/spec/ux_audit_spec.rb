@@ -112,14 +112,14 @@ RSpec.describe "UX audit remediation markup" do
   end
 
   describe "shell economics (UX11)" do
-    it "renders static pages in both navs and footer" do
+    it "renders static pages in both navs and not in a footer" do
       html = body_of("/")
       nav = html[%r{<nav class="site-nav".*?</nav>}m]
       mobile_nav = html[%r{<nav class="mobile-nav".*?</nav>}m]
       footer = html[%r{<footer.*?</footer>}m]
       expect(nav).to include("/pages/about")
       expect(mobile_nav).to include("/pages/about")
-      expect(footer).to include("/pages/about")
+      expect(footer).to be_nil
     end
 
     it "drops the protocol icon from the Charts nav links" do
@@ -138,35 +138,29 @@ RSpec.describe "UX audit remediation markup" do
   end
 
   describe "join strip & preset config (UX12)" do
-    it "renders the join-line strip from the resolved Meshtastic preset config" do
+    it "does not render the removed join-line strip" do
       html = body_of("/")
-      expect(html).to include("join-line")
-      expect(html).to include("Meshtastic")
-      expect(html).to include("#LongFast")
-      expect(html).to include("915MHz")
-      expect(html).not_to include("MeshCore ·")
+      expect(html).not_to include("join-line")
+      expect(html).not_to include("footer-join")
+      expect(html).not_to include("join-line__entry")
+      expect(html).not_to include("join-line__proto")
     end
 
-    it "adds the MeshCore join line only when both preset config values are set" do
+    it "does not render a MeshCore join line even when configured" do
       allow(PotatoMesh::Config).to receive(:meshcore_preset).and_return("EU/UK Narrow")
       allow(PotatoMesh::Config).to receive(:meshcore_freq).and_return("869MHz")
       html = body_of("/")
-      expect(html).to include("MeshCore")
-      expect(html).to include("EU/UK Narrow")
-      expect(html).to include("869MHz")
+      expect(html).not_to include("footer-join")
+      expect(html).not_to include("join-line__proto")
     end
   end
 
   describe "join strip moved to the footer (audit follow-up 04)" do
-    it "renders the join strip in the footer and drops the redundant details link" do
+    it "does not render the removed footer join strip" do
       html = body_of("/")
-      # The strip now carries its footer-placement class and still names the
-      # resolved preset — it lives in the footer, next to the About link.
-      expect(html).to include("footer-join")
-      expect(html).to include("join-line")
-      expect(html).to include("#LongFast")
-      # The `details` link (its About-page shortcut) is gone: the footer's own
-      # About link sits right beside the strip.
+      expect(html).not_to include("footer-join")
+      expect(html).not_to include("join-line")
+      expect(html).not_to include("#LongFast")
       expect(html).not_to include("join-line__more")
     end
 
@@ -179,11 +173,9 @@ RSpec.describe "UX audit remediation markup" do
   end
 
   describe "footer dot separators (Post-Deploy 02·03)" do
-    it "renders footer-separator elements as dots, not em dashes" do
+    it "does not render footer separators because the footer is removed" do
       html = body_of("/")
-      # The links row separators become dots; the dangling em-dash that the
-      # wrapping .footer-links box stranded on line one is gone.
-      expect(html).to match(%r{<span class="footer-separator"[^>]*>·</span>})
+      expect(html).not_to include("footer-separator")
       expect(html).not_to match(%r{<span class="footer-separator"[^>]*>—</span>})
     end
   end

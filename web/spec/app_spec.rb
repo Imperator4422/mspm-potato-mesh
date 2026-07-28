@@ -1384,17 +1384,16 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).to include('id="autorefreshToggle"')
     end
 
-    it "includes the application version in the footer" do
+    it "does not render the footer version bar" do
       get "/"
-      expected = APP_VERSION.to_s.start_with?("v") ? APP_VERSION : "v#{APP_VERSION}"
-      expect(last_response.body).to include(expected)
+      expect(last_response.body).not_to include('<footer class="app-footer">')
     end
 
-    it "renders the responsive footer container" do
+    it "does not render the footer container" do
       get "/"
 
-      expect(last_response.body).to include('<footer class="app-footer">')
-      expect(last_response.body).to include('class="footer-content"')
+      expect(last_response.body).not_to include('<footer class="app-footer">')
+      expect(last_response.body).not_to include('class="footer-content"')
     end
 
     it "renders the site title as a link to the dashboard" do
@@ -1508,15 +1507,13 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).not_to include('id="metaRow"')
     end
 
-    it "renders the opaque footer chrome on the federation page" do
+    it "does not render a footer on the federation page" do
       allow(PotatoMesh::Config).to receive(:federation_enabled?).and_return(true)
 
       get "/federation"
 
       expect(last_response).to be_ok
-      # Audit follow-up 08: the transparent slim variant is retired; every route
-      # uses the one opaque footer chrome so it never floats over body copy.
-      expect(last_response.body).to include('class="app-footer"')
+      expect(last_response.body).not_to include('class="app-footer"')
       expect(last_response.body).not_to include("app-footer--slim")
     end
   end
@@ -1562,15 +1559,14 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "GET /charts" do
-    it "renders the charts page with the opaque footer but without meta-controls" do
+    it "renders the charts page without meta-controls or footer" do
       get "/charts"
 
       expect(last_response).to be_ok
       expect(last_response.body).to include("initializeChartsPage")
       expect(last_response.body).not_to include('id="metaRow"')
       expect(last_response.body).not_to include('id="filterInput"')
-      # Audit follow-up 08: no more slim footer variant.
-      expect(last_response.body).to include('class="app-footer"')
+      expect(last_response.body).not_to include('class="app-footer"')
       expect(last_response.body).not_to include("app-footer--slim")
     end
   end
