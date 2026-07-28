@@ -99,20 +99,23 @@
   <script src="<%= asset_url("/assets/js/theme.js") %>" defer></script>
   <script src="<%= asset_url("/assets/js/background.js") %>" defer></script>
 
-  <!-- Leaflet CSS/JS -->
+  <!-- Leaflet CSS/JS (CDN) -->
   <link
     rel="stylesheet"
-    href="/assets/leaflet/leaflet.css"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
     crossorigin=""
   />
   <script
-    src="/assets/leaflet/leaflet.js"
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
     crossorigin=""
   ></script>
 </head>
 <% body_classes = ["dark"]
    view_mode = (defined?(current_view_mode) && current_view_mode) ? current_view_mode.to_sym : :dashboard
    page_view = view_mode.to_s.start_with?("page_")
+  static_page_links = defined?(static_pages) && static_pages ? static_pages : []
    full_screen_view = !(%i[dashboard charts federation].include?(view_mode) || page_view)
    body_classes << "view-#{view_mode}"
    shell_classes = ["page-shell"]
@@ -181,6 +184,11 @@
             <a href="/map" class="site-nav__link<%= view_mode == :map ? " is-active" : "" %>"<%= view_mode == :map ? ' aria-current="page"' : "" %>>Map</a>
             <a href="/chat" class="site-nav__link<%= view_mode == :chat ? " is-active" : "" %>"<%= view_mode == :chat ? ' aria-current="page"' : "" %>>Chat</a>
             <a href="<%= nodes_nav_href %>" class="site-nav__link<%= nodes_nav_active ? " is-active" : "" %>"<%= nodes_nav_active ? ' aria-current="page"' : "" %>>Nodes</a>
+            <a href="/charts" class="site-nav__link<%= view_mode == :charts ? " is-active" : "" %>"<%= view_mode == :charts ? ' aria-current="page"' : "" %>>Charts</a>
+            <% static_page_links.each do |sp| %>
+              <% sp_active = view_mode == "page_#{sp.slug}".to_sym %>
+              <a href="/pages/<%= Rack::Utils.escape_path(sp.slug) %>" class="site-nav__link<%= sp_active ? " is-active" : "" %>"<%= sp_active ? ' aria-current="page"' : "" %>><%= Rack::Utils.escape_html(sp.title) %></a>
+            <% end %>
             <% if federation_nav_enabled %>
               <a href="/federation" class="site-nav__link js-federation-nav<%= view_mode == :federation ? " is-active" : "" %>" data-federation-label="Federation"<%= view_mode == :federation ? ' aria-current="page"' : "" %>>Federation</a>
             <% end %>
@@ -211,6 +219,11 @@
             <a href="/map" class="mobile-nav__link<%= view_mode == :map ? " is-active" : "" %>"<%= view_mode == :map ? ' aria-current="page"' : "" %>>Map</a>
             <a href="/chat" class="mobile-nav__link<%= view_mode == :chat ? " is-active" : "" %>"<%= view_mode == :chat ? ' aria-current="page"' : "" %>>Chat</a>
             <a href="<%= nodes_nav_href %>" class="mobile-nav__link<%= nodes_nav_active ? " is-active" : "" %>"<%= nodes_nav_active ? ' aria-current="page"' : "" %>>Nodes</a>
+            <a href="/charts" class="mobile-nav__link<%= view_mode == :charts ? " is-active" : "" %>"<%= view_mode == :charts ? ' aria-current="page"' : "" %>>Charts</a>
+            <% static_page_links.each do |sp| %>
+              <% sp_active = view_mode == "page_#{sp.slug}".to_sym %>
+              <a href="/pages/<%= Rack::Utils.escape_path(sp.slug) %>" class="mobile-nav__link<%= sp_active ? " is-active" : "" %>"<%= sp_active ? ' aria-current="page"' : "" %>><%= Rack::Utils.escape_html(sp.title) %></a>
+            <% end %>
             <% if federation_nav_enabled %>
               <a href="/federation" class="mobile-nav__link js-federation-nav<%= view_mode == :federation ? " is-active" : "" %>" data-federation-label="Federation"<%= view_mode == :federation ? ' aria-current="page"' : "" %>>Federation</a>
             <% end %>

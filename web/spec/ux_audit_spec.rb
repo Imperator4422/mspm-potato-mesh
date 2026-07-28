@@ -112,13 +112,13 @@ RSpec.describe "UX audit remediation markup" do
   end
 
   describe "shell economics (UX11)" do
-    it "renders static pages in the footer, not the navs" do
+    it "renders static pages in both navs and footer" do
       html = body_of("/")
       nav = html[%r{<nav class="site-nav".*?</nav>}m]
       mobile_nav = html[%r{<nav class="mobile-nav".*?</nav>}m]
       footer = html[%r{<footer.*?</footer>}m]
-      expect(nav).not_to include("/pages/")
-      expect(mobile_nav).not_to include("/pages/")
+      expect(nav).to include("/pages/about")
+      expect(mobile_nav).to include("/pages/about")
       expect(footer).to include("/pages/about")
     end
 
