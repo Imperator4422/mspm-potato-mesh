@@ -18,6 +18,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { setupApp, setupAppWithOptions } from './main-app-test-helpers.js';
+import { TICK_INTERVAL_MS } from '../main/relative-time-ticker.js';
 
 const NOW = 1_700_000_000;
 
@@ -137,6 +138,57 @@ test('updateLegendProtocolCounts works when only meshtasticCountEl is present', 
 });
 
 // ---------------------------------------------------------------------------
+// updateProtocolToggleCounts (audit follow-up 04)
+// ---------------------------------------------------------------------------
+
+test('updateProtocolToggleCounts is a no-op when the count elements are absent', () => {
+  const { testUtils, cleanup } = setupApp();
+  try {
+    assert.doesNotThrow(() => {
+      testUtils.updateProtocolToggleCounts({ meshcore: { week: 3 }, meshtastic: { week: 4 } });
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test('updateProtocolToggleCounts writes the 7-day per-protocol counts onto the toggles', () => {
+  const { testUtils, env, cleanup } = setupAppWithOptions({
+    extraElements: ['protocolToggleMeshcoreCount', 'protocolToggleMeshtasticCount'],
+  });
+  try {
+    const mc = env.document.getElementById('protocolToggleMeshcoreCount');
+    const mt = env.document.getElementById('protocolToggleMeshtasticCount');
+    testUtils.updateProtocolToggleCounts({
+      week: 140,
+      meshcore: { hour: 1, day: 120, week: 123, month: 200 },
+      meshtastic: { hour: 1, day: 20, week: 17, month: 40 },
+    });
+    // The toggle count mirrors the legend's 7-day figure so the same protocol
+    // shows the same number in both places.
+    assert.equal(mc.textContent, '123');
+    assert.equal(mt.textContent, '17');
+  } finally {
+    cleanup();
+  }
+});
+
+test('updateProtocolToggleCounts defaults missing per-protocol data to zero', () => {
+  const { testUtils, env, cleanup } = setupAppWithOptions({
+    extraElements: ['protocolToggleMeshcoreCount', 'protocolToggleMeshtasticCount'],
+  });
+  try {
+    const mc = env.document.getElementById('protocolToggleMeshcoreCount');
+    const mt = env.document.getElementById('protocolToggleMeshtasticCount');
+    testUtils.updateProtocolToggleCounts({ week: 5 });
+    assert.equal(mc.textContent, '0');
+    assert.equal(mt.textContent, '0');
+  } finally {
+    cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // updateFooterStats
 // ---------------------------------------------------------------------------
 
@@ -159,13 +211,18 @@ test('updateFooterStats populates the active-stats element when present', () => 
     const el = env.document.getElementById('footerActiveNodes');
     testUtils.updateFooterStats({ day: 10, week: 20, month: 30, sampled: false });
 
+    // SPEC UX11 (audit D-026): worded vital sign with the day figure promoted.
     assert.ok(
-      el.textContent.includes('/day'),
-      `expected footerActiveNodes to contain "/day", got: ${el.textContent}`,
+      el.innerHTML.includes('10 nodes today'),
+      `expected footerActiveNodes to contain "10 nodes today", got: ${el.innerHTML}`,
     );
     assert.ok(
-      el.textContent.includes('10/day'),
-      `expected footerActiveNodes to contain "10/day", got: ${el.textContent}`,
+      el.innerHTML.includes('meta-active-nodes__today'),
+      `expected the day segment to be styleable, got: ${el.innerHTML}`,
+    );
+    assert.ok(
+      el.innerHTML.includes('20 this week'),
+      `expected footerActiveNodes to contain "20 this week", got: ${el.innerHTML}`,
     );
   } finally {
     cleanup();
@@ -261,8 +318,16 @@ test('restartAutoRefresh does not start a timer when refreshMs is 0', () => {
   globalThis.setInterval = (...args) => { calls.push(args); return origSetInterval(...args); };
   try {
     const { cleanup } = setupApp(); // uses refreshMs: 0
-    // restartAutoRefresh is called during init; no timer should have been started.
-    assert.equal(calls.length, 0, 'setInterval should not be called with refreshMs=0');
+    // restartAutoRefresh is called during init; no refresh timer should have
+    // been started. The only interval armed at boot is the shared
+    // relative-time ticker (SPEC RT2), identified by its 1 s cadence.
+    const refreshCalls = calls.filter(args => args[1] !== TICK_INTERVAL_MS);
+    assert.equal(refreshCalls.length, 0, 'setInterval should not be called with refreshMs=0');
+    assert.equal(
+      calls.filter(args => args[1] === TICK_INTERVAL_MS).length,
+      1,
+      'the shared relative-time ticker is armed at boot (RT2)'
+    );
     cleanup();
   } finally {
     globalThis.setInterval = origSetInterval;
@@ -282,8 +347,14 @@ test('restartAutoRefresh starts a timer when refreshMs > 0', () => {
 
   try {
     const { cleanup } = setupAppWithOptions({ configOverrides: { refreshMs: 30_000 } });
-    assert.equal(timers.length, 1, 'setInterval should be called once during init');
-    assert.equal(timers[0].ms, 30_000, 'interval should match configured refreshMs');
+    // Boot arms exactly one refresh timer plus the relative-time ticker (RT2).
+    const refreshTimers = timers.filter(t => t.ms === 30_000);
+    assert.equal(refreshTimers.length, 1, 'one refresh timer should be started during init');
+    assert.equal(
+      timers.filter(t => t.ms === TICK_INTERVAL_MS).length,
+      1,
+      'the relative-time ticker runs alongside the refresh timer'
+    );
     cleanup();
   } finally {
     globalThis.setInterval = origSetInterval;
@@ -298,21 +369,30 @@ test('restartAutoRefresh clears the existing timer before starting a new one', (
   const origClearInterval = globalThis.clearInterval;
   globalThis.setInterval = (fn, ms) => {
     const id = Symbol('timer');
-    timers.push(id);
+    timers.push({ id, ms });
     return id;
   };
   globalThis.clearInterval = id => { cleared.push(id); };
 
   try {
     const { testUtils, cleanup } = setupAppWithOptions({ configOverrides: { refreshMs: 30_000 } });
-    // One timer started during init.
-    assert.equal(timers.length, 1);
+    // One refresh timer started during init (the 1 s interval is the ticker).
+    const refreshTimers = () => timers.filter(t => t.ms === 30_000);
+    assert.equal(refreshTimers().length, 1);
+    const firstRefreshId = refreshTimers()[0].id;
 
-    // Calling restartAutoRefresh again must clear the first timer and start a new one.
+    // Calling restartAutoRefresh again must clear the first refresh timer and
+    // start a new one — without touching the relative-time ticker (RT3: the
+    // presentation clock is independent of the data-refresh lifecycle).
     testUtils.restartAutoRefresh();
-    assert.equal(cleared.length, 1, 'existing timer should be cleared');
-    assert.equal(cleared[0], timers[0], 'the original timer id should be cleared');
-    assert.equal(timers.length, 2, 'a new timer should be started');
+    assert.equal(cleared.length, 1, 'existing refresh timer should be cleared');
+    assert.equal(cleared[0], firstRefreshId, 'the original refresh timer id should be cleared');
+    assert.equal(refreshTimers().length, 2, 'a new refresh timer should be started');
+    assert.equal(
+      timers.filter(t => t.ms === TICK_INTERVAL_MS).length,
+      1,
+      'the ticker interval is untouched by a refresh restart'
+    );
     cleanup();
   } finally {
     globalThis.setInterval = origSetInterval;

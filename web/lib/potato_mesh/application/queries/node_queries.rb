@@ -130,6 +130,28 @@ module PotatoMesh
         ["(#{clauses.join(" OR ")})", params]
       end
 
+      # Reinterpret a bang-less, digit-only node reference as a canonical hex
+      # id.  The reference parser resolves digit-only strings as Meshtastic
+      # node nums first (see +canonical_node_parts+), which makes an 8-hex id
+      # composed entirely of decimal digits (e.g. "27336717" for !27336717 —
+      # ~2.3% of the id space) unreachable without its "!" prefix.  The per-id
+      # nodes route uses this fallback only after the num interpretation
+      # matched nothing, so genuine num lookups keep their precedence
+      # (SPEC NL2, ACCEPTANCE NL-A2).
+      #
+      # @param node_ref [String, nil] raw node reference from the request.
+      # @return [String, nil] the "!"-prefixed canonical id when the reference
+      #   is a bang-less canonical 8-hex string made of decimal digits,
+      #   otherwise +nil+.
+      def digit_only_hex_node_ref(node_ref)
+        return nil unless node_ref.is_a?(String)
+
+        trimmed = node_ref.strip
+        return nil unless trimmed.match?(/\A[0-9]{8}\z/)
+
+        "!#{trimmed}"
+      end
+
       # Fetch node state optionally scoped by identifier and timestamp.
       #
       # @param limit [Integer] maximum number of rows to return.
@@ -177,10 +199,12 @@ module PotatoMesh
 
         sql = <<~SQL
           SELECT node_id, short_name, long_name, hw_model, role, snr,
+                 rssi, hops_away,
                  battery_level, voltage, last_heard, first_heard,
                  uptime_seconds, channel_utilization, air_util_tx,
                  position_time, location_source, precision_bits,
-                 latitude, longitude, altitude, lora_freq, modem_preset, protocol
+                 latitude, longitude, altitude, lora_freq, modem_preset, protocol,
+                 synthetic
           FROM nodes
         SQL
         sql += "    WHERE #{where_clauses.join(" AND ")}\n" if where_clauses.any?
@@ -223,6 +247,10 @@ module PotatoMesh
           # redundant ISO twin (pos_time_iso / position_time_iso) is not emitted.
           pb = r["precision_bits"]
           r["precision_bits"] = pb.to_i if pb
+          # Name-derived placeholder marker (SPEC MR4).  Emitted as a boolean
+          # only when set, so +compact_api_row+ drops it from real nodes rather
+          # than adding a "synthetic": false to every row.
+          r["synthetic"] = r["synthetic"].to_i.zero? ? nil : true
         end
         rows.map { |row| compact_api_row(row) }
       ensure

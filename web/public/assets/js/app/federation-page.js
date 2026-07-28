@@ -24,7 +24,29 @@ import { resolveLegendVisibility } from './map-legend-visibility.js';
 import { mergeConfig } from './settings.js';
 import { roleColors } from './role-helpers.js';
 import { meshcoreIconHtml, meshtasticIconHtml } from './protocol-helpers.js';
-import { TILE_LAYER_URL, TILE_LAYER_OPTIONS } from './basemap-config.js';
+import { createBasemapLayer } from './basemap-config.js';
+import { timeAgoSuffixed } from './main/format-utils.js';
+import {
+  startRelativeTimeTicker,
+  tickAttributes,
+  TICK_FORMAT_AGO_SUFFIXED,
+} from './main/relative-time-ticker.js';
+
+/**
+ * The page's shared relative-time ticker handle (SPEC RT1/RT2); a re-init
+ * stops the previous ticker so exactly one clock drives the page.
+ */
+let relativeTimeTicker = null;
+
+/**
+ * Expose the page's ticker handle for unit tests (SPEC RT5).
+ *
+ * @returns {?{tick: Function, stop: Function, running: Function}} The live
+ *   ticker handle, or null before {@link initializeFederationPage} ran.
+ */
+export function getFederationRelativeTimeTicker() {
+  return relativeTimeTicker;
+}
 
 /**
  * Escape HTML special characters to prevent XSS.
@@ -57,21 +79,22 @@ function fmtCoords(v, d = 5) {
 }
 
 /**
- * Convert a Unix timestamp to a human-readable relative time string.
+ * Build the instances-table "last update" cell with live-tick opt-in markup.
  *
- * @param {number|null|undefined} unixSec Unix timestamp in seconds.
- * @param {number} nowSec Current timestamp in seconds.
- * @returns {string} Relative time string or empty string.
+ * The cell carries ``data-ts-ago`` (plus the ``ago-suffixed`` variant marker)
+ * so the shared relative-time ticker keeps the age counting up in place
+ * between refreshes (SPEC RT1/RT2), preserving the page's historical
+ * ``5m ago`` format verbatim (RT4). An instance without a usable timestamp
+ * renders today's plain empty cell.
+ *
+ * @param {Object} instance Federation instance row payload.
+ * @param {number} nowSec Reference timestamp in seconds for the initial text.
+ * @returns {string} ``<td>`` HTML fragment.
  */
-function timeAgo(unixSec, nowSec = Date.now() / 1000) {
-  if (unixSec == null || unixSec === '') return '';
-  const ts = Number(unixSec);
-  if (!Number.isFinite(ts) || ts <= 0) return '';
-  const diff = Math.max(0, Math.floor(nowSec - ts));
-  if (diff < 60) return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
+function lastUpdateCellHtml(instance, nowSec) {
+  const lastUpdate = instance.last_update ?? instance.lastUpdateTime;
+  const attrs = tickAttributes(lastUpdate, TICK_FORMAT_AGO_SUFFIXED);
+  return `<td class="instances-col instances-col--last-update mono"${attrs ? ' ' + attrs : ''}>${timeAgoSuffixed(lastUpdate, nowSec)}</td>`;
 }
 
 /**
@@ -494,19 +517,22 @@ export async function initializeFederationPage(options = {}) {
       const mtNodesVal = toFiniteNumber(instance.meshtastic_nodes_count ?? instance.meshtasticNodesCount);
       const mtNodesText = mtNodesVal == null ? '<em>—</em>' : `${meshtasticIconHtml()} ${escapeHtml(String(mtNodesVal))}`;
 
+      // Cell order mirrors `_instances_table.erb`'s traveler-first header
+      // order (SPEC UX9/UX12): where + settings + alive lead; coordinates
+      // and version trail.
       tr.innerHTML = `
         <td class="instances-col instances-col--name">${nameHtml}</td>
         <td class="instances-col instances-col--domain mono">${domainHtml}</td>
-        <td class="instances-col instances-col--contact">${contactHtml || '<em>—</em>'}</td>
-        <td class="instances-col instances-col--version mono">${escapeHtml(instance.version || '')}</td>
         <td class="instances-col instances-col--channel">${renderContactHtml(instance.channel) || ''}</td>
         <td class="instances-col instances-col--frequency">${escapeHtml(instance.frequency || '')}</td>
         <td class="instances-col instances-col--nodes mono">${nodesCountText}</td>
         <td class="instances-col instances-col--meshcore-nodes mono">${mcNodesText}</td>
         <td class="instances-col instances-col--meshtastic-nodes mono">${mtNodesText}</td>
+        ${lastUpdateCellHtml(instance, nowSec)}
+        <td class="instances-col instances-col--contact">${contactHtml || '<em>—</em>'}</td>
+        <td class="instances-col instances-col--version mono">${escapeHtml(instance.version || '')}</td>
         <td class="instances-col instances-col--latitude mono">${fmtCoords(instance.latitude)}</td>
         <td class="instances-col instances-col--longitude mono">${fmtCoords(instance.longitude)}</td>
-        <td class="instances-col instances-col--last-update mono">${timeAgo(instance.last_update ?? instance.lastUpdateTime, nowSec)}</td>
       `;
 
       frag.appendChild(tr);
@@ -584,7 +610,14 @@ export async function initializeFederationPage(options = {}) {
     map = leaflet.map(mapContainer, { worldCopyJump: true, attributionControl: false });
     map.setView([config.mapCenter.lat, config.mapCenter.lon], initialZoom);
 
-    leaflet.tileLayer(TILE_LAYER_URL, TILE_LAYER_OPTIONS).addTo(map);
+    // Shared stacked basemap — CARTO Voyager base under an opaque HOT overlay
+    // (see ``./basemap-config.js``); identical to the dashboard map. Add the
+    // base first, then the overlay on top. The federation map keeps no
+    // kill-basemap/offline logic (a tile that fails on both providers simply
+    // stays blank here), unchanged from the dashboard-only offline tier.
+    const basemap = createBasemapLayer(leaflet);
+    basemap.base.addTo(map);
+    basemap.overlay.addTo(map);
 
     markersLayer = leaflet.layerGroup().addTo(map);
   }
@@ -746,4 +779,10 @@ export async function initializeFederationPage(options = {}) {
     attachSortHandlers(() => renderTableRows(instances, nowSec));
     renderTableRows(instances, nowSec);
   }
+
+  // One shared presentation clock keeps the "last update" ages counting up
+  // in place (SPEC RT1/RT2); re-initialisation replaces the previous ticker
+  // so the page never runs two clocks.
+  if (relativeTimeTicker) relativeTimeTicker.stop();
+  relativeTimeTicker = startRelativeTimeTicker({ documentRef: document });
 }

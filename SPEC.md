@@ -544,11 +544,724 @@ contradicted; the change is a net simplification.
 
 | # | Decision | Source |
 | --- | --- | --- |
-| **DM1** | **Provider swap to CARTO Dark Matter.** The single, de-duplicated tile-URL constant becomes `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png` (subdomains `abcd`, `detectRetina` for the `{r}` HiDPI suffix), replacing `https://{s}.tile.openstreetmap.fr/hot/…` on **both** the dashboard map (`main.js`) and the federation map (`federation-page.js`). Keyless public CDN; returns `access-control-allow-origin: *` so the existing `crossOrigin:'anonymous'` is satisfied; natively dark-grey, so "keep the dark/grey style" holds with no filter. | interview + probe |
-| **DM2** | **Native dark style; the CSS tile-filter pipeline is removed.** Dark Matter is already styled, so the per-theme `grayscale/invert` filter (which existed only to grey out the colourful HOT tiles and is the last **light-theme** remnant) is deleted end-to-end: Ruby `DEFAULT_TILE_FILTER_LIGHT`/`DEFAULT_TILE_FILTER_DARK`, `map_tile_filter_light`/`map_tile_filter_dark`, `tile_filters`, and the `tileFilters` key in `frontend_app_config` (`config_helpers.rb`); JS `TILE_FILTER_LIGHT`/`TILE_FILTER_DARK`, `resolveTileFilter` + the tile filter-application/MutationObserver machinery in `main.js`, `applyTileFilter`/`resolveTheme`/`themechange` in `federation-page.js`, `tileFilters` in `settings.js`, and the `window.applyFiltersToAllTiles` hook in `theme.js`; CSS `--map-tile-filter-light`, `--map-tiles-filter`, and the `.map-tiles { filter: … }` rules in `base.css`. The broader theme system is already dark-only (`resolve_initial_theme` returns `"dark"`). | interview |
+| **DM1** | **Provider swap to CARTO Dark Matter.** The single, de-duplicated tile-URL constant becomes `https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png` (subdomains `abcd`, `detectRetina` for the `{r}` HiDPI suffix), replacing `https://{s}.tile.openstreetmap.fr/hot/…` on **both** the dashboard map (`main.js`) and the federation map (`federation-page.js`). Keyless public CDN; returns `access-control-allow-origin: *` so the existing `crossOrigin:'anonymous'` is satisfied; natively dark-grey, so "keep the dark/grey style" holds with no filter. **Superseded by HT1** — HOT is restored as the primary basemap (dark-filtered) and CARTO Dark Matter is retained only as a per-tile fallback, not the sole provider. | interview + probe |
+| **DM2** | **Native dark style; the CSS tile-filter pipeline is removed.** Dark Matter is already styled, so the per-theme `grayscale/invert` filter (which existed only to grey out the colourful HOT tiles and is the last **light-theme** remnant) is deleted end-to-end: Ruby `DEFAULT_TILE_FILTER_LIGHT`/`DEFAULT_TILE_FILTER_DARK`, `map_tile_filter_light`/`map_tile_filter_dark`, `tile_filters`, and the `tileFilters` key in `frontend_app_config` (`config_helpers.rb`); JS `TILE_FILTER_LIGHT`/`TILE_FILTER_DARK`, `resolveTileFilter` + the tile filter-application/MutationObserver machinery in `main.js`, `applyTileFilter`/`resolveTheme`/`themechange` in `federation-page.js`, `tileFilters` in `settings.js`, and the `window.applyFiltersToAllTiles` hook in `theme.js`; CSS `--map-tile-filter-light`, `--map-tiles-filter`, and the `.map-tiles { filter: … }` rules in `base.css`. The broader theme system is already dark-only (`resolve_initial_theme` returns `"dark"`). **Partially superseded by HT2** — a dark tile filter is reintroduced as a frontend-only static CSS constant applied to HOT tiles (CARTO fallback tiles stay unfiltered); the Ruby `tile_filters` / `data-app-config` `tileFilters` plumbing removed here stays removed. | interview |
 | **DM3** | **Tolerate isolated tile errors (dashboard).** The first `tileerror` no longer flips the whole map to the offline placeholder. Isolated tile failures remain individual blank tiles (Leaflet default); `activateOfflineTiles` fires **only** when the basemap is comprehensively unavailable — **zero** successful tile loads across the initial viewport (provider unreachable/blocked). After **any** successful `tileload` the basemap is latched "alive" and subsequent isolated `tileerror`s never trigger the offline switch; recovery is automatic on later loads. The offline `GridLayer` (`main/offline-tile-layer.js`) is retained as the last-resort fallback. The federation map has no kill-basemap logic today, so it receives only DM1+DM2. | interview |
 | **DM4** | **Adjacent light remnants removed.** `<meta name="color-scheme" content="dark light">` → `content="dark"` (`views/layouts/app.erb`); `background.js`'s `body.classList.contains('dark') ? '#0e1418' : '#f6f3ee'` ternary collapses to the dark colour `'#0e1418'`. (The broader dead light **CSS palette** is handled separately by DM7.) | interview |
 | **DM5** | **No attribution overlay (keep the clean look).** The map keeps `attributionControl:false` as today; no `© OpenStreetMap / © CARTO` credit is rendered. Accepted trade-off: this under-attributes CARTO/OSM — the same posture already taken with the HOT tiles — and is chosen to preserve the existing clean map style. | interview |
 | **DM6** | **Engineering bar & invariants (D9).** No server-side broker/dependency/egress; no `/api/*` or `/version` contract change; protocol-neutral. Every changed JS/Ruby unit ships with 100% unit tests (existing tile-filter specs are **updated or removed-as-dead**, never left dangling), JSDoc/RDoc, the exact Apache header, and `rufo`/`black`-clean formatting; all existing suites stay green. | D9 + proposed |
 | **DM7** | **Dead light CSS palette collapsed (dark-only).** `base.css` carried a full light token palette in `:root`, always overridden by an always-applied `body.dark { … }` token block, plus `html { color-scheme: light }`. Since `body` is always `dark` (`resolve_initial_theme` is fixed `"dark"`), the light half never rendered. The dual palette is collapsed to a **single dark `:root`** (the former `body.dark` token values promoted up, so `html` itself resolves dark tokens too), the `body.dark` *token* block and the light/`data-theme` `color-scheme` rules are removed, and `html { color-scheme: dark }`. `body.dark` *component* rules are untouched (still apply, `body` always has the class), so the rendered dark appearance is unchanged — verified by screenshot. | interview (scope expansion, approved) |
 
+---
+
+## Feature: HOT primary basemap (dark-filtered) with per-tile CARTO fallback
+
+Reinstates the OpenStreetMap France **HOT** (Humanitarian OSM Team) tile server as
+the **primary** basemap on both maps, dark-styled by the reintroduced
+`grayscale/invert` CSS filter, and demotes **CARTO Dark Matter** (the DM1 provider)
+to a **per-tile fallback**: any HOT tile that errors or fails to load within
+**1000 ms** is individually replaced by the CARTO tile at the same coordinate.
+CARTO Dark Matter proved reliable but too dark for the default look; HOT
+(dark-filtered) is the desired style, with CARTO as the dependable safety net and
+the offline placeholder (DM3) behind both. **Deliberately amends DM1 and DM2** (the
+sole-provider swap and the end-to-end filter deletion) while keeping their
+invariant posture (no attribution, dark-only theme, no broker, no contract change).
+Frontend-only (vanilla JS, `base.css`); no API/DB/ingestor change and no Ruby
+`tile_filters` / `data-app-config` return.
+
+**Conflict check.** *DM1 (CARTO sole basemap)* — **contradicts → amended** (HT1:
+HOT primary, CARTO fallback). *DM2 (filter pipeline deleted)* — **contradicts →
+amended** (HT2: dark filter reintroduced as a frontend-only static constant,
+HOT-only). *DM3 (offline placeholder)* — **extends** (offline is now the last tier,
+reached only when both HOT and CARTO fail). *DM4 / DM7 (dark-only)* —
+**consistent** (stays dark-only; the light filter is dropped as dead code).
+*DM5 (no attribution)* — **reaffirmed**. *Apex I* — **consistent**: HOT and CARTO
+are raster tile CDNs, not MQTT/cloud brokers; no manifest/dependency change
+(`guard-edits.py` untriggered); tiles are browser→CDN as before. *Invariant II /
+D11 (no phone-home)* — **consistent**: both providers are keyless and cookieless,
+and CARTO is fetched only for a HOT tile that failed, so common-case egress is
+HOT-only — no new per-operator credential and no telemetry. *Invariant IV
+(parity)* — **consistent**: the basemap is protocol-neutral, identical for
+Meshtastic and MeshCore. *D7 (fixed stack)* — **consistent**: native Leaflet
+URL/layer config, no new package or build step. *D8 (stable contract)* —
+**consistent**: the filter is a frontend constant; nothing enters `/version` or any
+`/api/*` shape, so no version bump. No invariant is contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **HT1** | **HOT primary; CARTO retained as fallback (amends DM1).** The shared basemap's **primary** layer is OpenStreetMap France HOT — `https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png` (`subdomains:'abc'`, `maxZoom:19`, `crossOrigin:'anonymous'`, `className:'map-tiles'`) — restored on **both** the dashboard (`main.js`) and federation (`federation-page.js`) maps. CARTO Dark Matter (`https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png`, `subdomains:'abcd'`, `detectRetina:true`, `crossOrigin:'anonymous'`) is **kept** but only as the per-tile fallback source (HT3), never the primary. HOT already ran with `crossOrigin:'anonymous'` before #831 (it serves permissive CORS), so the headless OG-image capture stays untainted. **Amends DM1** (CARTO-as-sole-provider). | interview |
+| **HT2** | **Dark filter for HOT only; frontend constant, dark-only (amends DM2).** The `grayscale(1) invert(1) brightness(0.9) contrast(1.08)` filter is reintroduced **only** as a static CSS rule on the per-tile class `.map-tiles-hot`, styling the natively-colourful HOT tiles dark. (Leaflet stamps a layer's `className` on the tile *container*, not each `<img>`, so per-tile HOT/CARTO filtering needs a per-tile class; the container keeps its unchanged `map-tiles` tag for the tile-pane opacity.) **CARTO fallback tiles are exempt** — a swapped tile drops `.map-tiles-hot` for `.map-tiles-fallback` (`filter:none`), because CARTO is already dark and `invert(1)` would render it light; offline placeholder tiles carry neither class and stay unfiltered too. **No light-theme filter** is added (the app is dark-only per DM7 — a light variant would be dead code). The removed per-theme machinery is **not** restored: no Ruby `tile_filters`/`DEFAULT_TILE_FILTER_*`, no `frontend_app_config`/`data-app-config` `tileFilters`, no JS `resolveTileFilter`/`applyFiltersToAllTiles`/MutationObserver, no `--map-tile*-filter` custom property. The filter lives entirely in one static `base.css` rule (D8 contract untouched). **Amends DM2** (which deleted the filter end-to-end). | interview |
+| **HT3** | **Per-tile 1000 ms timeout → CARTO (the core mechanism).** A custom Leaflet `TileLayer` (built by the shared factory) overrides tile creation: for each tile it sets the HOT `src` and starts a **1000 ms** timer (a single named constant, the source of truth). If the HOT image fires `error` **or** the timer elapses before `load`, the tile's `src` is swapped to the CARTO URL for the same `{z}/{x}/{y}` and the `map-tiles-fallback` marker is applied (HT2). A successful HOT `load` clears the timer and keeps the filtered HOT tile. The timeout value and the swap-decision/URL logic are pure and Leaflet-free for standalone unit testing (mirroring `main/tile-failure-policy.js`); the thin `createTile` wiring is covered via the leaflet-stub harness. | interview |
+| **HT4** | **Fallback ladder; offline placeholder is the last tier (extends DM3).** Leaflet's `tileload` reaches the DM3 `tile-failure-policy` when **either** HOT or the CARTO fallback serves a tile (the basemap is "alive" if either provider works); `tileerror` is signalled **only** when the CARTO fallback tile *also* fails. Thus an isolated HOT failure that CARTO covers never trips the offline switch, and `activateOfflineTiles` (`main/offline-tile-layer.js`) fires only when tiles fail comprehensively on **both** providers — preserving DM3/DM-A3 tolerance one tier lower. The offline `GridLayer` tier stays **dashboard-only**, exactly as DM3 scoped it. | interview |
+| **HT5** | **Both maps share one basemap factory (parity, no duplication).** A single `createBasemapLayer(L)` in the shared basemap module (`basemap-config.js`) builds the HOT-primary / per-tile-CARTO-fallback layer and is called by **both** `main.js` and `federation-page.js` — preserving DM-A1's "one shared basemap definition referenced by both maps." Both maps render HOT (dark-filtered) with the identical CARTO fallback. The federation map keeps **no** kill-basemap/offline logic (unchanged from DM3): a tile that fails on both providers simply stays blank there. Protocol-neutral (Invariant IV). | interview |
+| **HT6** | **No attribution (reaffirms DM5).** Both maps keep `attributionControl:false`; no `© OpenStreetMap / © CARTO` credit is rendered. Accepted under-attribution trade-off — now spanning both providers — chosen to preserve the clean map style, unchanged from DM5. | interview |
+| **HT7** | **Apex / privacy / stack / contract all untouched.** HOT and CARTO are raster tile CDNs, not MQTT/cloud brokers — the apex (I) holds and `guard-edits.py` is untriggered (no manifest/dependency change). Both are keyless and cookieless, and CARTO is requested only for a HOT tile that failed, so the common case egresses to HOT alone — no new phone-home or per-operator credential (II / D11). Native Leaflet only, no new package or build step (D7). The dark filter is a frontend CSS constant and never enters `/version`, `data-app-config`, or any `/api/*` shape, so there is no contract change or version bump (D8). | proposed |
+| **HT8** | **Engineering bar (D9).** The new/changed frontend units — the shared `createBasemapLayer` factory, the per-tile timeout/fallback tile layer, and its pure timeout/URL helpers — ship with **100% unit tests**, full JSDoc, the exact Apache header, and clean linters; all existing suites stay green. The DM-era tile tests are **updated**, not left dangling: `__tests__/config.test.js`, `__tests__/federation-page.test.js`, the leaflet-stub map-init harness, and `main/__tests__/tile-failure-policy.test.js` are retargeted to the HOT-primary + CARTO-fallback wiring. | D9 + proposed |
+
+---
+
+## Bugfix: Basemap provider blend (chess-pattern fix)
+
+The HOT-primary / per-tile-CARTO-fallback basemap (**HT1–HT3**) rendered a
+**light/dark checkerboard** in normal use: HOT tiles that beat the per-tile
+deadline showed dark-filtered, while tiles that missed it fell back to the
+**unfiltered, natively-dark CARTO Dark Matter** (HT2's deliberate `filter:none`
+exemption) — two visibly different looks tiling the same viewport. The mix was
+*routine*, not rare, because HOT (`openstreetmap.fr`) is slow and HT3's **1000 ms**
+deadline was aggressive, so a healthy fraction of tiles fell back on every load
+(and re-raced, so the pattern shifted on each pan/zoom). This is a **spec-silent**
+consequence of HT2 (filtered-HOT vs unfiltered-CARTO look different *by
+construction*) meeting HT3 (frequent per-tile fallback) — no acceptance criterion
+was violated; the contract was silent on the visual seam. The fix attacks both
+halves: make fallback *rare* (graceful timeout) **and** make the two providers
+*look alike* (colored CARTO source + shared dark filter). Frontend-only
+(`basemap-config.js`, `base.css`); no API/DB/ingestor change and no contract move
+(HT7 posture preserved: still frontend constants, off `/version` and
+`data-app-config`).
+
+**Conflict check.** *HT1 (CARTO source = Dark Matter)* — **amended** (BL2: CARTO
+Voyager). *HT2 (CARTO fallback exempt from the filter)* — **amended** (BL3: the
+fallback shares HOT's filter; HT2's "already dark → don't invert" rationale is void
+because the source is now light/colored). *HT3 (1000 ms)* — **amended** (BL1:
+2500 ms). *HT4 / HT5 (fallback ladder, shared factory, both maps)* —
+**consistent**: the per-tile swap mechanism, the offline last tier, and the single
+`createBasemapLayer` factory are unchanged; the federation map shares the `#map`
+filter selector, so the blend lands on both maps (parity, Invariant IV). *HT6 (no
+attribution)* — **reaffirmed**: Voyager is OSM+CARTO like Dark Matter and
+`attributionControl:false` is unchanged. *Apex I / privacy II / D7 / D8 / D11* —
+**untouched**: Voyager is a keyless, cookieless, CORS-enabled raster CDN like Dark
+Matter; no manifest/dependency/contract change, no version bump. The pattern may
+still not be eliminated 100% (a genuinely-failing HOT tile whose CARTO cover is
+also slow can briefly flash), but under normal latency both levers together make
+it rare and, when it occurs, near-invisible.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **BL1** | **Graceful per-tile timeout: 1000 ms → 2500 ms (amends HT3).** `FALLBACK_TIMEOUT_MS` (the single source of truth in `basemap-config.js`) is raised to **2500 ms**, so a slow-but-arriving HOT tile beats the deadline instead of falling back — restoring CARTO to the *rare safety net* HT3 intended, given HOT's real-world latency. Fewer routine fallbacks is the first half of removing the checkerboard. Accepted cost: when HOT is genuinely dead, the blank→CARTO recovery for that tile is up to 2.5 s (was 1 s); the offline tier (HT4) is unaffected. | interview |
+| **BL2** | **Colored CARTO source: Dark Matter → Voyager (amends HT1).** The fallback URL becomes `https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png` (same `subdomains:'abcd'`, `detectRetina`, `crossOrigin:'anonymous'`; keyless CORS CDN). Voyager is CARTO's natively-colourful, light-background raster style — chosen precisely so the *same* dark filter that greys HOT greys it too. (A natively-dark source could not be filtered to match — HT2's original constraint — which is why HT2 exempted it; BL3 removes that exemption because BL2 removes its cause.) | interview |
+| **BL3** | **Shared dark filter on the fallback tile (amends HT2).** `.map-tiles-fallback` no longer renders `filter:none`; it carries the **same** `grayscale(1) invert(1) brightness(0.9) contrast(1.08)` filter as `.map-tiles-hot`, expressed as one comma-grouped `base.css` rule (the single source of truth for the value). Both providers therefore converge to one coherent dark look, so a viewport mixing HOT and CARTO tiles is no longer a checkerboard — the second half of the fix. The per-tile class swap in `fallback-tile-layer.js` is **unchanged**; only what `.map-tiles-fallback` *does* in CSS changes. Offline placeholder tiles still carry neither class and stay unfiltered. | interview |
+| **BL4** | **Both maps, one rule; posture preserved (reaffirms HT5 / HT7).** The federation map shares the dashboard's `#map` container, so the single `base.css` filter rule and the shared `createBasemapLayer` factory land the blend on **both** maps identically (parity, Invariant IV). The filter value and the timeout stay **frontend constants** — no Ruby `tile_filters`, no `/version` / `data-app-config` key, no `/api/*` change, no version bump (HT7 / D8 unchanged). | proposed |
+
+---
+
+## Feature: MeshCore RF metrics (RSSI/SNR/hops/path) & roster-eviction assertion
+
+Closes the MeshCore↔Meshtastic RF-metrics parity gap (issue #762 for MeshCore):
+messages gain RSSI/SNR/hops-travelled/path, and node records gain per-advert
+signal metrics, all sourced from data the `meshcore` library already delivers
+but the ingestor currently drops. Three mechanisms: (1) native `path_len`/`SNR`
+fields on the message sync events; (2) the library's built-in RX-log⇆message
+join enabled via `decrypt_channels`; (3) a new `RX_LOG_DATA` subscription
+handling on-air `ADVERT` frames (full node identity + signal metrics,
+roster-independent). Additionally the ingestor asserts the firmware's
+`AUTO_ADD_OVERWRITE_OLDEST` roster-eviction bit at startup so a full contact
+roster keeps rotating instead of rejecting new contacts. Integrates with
+`data/mesh_ingestor/protocols/meshcore/{handlers,runner,decode,interface,_constants}.py`,
+the packet store path in `data/mesh_ingestor/handlers/`, `CONTRACTS.md`, one
+additive SQLite migration (`messages.hops`, `messages.path`, `nodes.rssi`), the
+message/node mappings in `web/lib/potato_mesh/application/data_processing/`,
+and the serializers in `queries/`.
+
+**Conflict check against existing decisions.** *Apex I (local LoRa)* —
+**consistent**: every new datum arrives over the existing local serial/BLE/TCP
+radio link; `decrypt_channels` is local crypto using channel keys the radio
+already holds; no broker, dependency, or egress (`guard-edits.py` untriggered).
+*Invariant II (privacy & consent)* — **consistent**: no new data class (channel
+messages already arrive decrypted via companion sync; adverts are public
+broadcasts already stored via the contact path); server-side opt-out,
+`PRIVATE`, and retention gates are untouched. The startup config write (RF4) is
+a **device** mutation, not a data exposure — treated as a §4.2 scope extension,
+documented operator-visibly in the README rather than silent. *Invariant IV
+(parity)* — **extends**: fills MeshCore's missing `rxSnr`/`rxRssi`/hops
+equivalents using the columns Meshtastic already populates; the new `hops`
+column is computed for **both** protocols. *D8/§3.4 (stable contract)* —
+**extends**: strictly additive fields (`hops`/`path` on messages, `rssi` on
+nodes; adverts otherwise reuse the already-accepted `snr`/`hops_away` node
+fields), no version bump. *A4e (MeshCore adverts gap)* — **extends**: RX-log
+adverts enrich non-roster nodes with full identity; the bare-`ADVERTISEMENT`
+minimal upsert stays as the fallback for builds without RX-log frames (A4e
+criteria updated, not removed). *MD-A1/MW-A1 (MeshCore dedup)* —
+**consistent**: `_derive_message_id` inputs stay byte-identical (RF6). No
+decision is contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **RF1** | **Hops-travelled on messages, both protocols.** Message packets gain a `hops` field = repeater relays actually travelled: MeshCore reads the native `path_len` on `CONTACT_MSG_RECV`/`CHANNEL_MSG_RECV` (the `255` "direct" sentinel normalizes to `0`; the 2-bit `path_hash_mode` prefix is masked off); Meshtastic computes `hopStart − hopLimit` when both are present (else omits). Stored in a new **additive** `messages.hops INTEGER` column — deliberately distinct from `hop_limit` (remaining budget, a different semantic, left untouched). MeshCore V3 sync frames' native `SNR` continues to flow into the existing `messages.snr` column. | interview + code |
+| **RF2** | **Channel-message RSSI/path via the library's RX-log join.** The runner sets `mc.decrypt_channels = True`; the `meshcore` lib then matches each `CHANNEL_MSG_RECV` to its on-air frame by `SHA256(sender_timestamp + text)` and injects `RSSI`, `path`, `recv_time` (channel secrets are already registered by `_ensure_channel_names`, so no new key handling). The handler forwards `RSSI` → the existing `messages.rssi` column and the hop-hash route → a new **additive** `messages.path TEXT` column (lowercase hex, `path_hash_size`-byte hashes concatenated in travel order, last = the repeater heard directly; raw material for a future topology view, no hash→node resolution attempted now). **DM RSSI is explicitly out of scope** — direct messages are E2E-encrypted so no RX-log join exists; DMs still get native SNR + hops via RF1. | interview + code |
+| **RF3** | **RX-log `ADVERT` frames become full node upserts (roster-independent).** A new `RX_LOG_DATA` subscription handles frames with `payload_typename == "ADVERT"`: `adv_key` (full 32-byte pubkey) → canonical `!%08x` id, `adv_name` → long name, `adv_type` → role via `_MESHCORE_ADV_TYPE_ROLE`, `adv_lat`/`adv_lon` → position store, and per-reception `snr` → `nodes.snr`, `path_len` → `nodes.hops_away` (existing, already-accepted node fields), `rssi` → a new **additive** `nodes.rssi INTEGER` column (Meshtastic has no per-node RSSI source — `NodeInfo` carries only SNR — so it stays `NULL` there; the column itself is protocol-neutral). This restores full node identity even when the radio's roster is full, closing the anonymous-placeholder gap. **Only `ADVERT` frames are handled**; other RX-log payload types stay in the DEBUG-only catch-all, and `RX_LOG_DATA` no longer falls through to `ignored-meshcore.txt`. Degrades gracefully: companion firmware ≥ 1.16 pushes RX-log frames unconditionally while a client is connected, but if none arrive (other builds), RF1 metrics and the existing bare-`ADVERTISEMENT` fallback (A4e) still function — absent frames are never an error. | interview + code |
+| **RF4** | **Always-on roster-eviction assertion (extends §4.2 ingestor scope).** At startup (after connect, `_ensure_channel_names`-style error tolerance) the ingestor reads `get_autoadd_config` and, **only if** bit `0x01` (`AUTO_ADD_OVERWRITE_OLDEST`) is unset, writes `config \| 0x01` back — a read-modify-write that preserves the type-filter bits 1–4 and never touches `autoadd_max_hops`; when the bit is already set no write occurs (the firmware `savePrefs()`es every set — skipping avoids flash wear). Unconditional by deliberate choice — **no env/config knob**; the behavior is documented in the README (deliberate and operator-visible, not silent), favourites are never evicted (firmware guarantee), and the write persists in device flash. `ERROR`/timeout from pre-1.16 firmware logs a warning and continues. This is the ingestor's **first and only** radio-config write, bounded to this single bit. | interview |
+| **RF5** | **`CONTACT_DELETED` becomes an explicit no-op handler.** Roster eviction (RF4) makes the firmware emit `PUSH_CODE_CONTACT_DELETED` per evicted contact; the event moves from the DEBUG catch-all to an explicit debug-logged no-op in the handler map — the web DB **intentionally retains** evicted nodes (dashboard history is independent of roster capacity; `retention.rb` remains the only data-expiry authority). | interview |
+| **RF6** | **Additive contract; dedup fingerprint frozen.** `CONTRACTS.md` documents the new fields (`messages.hops`/`messages.path`, `nodes.rssi`), the `255`→direct rule, the path hex format, and the advert→node field mapping. All changes are **additive** (D8: no version bump): the POST routes accept and the GET routes serialize the new fields; absent fields stay `NULL`. The MeshCore dedup fingerprint (`_derive_message_id` inputs) and the `v1:` content-dedup scheme are **byte-identical** — new fields ride alongside, never inside, the id derivation (MD-A1/MW-A1 preserved). | interview + code |
+| **RF7** | **Store + API only; UI display deferred.** v1 ends at the JSON API — no dashboard rendering of the new metrics (chat hover, node popup, topology view from `path` are tracked follow-ups). Closes #762 for MeshCore at the data layer. | interview |
+| **RF8** | **Engineering bar (D9).** All new/changed units ship with 100% unit tests (including: RF1 hops normalization edge cases, RF2 join-absent fallback, RF3 malformed-advert tolerance, RF4 read-modify-write/skip/error paths, RF5 no-op), full PDoc/RDoc, the exact Apache header, `black`/`rufo` clean; every existing suite stays green. | CLAUDE.md |
+
+---
+
+## Feature: Live relative-time tick (dynamic timers)
+
+Makes every rendered relative-time field count up in real time between data
+refreshes — "last seen 4s" becomes 5s, 6s, … without waiting for the next
+fetch — so a displayed age is never stale. Pure display-side ticking of the
+strings the existing formatters already produce; frontend-only (vanilla JS), no
+API/DB/ingestor change. Integrates with
+`web/public/assets/js/app/main/format-utils.js` (`timeAgo`), the node-table and
+map-overlay render paths in `main.js`, the node-detail table
+(`node-page/single-node-table.js` via
+`node-page-charts/display-formatters.js#formatRelativeSeconds`), the federation
+instances table (`federation-page.js`), and a new shared ticker module under
+`web/public/assets/js/app/main/`.
+
+**Conflict check.** *PS5/PS7 (poll removed; fetch is event-driven)* —
+**consistent**: the ticker is a pure presentation clock — no fetch, no cadence
+change, no cache write (FC2 untouched). *VF1 (poll-era "last updated" control
+removed)* — **consistent**: no global timestamp control returns; ticking is
+per-field on data ages. *VF4/VF6, LV1/LV2, CR-A1 (fades on already-rendered
+DOM; idle tick materializes 0)* — **extends (guarded)**: the tick mutates age
+text in place only and never re-renders rows/markers/chat entries, so fades are
+never restarted or truncated. *LD-A2/LD-A3/CL-A3 (scroll + open-overlay
+survival)* — **consistent**: in-place text writes cannot reset scroll or close
+overlays; an open popup's age ticking extends LD-A3's spirit. *D7 (fixed
+stack)* / *D8 (stable contract)* — **consistent**: vanilla JS, no new
+dependency, nothing enters `/version`, `data-app-config`, or any `/api/*`
+shape. *Invariants I/II/IV* — **consistent**: no network egress at all,
+displays only already-fetched data, ages tick identically for every protocol.
+No existing decision is contradicted or amended.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **RT1** | **Live-ticking ages, display-only.** Every rendered relative-time field — the node-table "last seen" / "last position" cells, the marker short-info overlay's "Last seen" line, the node-detail (`/n/:id`) last-seen / last-position rows, and the federation instances "last update" column — counts up in real time between data refreshes. **Amended in-interview:** the marker overlay (`openShortInfoOverlay`) previously displayed *no* time field (the "Last seen" popup builder `buildMapPopupHtml` is runtime-dead, reachable only from tests), so the overlay **gains** a "Last seen" line — new visible content, sourced from the `lastHeard` already in its payload, ticking while the overlay is open; the legacy popup builder is wired with tick markup for completeness. The tick is a presentation clock only: it triggers **no** fetch, alters no refresh cadence (PS5/PS7), and never touches the data cache (FC2). | interview (amended) |
+| **RT2** | **One shared ~1 s ticker; in-place text mutation only.** A single shared interval drives all registered fields: each tick re-evaluates the age string with the **unchanged** existing formatters (`timeAgo` / `formatRelativeSeconds`) and writes the DOM **only when the string changed** (so "3d 4h" fields update rarely, "4s" fields every second). The ticker mutates existing text in place and never re-renders rows, markers, or chat entries — preserving CR-A1 (idle materializes 0), LD-A2/CL-A3 (scroll), LD-A3 (open overlays), and the LV1/LV2 fade timers. **Amended in-build:** the federation page's local formatter turned out to be a *distinct format* (`5m ago` — coarse, suffixed), not a duplicate of `timeAgo`; it is hoisted **verbatim** into shared `format-utils.js` as `timeAgoSuffixed` (one definition repo-wide) and registered as the ticker's `ago-suffixed` variant — RT4's format preservation wins over literal consolidation. | interview (amended) |
+| **RT3** | **Wall-clock truth: independent of pause; idle when hidden.** Ages keep ticking regardless of the `#autorefreshToggle` play/pause state — the toggle pauses *data* updates (PS5), not the clock. When the tab is hidden the ticker idles (no background work) and snaps every field to its correct value the moment the tab becomes visible again. | interview |
+| **RT4** | **Format & contract unchanged.** The output format stays exactly today's (`4s`, `3m 12s`, `5h 2m`, `3d 4h`; empty/invalid timestamps keep rendering exactly as today). Frontend-only: no API, `/version`, or `data-app-config` change (D8), vanilla JS with no new dependency (D7), protocol-neutral (Invariant IV), no network egress and no new data exposure (Invariants I/II). | interview |
+| **RT5** | **Engineering bar (D9).** The ticker module and every touched render path ship with 100% unit tests, full JSDoc, the exact Apache header, and clean linters; all existing suites stay green. Existing formatter specs (`format-utils.test.js`, display-formatter tests) remain valid unchanged — the format is untouched; render-path specs are **updated** only where fields gain tick registration. | CLAUDE.md |
+
+---
+
+## Feature: Dual stacked basemap layers (HOT over CARTO, no timeout)
+
+Replaces the per-tile HOT→CARTO *timeout-and-swap* basemap (HT1–HT3, BL1–BL3)
+with **two always-on, simultaneously-loaded tile layers**: CARTO Voyager as the
+bottom **base** layer and OpenStreetMap France **HOT** as the opaque **overlay**
+on top. Both are requested at once on every viewport; a HOT tile paints over the
+CARTO cell beneath it as it arrives (a per-tile fade), so a slow HOT tile shows
+the already-present CARTO tile in the meantime rather than a blank cell or a
+deadline-driven fallback. This structurally eliminates the light/dark
+checkerboard the timeout mechanism produced: there is no per-tile deadline to
+miss, both providers wear the *same* dark filter, and the two layers composite to
+one coherent dark basemap. HOT was observed to time out so often that the
+2500 ms per-tile deadline (BL1) was still insufficient and the map routinely
+checkerboarded; stacking the layers removes the deadline entirely. The custom
+per-tile fallback tile layer (`main/fallback-tile-layer.js`) and its timeout
+constant are retired. Frontend-only (vanilla JS `basemap-config.js`, `base.css`,
+README doc line); no API/DB/ingestor change and no Ruby `tile_filters` /
+`data-app-config` return.
+
+**Conflict check.** *HT1 (CARTO "never the primary", only a per-tile fallback
+source)* — **contradicts → amended** (SB1: CARTO is a permanent base layer under
+HOT). *HT3 (per-tile 1000 ms→CARTO swap) / BL1 (raised to 2500 ms)* —
+**contradicts → amended** (SB1: the per-tile deadline and swap mechanism are
+deleted, not re-tuned). *HT2 (dark filter on the per-tile class `.map-tiles-hot`,
+CARTO exempt) / BL3 (fallback shares HOT's filter, per-tile)* — **amended** (SB3:
+the identical filter *value* now sits on the per-**layer** containers
+`.map-tiles-hot` / `.map-tiles-fallback`, because with no per-tile swap Leaflet
+stamps the class on the layer container, not each `<img>`; both providers stay
+filtered, as BL3 already established). *HT4 / DM3 (offline placeholder is the last
+tier)* — **extends** (SB5: the single liveness policy is now fed by *both* layers;
+the placeholder fires only when the whole viewport fails on both providers).
+*HT5 / BL4 (one shared `createBasemapLayer` factory on both maps)* —
+**consistent** (SB1: the factory still owns the whole basemap and both maps call
+it; it now returns two layers instead of one). *HT6 / DM5 (no attribution)* —
+**reaffirmed** (SB7). *BL2 (colored Voyager fallback source)* — **reaffirmed**
+(SB1 keeps the Voyager URL). *HT7 (common-case egress is HOT-only; CARTO fetched
+only on a HOT-tile failure)* — **contradicts → amended** (SB6: both CDNs are
+requested on every viewport, so third-party tile egress is now two CDNs, not one;
+still keyless, cookieless, no credential/analytics/identifier — D11 holds).
+*Apex I* — **consistent**: HOT and CARTO are raster tile CDNs, not MQTT/cloud
+brokers; no manifest/dependency change (`guard-edits.py` untriggered); tiles are
+browser→CDN as before. *Invariant II / D11 (no phone-home)* — **consistent under
+the SB6 amendment**: egress doubles to a second keyless CDN but carries no
+per-operator credential, cookie, analytics beacon, or user/mesh identifier — only
+tile coordinates. *Invariant IV (parity)* — **consistent**: the basemap is
+protocol-neutral, identical for Meshtastic and MeshCore and on both maps.
+*D7 (fixed stack)* — **consistent**: native Leaflet `L.tileLayer` × 2, no new
+package or build step (the custom subclass is *removed*). *D8 (stable contract)* —
+**consistent**: filter, opacity, and z-index are frontend constants; nothing
+enters `/version`, `data-app-config`, or any `/api/*` shape, so no version bump.
+No invariant is contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **SB1** | **Two always-on stacked layers from one factory (amends HT1, HT3, BL1).** The shared `createBasemapLayer(L)` (in `basemap-config.js`) returns **two** native `L.tileLayer` instances — a CARTO **Voyager** base (`https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png`, `subdomains:'abcd'`, `detectRetina:true`, `crossOrigin:'anonymous'`, `className:'map-tiles-fallback'`, `zIndex:1`) and a **HOT** overlay (`https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png`, `subdomains:'abc'`, `maxZoom:19`, `crossOrigin:'anonymous'`, `className:'map-tiles-hot'`, `zIndex:2`) — both added to **both** the dashboard (`main.js`) and federation (`federation-page.js`) maps. Both are fetched simultaneously on every viewport; there is **no** per-tile deadline or swap. The custom `main/fallback-tile-layer.js` (its `FALLBACK_TIMEOUT_MS`, `wireTileFallback`, `buildFallbackTileUrl`, `HOT_TILE_CLASS`/`FALLBACK_TILE_CLASS`) and `basemap-config.js`'s `prefersRetinaTiles` are **retired** — CARTO retina is handled by Leaflet's native `detectRetina`. The tile **URLs** are unchanged from BL2. **Amends HT1** (CARTO becomes a permanent base layer, not merely a per-tile fallback source) and **HT3/BL1** (the timeout mechanism is deleted, not re-tuned). | interview |
+| **SB2** | **HOT opaque on top; per-tile dissolve via Leaflet-native fade.** The HOT overlay renders at full layer opacity (1) so a loaded HOT tile completely covers the CARTO cell beneath it. Each HOT tile fades in 0→1 over Leaflet's built-in tile-fade (~200 ms, `fadeAnimation` left **enabled** — the app does not disable it and adds **no** competing custom opacity transition that would fight Leaflet's inline tile-opacity management), so the CARTO→HOT handover reads as a dissolve rather than a pop, and a slow HOT tile shows the already-present CARTO tile underneath meanwhile. Because HOT always paints over CARTO where it arrives, and both wear the same dark filter (SB3), a viewport mixing arrived-HOT and not-yet-arrived (CARTO-showing) cells never reads as a checkerboard. | interview |
+| **SB3** | **Shared dark filter on the per-layer containers (amends HT2/BL3 selector; value unchanged).** The single-source-of-truth filter `grayscale(1) invert(1) brightness(0.9) contrast(1.08)` (identical value to BL3, with its `-webkit-` twin) is applied in one `base.css` rule to the two layer containers `#map .leaflet-layer.map-tiles-hot, #map .leaflet-layer.map-tiles-fallback`. With no per-tile swap, Leaflet stamps each layer's `className` on its **container** (`.leaflet-layer`), and `filter` on a container greys that provider's whole tile set as one group; both providers therefore converge to the same dark look. The removed per-theme machinery is **not** restored: no Ruby `tile_filters`/`DEFAULT_TILE_FILTER_*`, no `frontend_app_config`/`data-app-config` `tileFilters`, no JS `resolveTileFilter`/`applyFiltersToAllTiles`/MutationObserver, no `--map-tile*-filter` custom property. Offline placeholder tiles carry neither class and stay unfiltered. **Amends HT2/BL3** (per-tile → per-layer selector; the filter *value* and its single-rule home are unchanged). | interview |
+| **SB4** | **Single pane dimming veil (brightness parity).** Tile dimming collapses to one rule `#map .leaflet-tile-pane { opacity: 0.5625 }`; `.leaflet-layer` returns to opacity 1 and the former `#map .leaflet-tile.map-tiles { opacity: 0.75 }` selector is removed (the `map-tiles` container class is gone). `0.5625 = 0.75 × 0.75` is the *effective* brightness the single pre-SB layer rendered at (pane 0.75 × layer 0.75), so the two stacked layers composite to **exactly today's** brightness. Dimming once at the pane makes the result independent of how many layers are in the tile pane — including when the offline placeholder (SB5) is added as a third. | interview |
+| **SB5** | **One liveness policy fed by both layers (extends HT4/DM3).** A single `createTileFailurePolicy` instance (`main/tile-failure-policy.js`, unchanged) receives `tileload` / `tileerror` / `load` from **both** layers on the dashboard: a `tileload` from **either** provider latches the basemap "alive", and `activateOfflineTiles` fires only when the whole initial viewport produced **zero** successful tiles across both layers (comprehensive dual outage). Thus HOT-down/CARTO-up **and** CARTO-down/HOT-up each keep a working map; only a both-providers outage reaches the offline placeholder. The offline switch removes **both** online layers. The offline `GridLayer` tier stays **dashboard-only** (the federation map keeps no kill-basemap logic, unchanged from DM3/HT5). **Extends HT4/DM3** (the ladder's top rung is now two parallel providers instead of one primary-with-fallback). | interview |
+| **SB6** | **Always-on dual egress; privacy posture (amends HT7).** Both keyless, cookieless raster-tile CDNs (HOT `openstreetmap.fr`, CARTO `cartocdn.com`) are now requested on **every** viewport — HT3's "CARTO only on a HOT-tile failure" conditionality is gone — so third-party tile egress is **two** CDNs rather than one, and CARTO now sees each viewer's IP/`Referer` on every pan/zoom rather than only on a HOT failure. Neither CDN receives a credential, cookie, analytics beacon, API key, or any user/mesh/operator identifier — only standard `{z}/{x}/{y}` tile coordinates — so **D11 (no phone-home) holds**: the bar is telemetry, which neither provider is sent. The doubled egress is documented **operator-visibly** in the README (a deliberate, disclosed trade-off, not silent). Reaffirms HT6/DM5 (no attribution) and Apex I (raster CDNs, not brokers; `guard-edits.py` untriggered). **Amends HT7** (which banked on common-case HOT-only egress). | interview |
+| **SB7** | **Stack & contract untouched (reaffirms D7/D8, HT5/BL4).** Native Leaflet only — two `L.tileLayer`s, **no** custom subclass, no new package or build step (D7). The dark filter, the pane opacity, and the layer z-indices are frontend constants; none enters `/version`, `data-app-config`, or any `/api/*` shape, so there is no contract change and no version bump (D8). The whole basemap still lives behind the one shared `createBasemapLayer` factory called by both maps (HT5/BL4), and it is protocol-neutral (Invariant IV). | proposed |
+| **SB8** | **Engineering bar (D9).** The new/changed frontend units — the `createBasemapLayer` factory (now returning the base+overlay pair) and the layer-option constants — ship with **100% unit tests**, full JSDoc, the exact Apache header, and clean linters; all existing suites stay green. Retired-module tests are **deleted, not left dangling**: `main/__tests__/fallback-tile-layer.test.js` is removed with its module. `__tests__/basemap-blend.test.js`, `__tests__/basemap-config.test.js`, `__tests__/federation-page.test.js`, `__tests__/config.test.js`, and the leaflet-stub map-init harness are **retargeted** to the two-layer wiring. **BL-A1** (which asserted `FALLBACK_TIMEOUT_MS === 2500`) and **HT-A3** (the per-tile swap mechanism) are **amended**, not silently broken. | D9 + proposed |
+
+---
+
+## Bugfix: MeshCore duplicate-node reconciliation (stale same-name identities)
+
+One physical MeshCore node surfaced as **three** dashboard rows: its live
+pubkey-derived row, a *retired* pubkey-derived row (an old keypair still present
+in ≥1 community roster), and the name-derived synthetic placeholder. Root
+causes, confirmed by deterministic reproduction: (a) the #755/#803 synthetic
+merge deadlocks as soon as a **second** same-name real row exists, because its
+ambiguity guard is absolute and unbounded in time; (b) duplicate message copies
+from co-operating ingestors overwrite `messages.from_id` last-writer-wins and
+bump their own `from_id` node's `last_heard`, so a retired identity that any
+stale roster still name-resolves receives eternal liveness and never ages out;
+(c) RX-log advert positions are keyed on receiver-side `recv_time`, so one
+advert flood mints one position row per copy and per ingestor. Integrates with
+`web/lib/potato_mesh/application/data_processing/{node_writes,messages}.rb`,
+`application/database.rb` (migration + #755 startup backfill),
+`application/queries/node_queries.rb`,
+`data/mesh_ingestor/protocols/meshcore/{handlers,decode}.py`, and
+`data/mesh_ingestor/CONTRACTS.md`.
+
+**Conflict check against existing decisions.** *MC-A1 / #755 machinery* —
+**amended, not silently overridden** (MR2): the documented "never merge when two
+same-name reals exist" rule gains a keyed-evidence freshness bound; the
+single-candidate base semantics are untouched. *RF3 (RX-log adverts)* —
+**extends** (MR5): only the position-time anchor moves from receiver-side to
+sender-side; the node mapping, `lastHeard`, and signal metrics are unchanged.
+*RF5 / retention* — **consistent**: no new deletion path; a retired identity
+simply stops receiving phantom liveness and ages out of the 7-day views while
+`retention.rb` remains the only data-expiry authority. *D8 (stable contract)* —
+**extends**: `nodes.last_advert_heard` (internal), the `synthetic` response
+field (MR4), and the sender-side position anchor are all additive; no version
+bump. *Invariant II (privacy)* — **consistent**: `synthetic: true` reveals only
+that a row is a name-derived placeholder (derived from public chat text); no
+new data class is exposed and opt-out/`PRIVATE` gates are untouched. *Invariant
+IV (parity)* — **consistent**: the evidence column is written by one
+protocol-neutral rule (any keyed, non-synthetic record); the resolution rules
+are scoped to MeshCore only because the synthetic-placeholder mechanism is
+MeshCore's own; Meshtastic behavior is byte-identical. *Apex I* — untouched.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **MR1** | **Keyed-evidence column.** Additive `nodes.last_advert_heard INTEGER` records the newest time a node was heard via a **key-authenticated record** — any non-synthetic upsert carrying `user.publicKey` (MeshCore contact/advert/self-info; Meshtastic NodeInfo with a key) — using the record's own heard time (sender-side `last_advert` for roster contacts, reception time for RX-log adverts), advancing forward-only. Name-inferred paths (message touches, chat placeholders) never write it. Written by a **separate, unguarded** statement, not a column in the main upsert: that upsert skips any record older than the stored `last_heard`, so a node whose `last_heard` was pushed to "now" by message touches would otherwise never record evidence from its own (sender-side-stamped, hence older) adverts — the exact situation the column exists to resolve. The migration seeds **no backfill**; every live device re-arms on its next advert/roster snapshot. | interview |
+| **MR2** | **Positive-staleness merge ambiguity (amends #755/#803 guard).** A same-name real row stops creating merge **ambiguity** only once it is *positively known* to be retired: `COALESCE(last_advert_heard, position_time)` **exists and** is older than `now − four_weeks_seconds`. **Absence of evidence is never staleness** — a `NULL` (a row predating the column; a node that has not re-advertised) keeps blocking exactly as today, so the post-migration window, and any quiet node, cannot be mis-merged. `position_time` is the legacy fallback signal because a MeshCore position is only ever written from a key-authenticated record (roster contact, advert, self-info) and never from chat text, making it valid historical keyed evidence. `merge_synthetic_nodes` bails when a not-positively-stale *other* real exists; `merge_into_real_node` folds into the survivor when all rivals but one are positively stale (≥2 live, or unknown rivals, keep refusing); the #755 startup backfill applies the same predicate. Single-candidate semantics are unchanged. The retired row itself is never deleted by the merge. *Accepted limitation:* a live node with a stale GPS fix and no evidence yet looks retired until its next advert (one advert cycle, self-healing); a retired identity that never stored a position stays "unknown" and keeps blocking, awaiting manual resolution. | interview |
+| **MR3** | **Duplicate-copy sender resolution (MeshCore).** When a MeshCore message copy arrives for an existing row with a different `from_id`, the ids are ranked — live-or-unproven real (2) > positively-stale real (1) > synthetic/unknown (0), using the same predicate as MR2 — and the incoming id replaces the stored one only on a **strictly higher** rank (ties keep the existing id; the empty/missing-`from_id` fill is unchanged). Applied on both collapse paths: the primary `id`-PK update **and** the `ConstraintException` insert-race fallback, which is precisely where two ingestors' copies meet. The sender-side ensure/touch block targets the **resolved winner**, so a losing copy grants no liveness to its own node — a retired identity's `last_heard` freezes and it ages out of the 7-day views naturally. Meshtastic message handling is byte-identical. | interview |
+| **MR4** | **`synthetic` exposed on the node API.** `GET /api/nodes` and `GET /api/nodes/:id` emit `synthetic: true` on name-derived placeholder rows and omit the key on real rows (matching the API's compact nil/blank convention — no `synthetic: false` noise). Additive per D8; documented in `CONTRACTS.md`. | interview |
+| **MR5** | **Sender-side position anchor for RX-log adverts (extends RF3).** The RX-advert path keys positions on the advert's own `adv_timestamp` (exposed by the `meshcore` library parser), falling back to `recv_time` when absent/zero, for both the `POST /api/positions` record and the node-row `position.time` anchor; `lastHeard` stays receiver-side. All flood copies of one advert — across paths **and** across ingestors — collapse to a single position identity, restoring the documented dedup intent; no grace window is needed. | interview + code |
+| **MR6** | **Engineering bar (D9).** Every touched unit ships with unit tests (evidence tracking, both merge directions incl. retained refusals, rank-resolution cases, adv-timestamp keying + fallback, API flag), full RDoc/PDoc, Apache headers, `black`/`rufo` clean; all suites stay green. | CLAUDE.md |
+
+
+---
+
+## Bugfix: MeshCore roster sync must not warm `last_heard` (issue #853)
+
+Loading the MeshCore contact roster re-stamped every positioned contact's
+`last_heard` to the sync wall-clock, so a node last actually heard months ago
+reappeared as **active**. `ensure_contacts()` runs at launch and on every
+reconnect (and `auto_update_contacts` re-fetches on adverts); each positioned
+contact then POSTed `/api/positions` with `rx_time = now`, and the web folds
+`rx_time` into `last_heard` via `MAX` (`update_node_from_position`). The
+node-upsert path already used the contact's real `last_advert` (MR1's stated
+intent); only the position path violated it. Integrates with
+`data/mesh_ingestor/protocols/meshcore/{position,handlers}.py`.
+
+**Conflict check.** *MR1 (roster contacts anchor on `last_advert`)* — **extends**:
+this brings the position path into line with the principle MR1 already stated
+for the node-upsert path; nothing in MR1 changes. *MR5 (RX-log advert position
+anchor)* — **consistent**: the RX-advert path is a genuinely-live reception and
+keeps `rx_time = now`; only its `position_time` uses `adv_timestamp`, unchanged.
+*RF5 / retention* — **consistent**: no new deletion; a dead contact simply stops
+being warmed and ages out of the 7-day window. *D8 (stable contract)* —
+**consistent**: no `/api/*` shape change (the `rx_time` field already exists);
+the web side is untouched. *Apex I / Invariant IV* — untouched (local RX only,
+protocol-neutral position handling).
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **RS1** | **Roster-sync positions carry the contact's real reception time.** `_store_meshcore_position` gains an explicit `rx_time` override (default = wall clock). The two roster-sync callers — `_process_contacts` (bulk `CONTACTS`) and `_process_contact_update` (`NEW_CONTACT`/`NEXT_CONTACT`) — pass the contact's `last_advert` as that `rx_time`, so the web-side `last_heard = MAX(rx_time, position_time)` resolves to `last_advert` rather than `now`. A live `NEW_CONTACT` has `last_advert ≈ now`, so it is unaffected; only genuinely-old roster contacts get a truthful old `last_heard`. The **genuinely-live** position paths — host `SELF_INFO` and on-air RX-log `ADVERT` (`on_rx_log_data`) — keep `rx_time = now` (their `last_heard` must advance). Ingestor-side only; the web `update_node_from_position` `MAX` logic is correct for real packets and is left unchanged. | interview + code |
+| **RS2** | **Engineering bar (D9).** The changed position helper and roster handlers ship with unit tests (roster `rx_time = last_advert`; `rx_time` override; live self-info / RX-advert still `now`), full PDoc, Apache headers, `black`-clean; all suites stay green. | CLAUDE.md |
+
+---
+
+## Bugfix: Frontend design & UX audit remediation (D-001…D-040)
+
+Remediates the 2026-07-22 design/UX audit of the dashboard frontend: 39 of its
+40 findings reproduced deterministically against source, live server HTML, and
+computed WCAG contrast (D-039 — "sort indicators invisible until first click" —
+did **not** reproduce: `sortState` initialises to `last_heard`/`desc` and
+`updateSortIndicators()` runs at init, so it is rejected). No finding violated
+an existing SPEC decision or acceptance criterion — the contract was silent on
+empty states, accessibility, contrast, information architecture, and visual
+encoding; this section closes that gap. The maintainer gates from the audit are
+ratified as contract: the map is the landing thesis, static pages belong to a
+secondary tier, **dark-only is identity**, operator-facing theme tokens are in
+scope, and the reduced mobile table is legitimate but must be curated.
+
+**Conflict check against existing decisions.** *DM7 (dead light palette
+collapsed)* — **extends**: the remaining light *component* literals + their
+`body.dark` overrides (explicitly left by DM7) are now folded to single dark
+rules; rendered appearance unchanged. *VF5/LV1–LV9 (flash/fade/wave,
+reduced-motion)* — **consistent/extends**: `prefers-reduced-motion` additionally
+gates Leaflet zoom easing and the chat-tablist smooth scroll (motion LV9 never
+covered). *RT1–RT4 (relative-time tick)* — **extends RT2**: the shared ~1 s
+tick additionally refreshes row age-bucket attributes (write-on-change, no
+re-render; markers stamp their bucket at render only — a deliberate VF3-style
+boundary). *LD-A2 (horizontal tab scroll preserved)* / *LV8 (tab dropdown)* —
+**consistent**: the strip keeps its scroll behaviour on desktop; ≤900 px the
+strip is hidden and LV8's dropdown is the sole channel navigation. *Invariant
+IV (parity)* — **extends**: MeshCore/Meshtastic gain a shape channel (square vs
+circle markers) — differentiation, not privilege; both remain equally legible
+and equally featured. *FS1–FS6 (signed federation wire)* — **consistent**: the
+CHANNEL→preset migration (UX12) keeps every wire/JSON **key** unchanged
+(`channel` now carries the resolved preset string), so no third signature
+break. *D8 (stable contract)* — **consistent**: no `/api/*` shape change;
+`/version` keys unchanged (values follow UX12 resolution). *Apex I / privacy
+II* — untouched: presentation-layer only, no dependency, no egress.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **UX1** | **Audit ratified; D-039 rejected.** The 39 reproduced findings are defects to fix; D-039 is dropped as not-reproduced (init stamps the default ▼). Line-number evidence re-based after #851. | audit + review |
+| **UX2** | **Accessibility floor: WCAG 2.1 AA contrast (1.4.3) for UI text.** Role-badge text colour is computed from the badge background's luminance (both palettes, all roles ≥ 4.5:1; kills the one-off `meshcoreRoleTextColors` map); chat log entries render `--muted`; errors render a new `--danger: #ff6b6b` token (≥ 4.5:1 on `--bg`); links use the single `--accent` (the `body.dark a { color:#9bd }` override is deleted); the four `#4a90e2` focus-ring literals become `var(--accent)`. | interview |
+| **UX3** | **Token aliases, not a rename.** `:root` gains `--border: var(--line)`, `--surface: var(--bg2)`, `--table-header-bg: var(--table-head-bg)`, `--hover-bg: var(--row-alt)` (fixing the federation table's undefined-token borders/sticky header) plus `--danger`. The audit's full `--pm-*` operator-theming rename is **deferred** to a follow-up feature. | interview |
+| **UX4** | **Degenerate states speak.** The layout ships a `<noscript>` notice; the nodes table ships a server-rendered `nodes-empty-row` ("No nodes heard yet — waiting for the first ingestor report.") that JS removes once nodes render and restores when the set is empty; empty table cells render a muted `—` dash (overlay parity); the empty-map placeholder stripes rise to 8–12 % white and always show the placeholder message when no positions exist. | interview |
+| **UX5** | **Freshness is visible state.** Rows and markers carry an age bucket — `live` (< 3 h), `today` (< 24 h), `stale` — stamped at render; CSS dims stale rows and accent-rules live rows; markers scale `fillOpacity` .85/.55/.30 by bucket. Buckets on rows refresh via the shared RT2 tick (attribute write-on-change; extends RT2). Markers restamp on data refresh only. | interview |
+| **UX6** | **Live/paused is legible.** The `#autorefreshToggle` becomes a text-bearing control: `● live` while streaming, `❚❚ paused HH:MM` when paused (timestamp = pause moment). Same element/id, aria semantics kept. | interview |
+| **UX7** | **Protocol shape channel + line key.** MeshCore markers render as square chips (`L.divIcon`), Meshtastic stays circular — colour keeps encoding role, shape encodes protocol (colourblind-safe). The legend's existing neighbor/trace toggle buttons gain 24 px line samples (solid = neighbor, dashed = traceroute), closing the missing-key gap without new controls. | interview |
+| **UX8** | **Legend defaults honest.** `/map` renders the legend expanded on desktop (collapsed ≤ 659 px and on the dashboard); the toggle label reads `Hide legend` / `Show legend` with a suffix **only** when role filters are active (mirrors the aria gating). | interview |
+| **UX9** | **Table IA curated.** Nodes table: a grouped second header row (Identity · Radio · Activity · Health · Utilization · Environment · Position) whose colspans are JS-maintained across the responsive tiers; ≤ 659 px survivors become Protocol/Short/Long/Last Seen/**Battery** (Role hides); a per-row `+` disclosure reveals the hidden fields as a definition list; rows get a hover state and a whole-row click that follows the long-name link; numeric columns right-align in the mono face with `tabular-nums` and the unit-bearing headers name their units (`Battery %`, `Voltage V`); `thead` was already sticky (the pre-existing bare `th` rule) and the fold gives it a solid background; both tables gain visually-hidden `<caption>`s and `scope="col"`; the dashboard gains visually-hidden section `h2`s. Federation table: Preset terminology (UX12), priority column order (Name · Domain · Preset · Frequency · Active …), lat/lon behind responsive tiers. | interview |
+| **UX10** | **Number honesty.** Utilisation renders 1 decimal; battery > 100 renders `100% ⚡` (powered sentinel); voltage with \|V\| < 0.01 renders the dash. | interview |
+| **UX11** | **Shell economics.** Site title clamps (`clamp(18px, 2.2vw, 28px)`, 40 vw ellipsis); the hamburger breakpoint rises to 1100 px; static pages move from both navs to the footer links row; the `(week)` count leaves the h1/tab title — the meta line becomes `N nodes today · M this week` with the day figure in `--fg`; the federation nav count gains a `title` tooltip; the Charts nav drops its protocol icon; the region selector collapses behind a compact 🌐 toggle; the announcement banner wraps to ≤ 3 lines under 600 px; the colocated-hub hit area grows to 32 px (16 px visual); chat ≤ 900 px shows the LV8 dropdown only (28 px arrows on desktop); chat entries get an 8ch hanging indent; `Select region ...` becomes `Other regions…`. | interview |
+| **UX12** | **Join surface + preset config migration (deprecating, fallback-compatible).** New env vars `MESHTASTIC_PRESET` (default `#LongFast` — the pre-existing `DEFAULT_CHANNEL` constant, so stock instances keep today's advertised strings) + `MESHTASTIC_FREQ` (default `915MHz`) and `MESHCORE_PRESET` + `MESHCORE_FREQ` (both empty ⇒ MeshCore line hidden). `CHANNEL`/`FREQUENCY` are **deprecated but honoured as fallbacks** for the Meshtastic pair. A `join-line` strip in the meta row renders `Meshtastic · <preset> · <freq>` (+ `MeshCore · <preset> · <freq>` when configured), linking to the About page when one exists. Terminology moves channel→preset everywhere operator-facing (federation table header **Preset**); every wire/JSON **key** (`channel` in `/version`, `data-app-config`, the signed federation payload) is unchanged and now carries the resolved Meshtastic preset string — no signature or contract break (FS1/BF3/D8 hold). README documents the migration. | interview |
+| **UX13** | **Map-first mobile landing, CSS only — found already implemented.** The audited route-swap was rejected (impossible viewport-conditionally server-side); the agreed CSS mechanism turned out to already ship: the ≤ 1024 px media block orders the chat panel after the map (`.chat-panel { order: 2 }`), so the mobile dashboard paints map-first today. Verified against source during the fix; no change was needed and the audit's D-004 evidence is corrected accordingly. Desktop order, routes, and bookmarks unchanged. | interview + review |
+| **UX14** | **Keyboard/AT equivalence declared.** `#map` gains `aria-describedby` pointing to a visually-hidden note naming the nodes table as the keyboard-accessible equivalent (markers stay pointer-driven — Leaflet focus retrofit rejected); tables/captions/scope per UX9. | interview |
+| **UX15** | **Engineering bar (D9).** Every change ships with 100 % unit tests (JS `node:test`, RSpec), full JSDoc/RDoc, the exact Apache header, `rufo`-clean formatting; all existing suites stay green; view specs asserting moved markup are updated, not deleted. | CLAUDE.md |
+
+---
+
+## Bugfix: UX audit follow-up (design review remediation)
+
+Remediates a Claude-Design review of the shipped UX-audit dashboard (8 numbered
+fixes plus 4 smaller "also spotted" items), each traced to a concrete
+`base.css` / `web/views/` / `assets/js/app/` cause. It is presentation-layer
+only: no dependency, no egress, no `/api/*`, `/version`, or `data-app-config`
+change, so **all four apex invariants and D7/D8 hold** by construction. Protocol
+parity (Invariant IV) is preserved — FU3 keeps the MeshCore-diamond /
+Meshtastic-circle distinction as differentiation, not privilege.
+
+**Conflict check against existing decisions.** *UX7/D-013 (MeshCore square chip,
+`2 × radius`)* — **amended** (FU3: equal-area rotated diamond at
+`round(radius × 1.78)`; a raw `2r` square out-weighed the circle ~27 %). *UX7/
+D-014 (legend dash sample `6 6`)* — **amended** (FU5: the 24 px **sample** uses
+`6 2` so it inks both ends; the on-map traces stay `6 6`). *UX11/D-033 (chat
+hang `8ch`)* — **amended** (FU1/FU9: hang is `19ch` — the real prefix width —
+and inline badge/icon/reply descendants zero the inherited `text-indent`). *UX11/
+D-029 (region toggle 🌐)* — **amended** (FU2: 🌍, greyscale-until-open). *UX12/
+D-002 (join strip in the meta row with a `details` link)* — **amended** (FU4:
+the strip moves to the footer beside the About link and the redundant `details`
+link is dropped). *UX11/D-026 (meta day/week line)* — **extends** (FU4: the line
+is unchanged; per-protocol counts are added to the two toggle buttons). *UX9/
+D-006/D-007/D-017 (nodes table)* — **extends** (FU6 condenses row density, FU7
+lists only reported fields in the disclosure row, FU10 pins both header rows).
+*UX8 (legend defaults)* — **extends** (FU12: columns top-align; no default
+change). *Footer slim variant* — **retired** (FU8). No invariant is contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **FU1** | **Chat badge sits in its colour box.** `text-indent` is inherited, so the D-033 hang re-applied to the inline-block `.short-name` / `.protocol-icon` / `.chat-entry-reply` inside `.chat-entry-msg`/`-node`. A `:where(...) :where(...)` reset zeros it on those descendants at specificity 0. | review |
+| **FU2** | **Region toggle reads as a place.** The glyph is 🌍 (was 🌐, a generic "web" mark); the button is greyscale/dimmed by default and returns to full colour + an accent frame on hover and `[aria-expanded="true"]` — the colour is the open-state feedback the toggle lacked. No JS change (`aria-expanded` already flips). | review |
+| **FU3** | **MeshCore marker is an equal-area diamond (amends UX7/D-013).** The chip is sized `round(radius × 1.78)` (16 px at radius 9 ≈ the circle's `πr²`), rotated 45° and corner-rounded in `base.css`; the rotation is CSS-only so the divIcon box and anchor are unchanged and the container keeps `overflow: visible`. | review |
+| **FU4** | **Join strip → footer; counts → toggles; `details` dropped (amends UX12/D-002, extends UX11/D-026).** The `.join-line` moves from the meta row to `_footer.erb` (rendered from the `Sanitizer` preset helpers, MeshCore entry only when both values are set). The two otherwise-unlabelled protocol toggles gain a per-protocol count span filled from the same 7-day figure as the legend column counts. The `details` link is removed — the footer's About link is beside the strip now. Every wire/JSON key is untouched (FS1/D8 hold). | review |
+| **FU5** | **Legend dash sample inks both ends (amends UX7/D-014).** `legendLineSampleSvg('trace')` uses `stroke-dasharray="6 2"`, which tiles the 22 px sample exactly (6+2+6+2+6); the map traceroutes keep `6 6`. | review |
+| **FU6** | **Condensed nodes table.** Row density is scoped to `#nodes` (`thead th` 5/8, `tbody td` 3/8 + `line-height 1.35`, group row 3/8), taking rows from ~30 px to ~20 px without shrinking the 12 px type; the waiting row keeps a roomy 12/8 via an id-scoped selector that outranks the tight rule. | review |
+| **FU7** | **Disclosure row lists only reported fields (extends UX9).** `filterReportedFields` drops null/empty/em-dash fields but **keeps honest zeros** (a `0 %` util or `0 V` is a real reading — UX10 number-honesty); an all-absent set falls back to one muted "No additional fields reported." line. | review + interview |
+| **FU8** | **Footer chrome on every route.** The transparent `.app-footer--slim` variant (and its full-screen padding reset) is deleted and the `slim` local dropped; the still-`position: fixed` footer now paints opaque with a lift shadow on Charts / Federation / `/pages/*` instead of floating over body copy. Geometry is unchanged (it was already fixed), so no content is newly occluded. | review |
+| **FU9** | **Chat hang is the real prefix width (amends UX11/D-033).** The `[HH:MM:SS][freq][MF]` prefix is 19 characters, so the hanging indent is `19ch` — wrapped lines land under the message column instead of mid-timestamp. | review |
+| **FU10** | **Both nodes-table header rows pin (extends UX9).** The group row becomes `position: sticky; top: 0` (was `static`) with a fixed 24 px border-box height; the column row pins at `top: 24px`, so the grouped header no longer scrolls away leaving the column row unbacked. | review |
+| **FU11** | **Badge meets the 44 px touch floor.** On `pointer: coarse`, a transparent centred `::after` lifts the `.short-name[data-node-info]` hit box to 44 px without changing its look; fine pointers keep the tight target so dense chat lines do not cross-capture clicks. | review |
+| **FU12** | **Legend columns share a top baseline (extends UX8).** `legend-column--bottom` is removed so the shorter MeshCore column top-aligns with Meshtastic; the two protocol titles sit on one line. | review |
+| **FU13** | **Engineering bar (D9).** Every change ships with 100 % unit coverage on new/changed lines (JS `node:test`, RSpec), full JSDoc/RDoc, the exact Apache header, `rufo`-clean specs; all existing suites stay green; view/JS specs asserting moved markup are updated, not deleted. | CLAUDE.md |
+
+---
+
+## Bugfix: Post-deploy design review (detail view, footer, marker recency)
+
+Answers four post-deploy asks against `992d6bb` (the deployed audit tree): three
+real gaps the audit left behind and one feature with a trade-off. Presentation
+layer only — no dependency, no egress, no `/api/*`, `/version`, or
+`data-app-config` change, so **all four apex invariants and D7/D8 hold**.
+Protocol parity (Invariant IV) is preserved: PD3 gives both protocols the same
+freshness-pane treatment.
+
+**Conflict check against existing decisions.** *UX9/D-007 (disclosure — mobile
+loses nothing) and UX4/D-020 (muted dash)* — **extended to `/nodes/:id`** (PD1):
+those were `#nodes`-scoped and never reached the detail table, which reused the
+global `.nodes-col--*` hide rules and lost columns with no disclosure. *FU4/FU8
+(static pages → footer)* — **regression fixed** (PD2): the enlarged
+single-`inline-flex` links row wrapped and stranded a separator; the links become
+their own tier and separators become dots. *`getRoleRenderPriority` render order
+(role-major z-order; MeshCore "companion above infrastructure")* — **amended**
+(PD3): **recency becomes the coarse stacking channel** and role the fine one, so
+a live low-priority node now paints over a stale high-priority one — the map
+answers "what is alive now", not "where is the infrastructure". The ladder is
+**preserved but subordinated** to freshness (it still orders within a pane), and
+the pre-existing protocol pane-split (every MeshCore chip painting over every
+Meshtastic circle, because `divIcon`→`markerPane` sits above `circleMarker`→
+`overlayPane`) narrows to within-a-bucket, since both marker types now share the
+three freshness panes. *FU10 (sticky group-header `24px` offset)* — **hardened**
+(PD4). No invariant is contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **PD1** | **The `/nodes/:id` detail view is a spec sheet, not a table (extends UX9/UX4).** `single-node-table.js` renders a grouped `<dt>/<dd>` spec sheet (Activity · Health · Utilization · Environment · Position) reusing `.node-detail__row`; it carries **no** `.nodes-col--*` classes, so nothing is `display:none`'d on a single-record page and no disclosure column is needed; absent telemetry renders the muted `.cell-empty` dash (fixing the blank-cell half). It reflows to one column ≤ 659 px with no horizontal scroll. Identity and the long name live in the page header (`detail-html.js`) and are not repeated; the pointless self-link to the current page is dropped. The one-record table's whole cost (18 columns of horizontal scroll) bought nothing — a table compares rows, and there is one row. | review |
+| **PD2** | **Footer is two intentional tiers with dot separators (fixes an FU4/FU8 regression).** `.footer-links` becomes its own tier (`flex-basis: 100%`) so the row can no longer strand the version→links separator on line one; every `.footer-separator` is `·` at `margin: 0 5px; color: var(--muted)` (a dot wants more air, less weight than an em dash); the chat label shortens to `chat:` (the instance name is already the title and logo). The `≤ 600px` stack rule is unchanged. | review |
+| **PD3** | **Marker stacking: recency-major via three freshness panes (amends the role-priority z-order).** The map creates three Leaflet panes — `markers-stale` < `markers-today` < `markers-live` (ascending z-index) — and every marker, **circle and chip**, is assigned its `nodeAgeBucket` pane (`freshnessPaneForBucket`). Freshness is the coarse channel; the existing `getRoleRenderPriority` ladder still orders **within** a pane. A live Meshtastic circle now paints over a stale MeshCore chip. This **inverts** the old guarantee (a stale ROUTER drops below a live CLIENT, and MeshCore's "companion above infrastructure" holds only within a bucket) — the deliberate trade for a liveness dashboard; role keeps its own untouched colour/shape channel. It also **narrows** the pre-existing protocol pane-split (chips no longer unconditionally top circles — only within one bucket). No representation change, so `circleMarker` performance is kept. | interview + review |
+| **PD4** | **Sticky group-header offset hardened (FU10).** The group row's `height: 24px` and the column row's `top: 24px` are a coupled pair; `white-space: nowrap` on `.nodes-group-header th` stops a longer label / translation / narrow tier from wrapping the group row and overlapping the two sticky rows. A comment names the coupling. | review |
+| **PD5** | **Engineering bar (D9).** Each fix shipped with a fail-first check (Phase 2), 100 % coverage on new/changed lines, full JSDoc, the exact Apache header, `rufo`/`black`-clean; all prior suites stay green; specs asserting the old detail table / footer markup are updated, not deleted. | CLAUDE.md |
+
+---
+
+## Bugfix: Legend shape key & chat log overflow
+
+Two deployed-CSS defects and one legend-key gap from a final frontend review.
+Presentation layer only — no dependency, no egress, no `/api/*`, `/version`, or
+`data-app-config` change; all four apex invariants and D7/D8 hold. Protocol
+parity (Invariant IV) is preserved: the legend keys both protocols' shapes
+equally.
+
+**Conflict check.** *UX7 (marker shape channel; the neighbor/trace line key)* —
+**extended** (LC1): the legend now also keys the role-swatch shape (circle vs
+diamond), the channel the map used but the panel never keyed; the swatch is the
+marker at legend size (same `nodeMarkerShapeForProtocol` mapping, same
+`side = radius × 1.78` area rule, same ring + 3px corner). *Legend filter visual
+feedback* — **fixed** (LC2): the pressed-state rule existed but a lower
+specificity than the global button reset meant it never painted. *UX11/D-033
+(chat hanging indent)* — **extended** (LC3): wrapped lines already hung at 19ch,
+but unbreakable tokens were never broken, so the panel scrolled sideways;
+`overflow-wrap: anywhere` on the same rule closes it. No invariant is
+contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **LC1** | **Legend swatches key the marker shape (extends UX7).** `buildRoleButtons` stamps each swatch `legend-swatch--diamond` (MeshCore) or `legend-swatch--circle` (Meshtastic) from `nodeMarkerShapeForProtocol` — one source of truth with the map. `base.css` renders the circle at 12px and the diamond as an equal-area 11px square rotated 45° (the map's `side = radius × 1.78`) with the chip's 3px corners, both carrying the marker's `1px rgba(0,0,0,.7)` ring, in a 16px slot so the diagonal never clips the label. The swatch is the marker at legend size, not a second drawing of it. Freshness (opacity) is deliberately **not** keyed (the recommended shapes-only option). | review |
+| **LC2** | **Legend pressed state paints (specificity fix).** A role chip is a `<button>`; the reset `button:not(.chat-tab):not(.sort-button)` (0,2,1) outranked the bare `.legend-item[aria-pressed="true"]` (0,2,0), so every chip computed to `#333` and only `font-weight` distinguished selected from filtered. The selector is now `button.legend-item[aria-pressed="true"]` (0,2,1), which wins on source order — the selected blue paints. | review |
+| **LC3** | **Chat log never scrolls horizontally (extends UX11/D-033).** `.chat-tabpanel` is `overflow-y: auto`, so its x-axis is a scroll container; nothing broke long tokens. `overflow-wrap: anywhere` on `.chat-entry-msg, .chat-entry-node` wraps unbreakable tokens under the 19ch hang and lowers the entry's min-content width so it can never exceed the panel. `anywhere`, not `break-word`; no `overflow-x: hidden` (which would only mask the next regression). | review |
+| **LC4** | **Engineering bar (D9).** Each fix shipped with a fail-first check (Phase 2), full JSDoc/comments, the exact Apache header, clean linters; all prior suites stay green; the `buildRoleButtons` filter specs gain the swatch-shape assertion, none removed. | CLAUDE.md |
+
+---
+
+## Feature: Mesh activity reporting & announcements
+
+Turns each ingestor from a pure listener into a reporter **and** an announcer.
+(1) **Reporting:** every ingestor counts *every* frame it handles — all received
+frames (including ignored / errored / unimplemented) plus its own transmissions —
+as one merged `packets` figure and appends the per-interval delta to its hourly
+`POST /api/ingestors` heartbeat; the web app persists a per-ingestor activity
+time-series so a **packets/hour moving average** is computable across
+time × protocol × multiple ingestors. (2) **Announcing** ("we stop listening and
+start talking"): each ingestor periodically broadcasts a one-line activity summary
+on its protocol's default channel, drawing the numbers **back from the target
+instance's own API** (dogfeeding, so one radio's partial view never
+under-represents the mesh). Integrates with
+`data/mesh_ingestor/handlers/_state.py` (RX/TX counting seam), `ingestors.py`
+(heartbeat payload), `config.py` (reuse `RX_ONLY`), `daemon.py`
+(announce schedule), `mesh_protocol.py` + `protocols/{meshtastic,meshcore,meshtastic_udp}`
+(optional send), a new announce + instance-stats-GET module, `data/ingestors.sql`
+plus a new `data/ingestor_activity.sql` table,
+`web/lib/potato_mesh/application/routes/{ingest,api}.rb`, the query + retention
+layers, and `data/mesh_ingestor/CONTRACTS.md`.
+
+**Conflict check against existing decisions.** *Invariant I (apex / local-LoRa)*
+— **consistent, extends §4.2**: the announcement is a LoRa transmission on the
+local aether and the dogfeed is an HTTP GET to the ingestor's *own* instance; no
+MQTT/broker/cloud dependency or connection is added (A1 stays clean), and ingestor
+TX already exists (`RX_ONLY`, MeshCore telemetry polls), so this widens an existing
+capability rather than crossing the apex line. *Invariant II (privacy)* —
+**extends**: a new gate suppresses the announcement unless the target instance
+reports non-private, read authoritatively from its `/version` and **fail-closed**
+on any fetch error; only public aggregates (active nodes, packet rate) are ever
+announced. *Invariant III (federation) & §5 (no analytics / phone-home)* —
+**consistent, new authorized behavior**: the announcement publishes an *unsigned
+public activity line on the community's local mesh* — not the signed federation
+wire, not cloud egress, not third-party analytics — and is opt-out via
+`RX_ONLY=1`. *Invariant IV (parity & pluggability)* — **extends**: sending is an
+*optional, duck-typed* provider capability, not a new formal `MeshProtocol` member,
+so the `A4b` conformance contract and every existing provider are untouched; both
+protocols announce identically. *D8 (stable contract)* — **extends**: the heartbeat
+`packets` field, the `/api/stats` `<scope>.packets.hour` metric, and the activity table
+are all additive; no version bump. *§3.3 (web is POST-only intake)* —
+**consistent**: the dogfeed is a read; no new ingest path. No invariant is
+contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **MA1** | **Merged packet counter — count everything, at the earliest seam.** Each ingestor maintains one merged `packets` counter incremented on **every received frame** — *all of them, including ignored / errored / unimplemented / unsupported-port packets* — counted at the earliest common receive seam (`handlers/_state._mark_packet_seen`, already invoked by both the Meshtastic `on_receive` path and every MeshCore handler/telemetry path *before* any dispatch or filtering), **plus every ingestor-initiated transmission** (the announcement itself and the existing MeshCore telemetry/status polls). RX and TX are deliberately **merged** into a single figure (no separate breakdown). "We don't want to under-report" is satisfied at source: counting precedes every drop/ignore decision. A build-phase check confirms each protocol's RX entry funnels through the seam so no family is missed. | interview |
+| **MA2** | **Heartbeat carries the per-interval delta.** `POST /api/ingestors` gains an additive optional `packets` field = frames counted since the previous heartbeat (a per-interval **delta**, not a since-boot cumulative), reset to zero each time a heartbeat is queued. Per-interval deltas map one-to-one onto time-series rows and are restart-safe (a reboot simply starts a fresh interval). Absent ⇒ treated as `0`, so pre-feature ingestors and the existing `tests/test_mesh.py` fixtures are unaffected (D8). | interview |
+| **MA3** | **Per-ingestor activity time-series (the moving-average schema).** A new append-only table `ingestor_activity` (`ingestor_id TEXT`, `at INTEGER`, `packets INTEGER`, `protocol TEXT`, indexed on `at`) records one row per heartbeat delta. This is the schema that makes a packets/hour moving average computable while distinguishing **multiple protocols and multiple ingestors per protocol** (each ingestor's contribution is kept separate rather than pre-summed). The `ingestors` snapshot table (one row per node) is unchanged. Rows are pruned by the existing retention worker (window ≥ the 24 h the announcement needs; sized with the other activity floors). | proposed |
+| **MA4** | **Aggregation = MAX per protocol; `total` = SUM across protocols (dedup-free "in the air").** The mesh-wide packets/hour for a protocol is `MAX` over that protocol's ingestors of *(that ingestor's total `packets` reported in the last 24 h ÷ 24)*. A single radio can only hear ≤ what is actually transmitted, so the busiest single vantage is the best dedup-free estimate of unique air traffic and can never double-count a frame heard by two radios (true per-frame dedup is impossible anyway — ignored/errored frames carry no id). The **`total`** rate is the **SUM** of the per-protocol rates — different protocols ride different frequencies/channels, so their frames never overlap in the air and add rather than dedup. **Amended pre-release:** `total` first shipped as a MAX over *every* ingestor regardless of protocol, which under-counted it to the single busiest protocol (e.g. meshcore 44 + meshtastic 76 rendered as 76, not 120); corrected to the cross-protocol SUM. The fixed `÷ 24` denominator (not ÷ elapsed) keeps the rate stable and avoids divide-by-small spikes; an ingestor with < 24 h of data simply reads lower and ramps up (moot in practice — the announcement fires only ≥ 24 h after start, MA7). *Accepted limitation:* the per-protocol MAX under-estimates the true union when different radios are busiest in different hours. | interview |
+| **MA5** | **Exposure as an additive per-scope `packets` metric.** `GET /api/stats` exposes the MA4 24 h MAX-aggregated moving average under each scope as `<scope>.packets.hour` — a `packets` metric carrying a single `hour` window (it is a rate, not a windowed count, so no day/week/month keys), consistent with the S1 `scope → metric → window` layout. `reticulum.packets.hour` is a forward-looking `0` stub (S6); `total.packets.hour` is the **SUM** of the per-protocol rates (MA4). The rest of the S1 tree is untouched, so this needs **no** version bump. The announcement's active-node figure reuses the existing `<protocol>.nodes.day` count (already deduped by `node_id`); only packets/hour is new. **Amended pre-release:** the field originally shipped (unreleased, on `main`) as a top-level `packets_per_hour: { total, meshcore, meshtastic, reticulum }` map; it is superseded here by the per-scope `packets.hour` form for consistency with the S1 tree. Because it was merged but **not yet in any tagged release** and is **not** on the signed federation wire, the reshape carries **no** version bump, federation-compat fallback, or signature break — only the in-repo `announce.py` dogfeed reader (MA6) and the specs/docs move with it. | proposed (amended) |
+| **MA6** | **Announcement content, drawn from the instance's own API (dogfeeding).** Each ingestor broadcasts, for its own configured protocol, a single line formatted to that protocol's character limit: `"<Protocol> activity in the last 24h: <N> active nodes, <M> packets/hour. https://<domain>"`. `<N>` and `<M>` are fetched **from the target instance** (`GET /api/stats` → `<protocol>.nodes.day` and `<protocol>.packets.hour`), never computed from the ingestor's local view — because one ingestor may not see the whole mesh. `<domain>` is the configured `INSTANCE_DOMAIN`. Reporting (MA1–MA4) is independent and continues regardless of announcement state. | interview |
+| **MA7** | **Announcement is triple-gated.** An announcement is transmitted only when **all** hold: (a) `RX_ONLY` is unset — the **reused** receive-only flag (default `0`) is the single transmit gate; `RX_ONLY=1` forbids *every* ingestor TX (the MeshCore polls and the announcement alike), so it is the sole opt-out and **no separate `ENABLE_TX` env is added**; (b) the target instance reports **non-private** — the ingestor GETs `<domain>/version` and honors `config.private_mode`, re-checked every cycle, and **fails closed** (skips) on any fetch/parse error, so a privacy signal is never missed (Invariant II); (c) **≥ 24 h have elapsed since ingestor start** — so the first numbers are accurate over a full window and restarts cannot spam the channel. | interview |
+| **MA8** | **Default channel/scope + 24 h cadence.** The announcement is broadcast on the protocol's **default channel and scope** — Meshtastic channel `CHANNEL_INDEX` (default `0`) via the interface text-send; MeshCore its public/default channel — honoring existing `ALLOWED_CHANNELS`/`HIDDEN_CHANNELS` intent. After the initial ≥ 24 h wait it repeats **every 24 h**, per configured instance domain (an ingestor with several `INSTANCE_DOMAIN` targets announces each with its own numbers and link). TX volume is negligible (~1 frame/day/domain). | proposed |
+| **MA9** | **Optional duck-typed provider send.** Transmission is exposed as a new **optional** provider method (e.g. `send_channel_announcement(iface, text)`) accessed via `getattr(provider, …, None)` — mirroring the existing optional `self_node_item` extension — so the `@runtime_checkable MeshProtocol` interface and its `A4b` isinstance conformance are unchanged, and a provider that cannot transmit (or a receive-only transport) simply omits it. Both `meshtastic` and `meshcore` providers implement it; neither protocol is privileged. | interview |
+| **MA10** | **Engineering bar (D9).** Every new/changed unit ships with 100 % unit tests (counter increment across RX families + TX; heartbeat delta + reset; activity-table write + retention; MAX-aggregation math incl. multi-ingestor; the `/api/stats` field; the four announcement gates incl. fail-closed privacy and the 24 h wait; per-protocol send), full PDoc/RDoc, Apache headers, `black`/`rufo` clean; `pytest`/`rspec`/`npm test` stay green; `CONTRACTS.md` documents the additive heartbeat field, the activity schema, and the `/api/stats` addition. | CLAUDE.md |
+
+---
+
+## Feature: Mesh activity map card (frontend)
+
+Surfaces the MA5 `<scope>.packets.hour` rate on the dashboard as a "Mesh
+activity" card in the map's bottom-left corner (the recommended treatment from
+the imported Claude-Design review, option 1a). Frontend/read-side only:
+integrates with `web/public/assets/js/app/stats.js` (parses the new `packets`
+rates), a new `web/public/assets/js/app/map-activity-card.js` module, the map
+setup + stats callback in `web/public/assets/js/app/main.js`, and
+`web/public/assets/styles/base.css`. Consumes the existing `GET /api/stats` with
+**no** API/DB/ingestor change.
+
+**Conflict check against existing decisions.** *Invariant I (apex)* —
+**consistent**: a read-side consumer of the existing local API; no broker,
+dependency, or egress. *Invariant II (privacy)* — **consistent**: packets are a
+public aggregate (no message content), already un-gated by `PRIVATE` (MA5); the
+card shows only rates the API already returns. *Invariant IV (parity)* —
+**extends**: both protocols render identically and either can be toggled; neither
+is privileged. *D8 (contract) / §3.3 (POST-only intake)* — **consistent**: no new
+endpoint or shape; the card reads `<scope>.packets.hour` as it ships. *AV3
+(cache-busting)* — **consistent**: the new module self-registers in the automatic
+import map. No invariant is contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **MA-F1** | **Placement & source.** A "Mesh activity" card renders as a Leaflet control at the map's **bottom-left** (mirroring the roles legend bottom-right) on the dashboard and `/map`. Its figures come from `GET /api/stats` `<scope>.packets.hour` (parsed by `stats.js` into `stats.packets = { total, meshcore, meshtastic }`); on a stats-fetch failure the local-count fallback carries no packets, so the card simply hides. Recommended design option 1a / treatment A ("Signal card"). | interview + design |
+| **MA-F2** | **Content.** A pulsing live-dot + "Mesh activity" label; the big tabular **total** packets/h; the placeholder sparkline (MA-F5); and one row per protocol (Meshtastic, then MeshCore) carrying the protocol icon, label, a share-bar sized to the busiest visible protocol, and the tabular rate. **`reticulum` is never rendered** (forward-looking zero stub, S6). | design |
+| **MA-F3** | **Zero-state unmount.** The card is hidden entirely (`.map-activity-card--hidden`, `hidden`, emptied) whenever the visible total is `0` or the payload carries no packet rates — the map's one free corner is never occupied by an empty card. | interview + design |
+| **MA-F4** | **Toggle-reactive rebasing (Invariant IV parity).** A protocol hidden via the meta-row protocol toggle (the existing `hiddenProtocols` set) drops its row and rebases the displayed total to the **sum of the visible** protocol rates — the same treatment for both protocols, identical to how the node counts already rebase. Toggling re-runs `applyFilter`, which re-renders the card; hiding **all** protocols unmounts it. | interview + code |
+| **MA-F5** | **Sparkline (superseded by F2-4).** As first shipped in F1 the 24-hour sparkline was a **deterministic placeholder** (`data-placeholder="true"`), never claiming to be live. **Superseded by F2-4:** it now renders the real 24 h `total` series from `GET /api/stats/activity`, and is simply **omitted** when that series is unavailable — the card never shows a fake curve. | interview |
+| **MA-F6** | **Engineering bar (D9) & scope.** Frontend/read-side only — no API/DB/ingestor change (D8, §3.3), apex (I) untouched. The DOM-building logic lives in `map-activity-card.js` at **100 % unit coverage** (JSDoc, Apache header); `main.js` holds only the Leaflet-control wiring + the one render call in the stats callback (integration-only, matching the sibling legend control). The module self-registers in the cache-busting import map (AV3). `npm test` stays green; no Ruby/Python change. | CLAUDE.md |
+
+---
+
+## Feature: Mesh activity time-series (F2)
+
+Adds a bucketed packets/hour time-series over `ingestor_activity` so the map
+card's 24 h sparkline (MA-F5) and a protocol-aware `/charts` figure render on
+real history instead of a placeholder. Backend: `GET /api/stats/activity` +
+`query_activity_buckets` (`web/lib/potato_mesh/application/queries/ingestor_queries.rb`)
++ the route in `application/routes/api.rb`. Frontend: `map-activity-card.js`
+(real sparkline) and `charts-page.js` + `views/charts.erb` (the new figure).
+Read-side, additive; no ingest or DB-schema change.
+
+**Conflict check.** *Apex I / §3.3* — **consistent**: a read of the existing
+local DB; no broker, egress, or ingest path. *Privacy II* — **consistent**:
+packets are a public aggregate (no message content), un-gated like MA5. *Parity
+IV* — **extends**: the series and the chart are per-protocol and equal, and the
+`/charts` intro stops naming a single protocol. *D8* — **extends**: a new
+additive endpoint (snake_case params, no version bump); the camelCase
+`/aggregated` params remain BP9's separate migration. No invariant is
+contradicted.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **F2-1** | **New `GET /api/stats/activity`.** Bucketed packets/hour series over `ingestor_activity`, mirroring `/api/telemetry/aggregated` (window clamped to the 28-day floor, bucket count capped at `MAX_QUERY_LIMIT`, `ApiCache`), but with **snake_case** `window_seconds`/`bucket_seconds` params — the API norm. Returns `[{ bucket_start, bucket_end, total, meshcore, meshtastic }, …]` ascending. The lone camelCase params on `/aggregated` stay the tracked BP9 migration, not folded in here. | interview |
+| **F2-2** | **Per-bucket aggregation mirrors MA4.** Within each bucket, per protocol = **MAX** over that protocol's ingestors of their summed packets; `total` = **SUM** across protocols; each ÷ (`bucket_seconds`/3600) to a packets/hour rate. `reticulum` folds into `total` but emits no series (consistent with `query_packets_per_hour`). | interview + code |
+| **F2-3** | **No new retention.** `ingestor_activity` is already retained a year; the 28-day API clamp is the only ceiling. The card requests **24 h / 1 h** buckets, the `/charts` figure **7 d / 2 h**. | code |
+| **F2-4** | **Card real sparkline.** The MA-F5 placeholder is replaced by the real 24 h series from `/api/stats/activity`, fetched on a slower cadence with its own short cache (the trend moves slowly — not every refresh). On fetch failure the sparkline is omitted but the live total/rows (from `/api/stats`) still render — the card never regresses to a fake curve. | interview |
+| **F2-5** | **Charts page — protocol-aware, all-protocol.** A "Mesh activity" figure (packets/h per protocol, 7 d) is added to `/charts` **between** the channel-utilization and environmental figures. The intro no longer names "Meshtastic": the aggregated telemetry (`query_telemetry_buckets`) already carries **all** protocols (MeshCore telemetry included since the telemetry pull shipped) — the prior wording mislabelled all-protocol data. Invariant IV. | interview |
+| **F2-6** | **Engineering bar (D9).** 100 % unit tests (rspec for `query_activity_buckets` + the route; node --test for the card sparkline + charts figure), full RDoc/JSDoc, Apache headers, `rufo`/`black` clean; `CONTRACTS.md` documents the new endpoint; all suites stay green. | CLAUDE.md |
+
+---
+
+## Bugfix: Neighbor/trace legend toggles highlight when visible
+
+The neighbor-line and trace-line legend toggles set `aria-pressed="true"` when their
+lines were **hidden**, so `button.legend-item[aria-pressed="true"]` (the selected/
+highlighted style, LC2) painted them highlighted while the lines were off — reversed
+relative to the role chips, which highlight when a role is **visible**. Fixed in
+`web/public/assets/js/app/main.js` (`updateNeighborLinesToggleState` /
+`updateTraceLinesToggleState`). Presentation-only; no data/API change.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **NT1** | The neighbor/trace line toggles set `aria-pressed="true"` when their lines are **visible** (highlighted = shown), consistent with the role chips (LC2) and the meta-row protocol toggles; previously reversed (pressed when hidden). Presentation-only, no data/API change. | review |
+
+---
+
+## Bugfix: Mesh activity design-review remediation
+
+A Claude-Design review of the shipped F1/F2 work against the 1a/1c/1d design. The
+card, the real-data sparkline, and the toggle rebasing all matched or bettered the
+design; this section remediates the one regression and the mobile/charts
+divergences it found. Presentation + read-side only; no API/DB change.
+**Conflict check:** **fixes** an MA-F3 regression and **extends** MA-F4/MA-F5/F2-4
+(the sparkline now rebases with the toggles); consistent with all invariants.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **MR1** | **Idle card stays hidden on mobile (MA-F3 regression fix).** The mobile media query set `.map-activity-card { display: flex }`, which outranked `.map-activity-card--hidden { display: none }` (equal specificity, later rule) and the `[hidden]` attribute, so an idle card painted an empty pill over the map. `.map-activity-card--hidden { display: none }` is re-declared inside the media query. | review |
+| **MR2** | **Mobile strip is a full-width caption (design 1d).** Below the mobile breakpoint the bottom-left Leaflet control spans the map (`left: 0; right: 0`, 8px inset) at ≥ 32px tall with the protocol split pushed to the far edge (`margin-left: auto`), so it reads as a map caption rather than a content-width corner pill. | review |
+| **MR3** | **Mobile breakpoint aligned to the app band.** The strip triggers at ≤ 659px (the app's mobile band, UX9), not a one-off 640px. | review |
+| **MR4** | **Sparkline headroom.** `sparklinePathsFromSeries` scales to `max × 1.15`, so the busiest hour's vertex sits below the box edge and the 1.5px stroke is never clipped. | review |
+| **MR5** | **Sparkline rebases with the toggles.** The curve is the sum of the **visible** protocols per bucket (from `/api/stats/activity`'s per-protocol fields), so it agrees with the headline total once a protocol is toggled off — previously the number rebased but the curve stayed all-protocol. Extends MA-F4 / F2-4. | review |
+| **MR6** | **Card is a labelled `group`.** The card root carries `role="group"` so its `aria-label` is announced (a bare div's is not); children stay readable, unlike `role="img"`. | review |
+| **MR7** | **`/charts` intro is protocol-neutral.** The all-protocol "Network telemetry trends" heading no longer carries the single Meshtastic badge (`charts.erb`), matching the de-scoped copy (F2-5). | review |
+| **MR8** | **Utilization second-axis (design 1c) explicitly out of scope.** The packets/h right-hand axis overlay on the channel-utilization chart was **not** built — the standalone "Mesh activity" figure (F2-5) is the shipped scope; recorded so the design is not re-litigated. | review |
+
+---
+
+## Bugfix: MeshCore RX packet undercount & position radio metadata
+
+Two MeshCore ingestor defects where the ingestor under-reports data it already
+holds. **(a)** The packet counter drastically under-counts MeshCore RF traffic:
+`on_rx_log_data` (`protocols/meshcore/handlers.py`) counted only `ADVERT`
+RX-log frames and dropped every other received frame (`REQ`, `RESPONSE`,
+`GRP_TXT`, `TEXT_MSG`, `ANON_REQ`, `PATH`, `ACK`, …) to the `DEBUG`-only capture
+via an early `return` that never reached the counting seam — violating **MA1**
+("count *every* received frame, including ignored / errored / unimplemented").
+Field evidence: 31 171 uncounted non-`ADVERT` RX-log frames over ~3 days on one
+node. **(b)** MeshCore position POSTs omit `lora_freq`/`modem_preset`: the
+protocol-specific builder (`protocols/meshcore/position.py`) posts directly and
+never called `_apply_radio_metadata`, so every `/api/positions` row landed with
+nil radio config (empirically 0 of 3 278) even though the ingestor had captured
+those values at `SELF_INFO` — unlike MeshCore message and node POSTs, which are
+enriched.
+
+**Conflict check.** *MA1 (count everything at the earliest seam)* — **fixes**:
+(a) restores the invariant for the MeshCore RX-log family that was silently
+dropped; the corrected mechanism (**PC2**) refines MA1's "every MeshCore
+handler" phrasing to the RX-log seam without changing the goal. *RF3 (only
+`ADVERT` RX-log frames upsert nodes)* — **preserved**: non-`ADVERT` frames still
+never upsert and stay in the `DEBUG`-only capture (PC2 only adds *counting*, not
+storing). *MA4 (MAX-per-protocol aggregation)* — **untouched**: only the
+per-ingestor RX count changes. *Invariants I/II (apex/privacy)* —
+**consistent**: no broker/egress, no new on-disk retention; radio metadata is
+already carried on other MeshCore records. *Invariant IV (parity)* —
+**consistent**: Meshtastic already counts every frame at `on_receive` and its
+positions already carry radio metadata; this brings MeshCore to parity.
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **PC1** | **Root cause = an early `return` before the counting seam (implementation defect, MA1 right).** Non-`ADVERT` `RX_LOG_DATA` frames were routed to `_record_meshcore_message` and returned *before* any `_mark_packet_seen`, so they were never counted. MA1's own "a build-phase check confirms each protocol's RX entry funnels through the seam" did not catch this family. | interview + code |
+| **PC2** | **Model A — count at the `RX_LOG_DATA` seam; decoded events are clock-only.** The MeshCore firmware emits exactly one `RX_LOG_DATA` frame per received over-air frame (the complete per-frame ground truth of "what is in the air"), while the decoded high-level events (`CHANNEL_MSG_RECV`, `CONTACT_MSG_RECV`, bare `ADVERTISEMENT`, `NEW_CONTACT`/`NEXT_CONTACT`, remote telemetry/status responses) are duplicates of those same frames (the `decrypt_channels` RX-log join, **RF2**, confirms both events fire for one frame). So MeshCore counts **every** frame **once** at `on_rx_log_data` — before the `ADVERT`/non-`ADVERT` split, the malformed-advert skip, and the DEBUG-capture drop — and the decoded seams advance the reconnect clock only. This eliminates both the undercount (all frame types now count) and any double-count (decoded duplicates do not re-count). | interview (Model A) |
+| **PC3** | **Reconnect clock decoupled from the counter (`_mark_packet_activity`).** `_mark_packet_seen` previously did two jobs — advance `_last_packet_monotonic` (the inactivity-reconnect clock, `daemon._check_inactivity_reconnect`) *and* count. A new `handlers/_state._mark_packet_activity` does the clock update alone; `_mark_packet_seen` = `_mark_packet_activity` + `activity.record_packet`. Every MeshCore seam that stops counting still calls `_mark_packet_activity`, so its **reconnect timing is unchanged** — only the counter is deduplicated. Companion-link reads (`SELF_INFO`, `CONTACTS`, host self-telemetry) are clock-only too: they are not over-air traffic. *One deliberate, benign effect:* non-`ADVERT` RX-log frames now advance the clock as well (the old early `return` skipped both the count **and** the clock), so inactivity-reconnect fires marginally *less* eagerly — overheard RF traffic is proof the link is alive, so this is strictly more correct, not a regression. | code |
+| **PC4** | **Accepted caveat: firmware without RX logging.** Because RX counting now flows solely through `RX_LOG_DATA`, a MeshCore build that does not push RX-log frames counts ~0 RX (TX still counts). Companion firmware ≥ 1.16 pushes RX-log frames unconditionally while a client is connected (**RF3**), which is the supported target, so this is the deliberate, documented cost of an accurate per-frame count over a partial-but-firmware-robust estimate. | interview + code |
+| **PC5** | **MeshCore position POSTs carry captured radio metadata.** `_store_meshcore_position` applies `_apply_radio_metadata` before posting, adding `lora_freq`/`modem_preset` from the values captured at `SELF_INFO` (absent ⇒ omitted, never nil-stamped), matching MeshCore message/node POSTs and the Meshtastic position path. An audit of every `_queue_post_json` builder confirmed positions were the **only** omission; no web-side fallback is added (the ingestor is the source of truth). | interview + code |
+
+---
+
+## Bugfix: Canonical node-id lookups (bridge bang-stripping, digit-only refs)
+
+Live failure (2026-07-27): the Matrix bridge requested node lookups with the
+canonical id's `!` stripped, and `GET /api/nodes/:id` resolves a bang-less
+digit-only ref exclusively as a Meshtastic node **num** — so a message from
+`!27336717` (an 8-hex id composed entirely of decimal digits, ~2.3% of the id
+space) failed its node lookup five polls in a row and was dropped by the
+poison tracker, while `/api/nodes` listed the node and `/api/nodes/!27336717`
+returned 200. **Conflict check:** **extends** D8 (the `!%08x` id is canonical
+system-wide — the bridge must not transform it on the wire) and D8's
+backward-compatible evolution rule (the route fallback is additive: every
+currently-resolving ref resolves identically); consistent with all four
+invariants (read-side only, no new egress, protocol-neutral — the ambiguity
+hits Meshtastic and MeshCore ids alike).
+
+| # | Decision | Source |
+| --- | --- | --- |
+| **NL1** | **The bridge requests nodes by the full canonical id** — `/api/nodes/%21<hex>` (the URL-encoded `!%08x` form), never the bare hex. Root-cause fix on the consumer side per D8; effective against current production servers without any web deploy. | interview |
+| **NL2** | **`GET /api/nodes/:id` gains a hex-id fallback for digit-only refs.** A bang-less ref matching `\A[0-9]{8}\z` keeps its existing num-first resolution; only when the num interpretation matches nothing is it retried once as the canonical `!<8-digit-hex>` id. Deterministic precedence (a genuine num match always wins), additive (no currently-resolving ref changes meaning), and scoped to the per-id nodes route only — bulk/query-param refs are untouched. Hardens the API for any bang-stripping client beyond the bridge. | interview |

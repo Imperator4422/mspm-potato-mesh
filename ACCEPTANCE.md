@@ -226,7 +226,6 @@ grep -A14 '^coverage:' .codecov.yml
 `target: 100%` and `threshold: 10%`. Per-language coverage is produced by the
 suites in B1 (SimpleCov for Ruby, `pytest-cov`, `cargo llvm-cov`, `flutter
 --coverage`, V8 for JS) and enforced server-side by Codecov.
-> See [§ Known gaps](#known-gaps): the `patch` block is currently missing.
 
 ### B3 — 100% API documentation (language standard)
 ```bash
@@ -432,13 +431,41 @@ These deviate from the bar above and are surfaced by the Phase 2 environment
 audit. They are **FAIL** until fixed, but a reviewer should attribute them to the
 existing codebase, not to the change under review.
 
-- **B2 — `.codecov.yml` has no `patch` block.** It defines only
-  `coverage.status.project.default` (target 100% / threshold 10%); `CLAUDE.md`
-  requires the same on **patch**. Fix tracked in the Phase 2 audit.
 - **B4 — header-check exemptions are conventional, not codified.** Formats
   without comment syntax (JSON fixtures under `tests/`, `*.lock` files, binary
   assets) cannot carry the notice; there is no committed allow-list or CI check
   asserting headers. The B4 commands above are the interim verification.
+- **A1b — two benign textual matches in the broker grep.** The repo-wide A1b
+  command matches `.claude/hooks/guard-edits.py` (the anti-broker edit guard's
+  own pattern list) and the "no broker" documentation comment in
+  `web/lib/potato_mesh/application/pubsub.rb` (PS1). Both are descriptive or
+  defensive text *about* the apex ban — neither is a broker dependency or
+  connection — but they sit outside A1b's `via_mqtt` exemption wording. Treat
+  these two files as documented exemptions until the A1b filter codifies them.
+- **B1 — sandbox DNS breaks the `POST /api/instances` spec block.** In
+  sandboxed environments whose resolver maps the suite's test domains
+  (`mesh.example`, …) into the SSRF guard's restricted address ranges, 17
+  `spec/app_spec.rb` "POST /api/instances" examples fail with
+  `{"error":"restricted domain"}` (400 instead of 201). Environmental only:
+  the failures reproduce identically with and without any change under review
+  and do not occur where the test domains resolve normally (CI). Attribute to
+  the environment, not the codebase or the change.
+- **C2 — `tests/test_mesh.py` fails in isolation on Python 3.14.** Running
+  the C2 command alone (`pytest -q tests/test_mesh.py`) fails 3 daemon
+  reconnect-loop tests (`test_main_retries_interface_creation`,
+  `test_main_reconnects_when_connection_event_clears`,
+  `test_main_recreates_interface_after_snapshot_error`): their local
+  `DummyEvent` helpers monkeypatch the global `threading.Event` with a
+  `wait(self, timeout)` signature that requires an argument, and Python
+  3.14's `Thread.start()` calls `self._started.wait()` with none →
+  `TypeError`. Pre-existing and independent of any change under review
+  (reproduces on a clean tree), and **the full suite (`pytest -q tests/`)
+  passes** — the failure is an isolation/collection-order artifact of the
+  global patch. A naive `timeout=None` default is *not* a fix: it lets the
+  patched-Event path run further and breaks thread startup in the full suite
+  too ("cannot join thread before it is started"). Needs a proper follow-up
+  that stops monkeypatching the global `threading.Event` in those three
+  tests; until then, judge C2 by the full-suite run.
 
 ---
 
@@ -513,7 +540,7 @@ git grep -nA2 'def version_fallback' -- web/lib/potato_mesh/config.rb
 `{ nodes, messages, telemetry }`, each metric carrying integer
 `{ hour, day, week, month }`, with `sampled` still present and `false`. The old
 flat keys (`active_nodes`, integer-valued `meshcore`/`meshtastic`) are **gone** —
-this is the intended, versioned break. `version_fallback` returns `"0.7.1"`, and
+this is the intended, versioned break. `version_fallback` returns `"0.7.4"`, and
 `test_version_sync.py` **passes** — the bump is applied in lockstep across all
 five language manifests (`data.VERSION`, `Config.version_fallback`,
 `web/package.json`, `app/pubspec.yaml`, `matrix/Cargo.toml`; `matrix/Cargo.lock`
@@ -2118,6 +2145,11 @@ in `web/lib/potato_mesh/config.rb`,
 shell checks from the repo root.
 
 ### DM-A1 — Both maps use CARTO Dark Matter; HOT is gone — DM1
+
+> **⚠️ Superseded by HT-A1** (§ *HOT primary basemap (dark-filtered) with per-tile
+> CARTO fallback*). HOT is intentionally restored as the **primary** basemap, so
+> the "HOT is gone" expectation below no longer holds by design; CARTO is retained
+> as the per-tile fallback. **HT-A1 is the authoritative check.**
 ```bash
 git grep -nE "basemaps\.cartocdn\.com/dark_all" -- web/public/assets/js
 git grep -niE "openstreetmap\.fr|/hot/" -- web/public/assets/js web/lib web/views
@@ -2130,6 +2162,13 @@ layer options (subdomains `abcd`, `detectRetina`, `crossOrigin:'anonymous'`,
 `maxZoom`) are asserted by the JS map-init / DM-A3 suite.
 
 ### DM-A2 — Tile-filter pipeline fully removed (native dark) — DM2
+
+> **⚠️ Partially superseded by HT-A2.** A single **static** dark filter is
+> intentionally reintroduced for HOT tiles (CSS/JS constant only). The Ruby
+> `tile_filters` / `data-app-config` `tileFilters` half of this check **still
+> holds** (that plumbing stays removed), and none of the removed per-theme
+> machinery (`resolveTileFilter` / `applyFiltersToAllTiles` / MutationObserver /
+> `--map-tile*-filter`) returns. **HT-A2 is the authoritative check.**
 ```bash
 git grep -niE "tile_filters|DEFAULT_TILE_FILTER|map_tile_filter|tileFilters|map-tile-filter|map-tiles-filter|resolveTileFilter|applyTileFilter|applyFiltersToAllTiles|applyFilterToTile|ensureTileHasCurrentFilter" -- web/lib web/public/assets web/views
 git grep -n -A2 "def resolve_initial_theme" -- web/lib/potato_mesh/application/routes/root.rb
@@ -2430,3 +2469,1952 @@ capture touches only already-built DOM), **CB-A1** (every bulk collection still
 backfills; the accumulators it merges into are raw, which is the shape the model
 already expects), and **B1** (all suites). Frontend-only: no POST/GET/event
 contract change, so `CONTRACTS.md` and the Python suite are unaffected.
+
+---
+
+## Bugfix: UDP-transport hardening & bridge failure-tracker coverage
+
+Four small defects fixed as a batch. The first two live on the passive
+UDP-transport surface (PR #838), which shipped with **no SPEC/ACCEPTANCE
+feature section** — the contract was silent there, so these are its first
+command-backed checks. The third closes a test-coverage gap (D9/B1) in the
+Matrix bridge's poison-message tracker (PR #839). The fourth repairs the
+Python CI dependency drift that turned `main` red after #838. Formatting
+drift found alongside (rufo on `web/views/layouts/app.erb`, the cause of the
+red Ruby workflow on `main`) is covered by the existing **B5**, no new check
+needed.
+
+### UH-A1 — malformed `PRIMARY_CHANNEL_KEY` fails at import, not in the retry loop
+```bash
+( . .venv/bin/activate && pytest -q tests/test_config_unit.py -k PrimaryChannelKey )
+PRIMARY_CHANNEL_KEY='not-base64!!' python -c 'import data.mesh_ingestor.config'  # exits non-zero, names the var
+```
+**Expected:** the unit tests pass; the one-liner fails with
+`ValueError: PRIMARY_CHANNEL_KEY is not valid base64: 'not-base64!!'. …`.
+`config.py` validates the key as base64 **at import time** (decoding exactly as
+`meshtastic_udp_decode.expand_default_key` later would), matching the existing
+`TRANSPORT`/`PROTOCOL` import-time validation. Previously the raw value was
+stored unchecked and only decoded lazily inside `channel_hash` /
+`decrypt_meshpacket`, so with `PRIMARY_CHANNEL_NAME` set a malformed key raised
+`binascii.Error` out of `connect()` — caught by `daemon._try_connect`'s
+generic `except Exception`, which logged only "Failed to create mesh interface"
+and retried forever: the service never ingested and never surfaced the cause.
+Valid keys of any decodable length (1-byte default `AQ==`, 16/32-byte PSKs) are
+accepted unchanged; blank still falls back to `AQ==`.
+
+### UH-A2 — UDP multicast sockets bind the group address, never all interfaces
+```bash
+( . .venv/bin/activate && pytest -q tests/test_meshtastic_udp_socket_unit.py tests/test_capture_udp_fixtures_unit.py )
+git grep -n 'bind(("", ' -- data/
+```
+**Expected:** tests pass; the grep prints nothing. Both
+`data/mesh_ingestor/protocols/meshtastic_udp_socket.py` and its documented
+mirror `data/tools/capture_udp_fixtures.py` bind `(group, port)` instead of the
+wildcard `("", port)` (CodeQL *py/bind-socket-all-network-interfaces*): the
+kernel then delivers only datagrams addressed to the multicast group, so
+unicast traffic sent to the port on any local interface never reaches the
+socket. Receive behavior for "Mesh via UDP" traffic is unchanged (the transport
+is multicast-only); binding a group address is POSIX behavior (Linux/macOS, the
+platforms the transport targets). The capture tool, previously untested, gains
+unit coverage of its socket plumbing.
+
+### UH-A3 — bridge failure-tracker success-path reset is covered — D9/B1
+```bash
+( cd matrix && cargo test poll_once_clears_failure_tracker_when_failed_message_recovers )
+```
+**Expected:** pass. The most common real-world sequence — a message fails a
+poll transiently, then succeeds on the next — executes the success-path reset
+in `poll_once` (`matrix/src/main.rs`: clear `failing_msg_id` /
+`failing_msg_attempts` after a successful `handle_message`), which **no prior
+test reached**: the watermark test stops at the first failure and the poison
+test's tracker is already cleared by the skip before the next success. The test
+arms the tracker with a 500 node lookup, swaps the mock to 200, re-polls, and
+asserts the tracker is cleared, the watermark advances through the recovered
+message to the batch tail, and the message is not reprocessed. Verified by
+mutation: with the reset disabled (`if false && …`) only this test fails —
+every other test stays green, which is the coverage gap this closes.
+
+### UH-A4 — Python CI installs the ingestor deps from the manifest
+```bash
+grep -n 'pip install -r data/requirements.txt' .github/workflows/python.yml
+```
+**Expected:** one match in the workflow's install step. The workflow previously
+hand-listed packages (`black pytest pytest-cov meshtastic meshcore`), which
+silently drifted from `data/requirements.txt` when PR #838 added
+`cryptography>=42.0.0` — every Python CI run on `main` since then failed test
+collection with `ModuleNotFoundError: No module named 'cryptography'`.
+Installing from the manifest (which also carries the dev deps) keeps CI in
+lockstep with the documented [Setup](#setup-one-time) command and removes the
+drift channel.
+
+### UH-R1 — Regression: prior acceptance still holds
+```bash
+( . .venv/bin/activate && pytest -q tests/ ) && ( . .venv/bin/activate && black --check ./ )
+( cd matrix && cargo test --all --all-features && cargo fmt --all -- --check \
+            && cargo clippy --all-targets --all-features -- -D warnings )
+( cd web && bundle exec rspec ) && ( cd web && npm test ) && ( cd web && bundle exec rufo --check . )
+```
+**Expected:** all green, including **B5** (rufo/black — `views/layouts/app.erb`
+re-formatted). At risk and explicitly required to stay green: the UDP provider
+suite (`test_meshtastic_udp_unit.py` — the provider consumes the validated key
+and group-bound socket unchanged), `test_config_unit.py`'s UDP-var defaults
+(blank-fallback semantics unchanged), and the bridge watermark/poison tests
+(the new test only adds coverage; `poll_once` is untouched). The web app,
+federation wire, and Flutter app are behaviorally untouched by this batch —
+the only edits outside the four fixes are the lockstep 0.7.2 version-bump
+stamps (manifests, lockfiles, iOS plist, README pinned tags, S-A1), verified
+by `tests/test_version_sync.py`.
+
+---
+
+## Bugfix: MeshCore ghost nodes (stale contact enrichment discarded)
+
+A MeshCore node first seen via a bare `ADVERTISEMENT` push was upserted as a
+minimal placeholder stamped `lastHeard = now` (receiver wall clock). The
+follow-up roster contact record — carrying the real name/role/public key — is
+stamped `lastHeard = last_advert`, the **sender-side** advert-creation time,
+which is always older than the placeholder's receive time (seconds for healthy
+clocks, years for broken ones). `upsert_node`'s row-level freshness guard
+(`WHERE excluded.last_heard >= nodes.last_heard`) therefore discarded the
+entire named update, permanently: every later contact re-post (auto-update,
+periodic snapshot, restart) is also sender-stamped and also lost, while each
+advertised-position ingest re-bumps the row's `last_heard`. Result: nameless
+"ghost" nodes with a hex `short_name`, NULL role (displayed as the CLIENT
+default), and an advert-stamped `position_time` — violating the reconciliation
+promise in `CONTRACTS.md` ("a later full contact advertisement reconciles it",
+SPEC A4e). Fixed web-side (Ruby): after the guarded upsert, a non-synthetic
+record additionally **fills identity columns that are still NULL** (`num`,
+`short_name`, `long_name`, `macaddr`, `hw_model`, `role`, `public_key`,
+`is_unmessagable`) regardless of staleness — stale data can fill gaps but can
+never overwrite fresher values, and synthetic placeholders remain barred from
+real rows. No ingestor/API/DB-schema change; protocol-neutral (Invariant IV).
+
+### GH-A1 — Stale contact records name advert-placeholder ghosts
+```bash
+( cd web && bundle exec rspec spec/data_processing_spec.rb -e "stale contact record enrichment" )
+```
+**Expected:** pass. Replaying the ingestor's wire sequence — bare-advert
+placeholder (`lastHeard = now`, no name) followed by the roster contact record
+(`lastHeard = last_advert`, older by 17 s and by ~2 years in a second example) —
+leaves the node **named** with its real role and public key. The stale record
+never regresses `last_heard`, never overwrites an existing name/role, empty
+strings never fill `long_name` / `short_name` (the other identity fields of the
+same record still fill), and a stale `synthetic=1` chat placeholder still
+cannot touch a real row.
+
+### GH-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && bundle exec rspec ) && ( cd web && npm test ) && ( cd web && bundle exec rufo --check . )
+( . .venv/bin/activate && pytest -q tests/ )
+```
+**Expected:** all green. At risk and explicitly required to stay green: the
+pre-existing `upsert_node` guard specs (`data_processing_spec.rb` — role/
+identity preservation, generic-name fallback, synthetic flag + merge #755/#803)
+and `database_spec.rb`'s node-merge suites, since the fix appends a second
+NULL-fill statement inside the same `upsert_node` transaction; the Python
+ingestor is untouched (A4e's advert-capture suite unchanged).
+
+---
+
+## Bugfix: Docker release builds on 32-bit ARM (fail-fast teardown + missing armv7 toolchain)
+
+The v0.7.2 release build (run 28775124854) failed twice the same way: PR #838
+added `cryptography>=42.0.0` (AES-CTR for the passive UDP transport), which —
+like its C dependency `cffi` — publishes **no 32-bit ARM wheels** (neither
+musllinux nor manylinux `armv7l`), so the `python:*-alpine` armv7 image build
+compiles both from source. The Dockerfile's throwaway `.build-deps` lacked the
+required toolchain, dying at `src/c/_cffi_backend.c:15:10: fatal error: ffi.h:
+No such file or directory`. Because the build matrix left `fail-fast` at its
+default (`true`), that one leg cancelled all eight healthy publish jobs —
+web and matrix-bridge images for every architecture were never pushed, and
+GitHub's carried-over-failure semantics make re-running any job of the run
+impossible (new attempts are cancelled within seconds by the failed sibling).
+UH-A4 fixed the same #838 dependency drift for `python.yml`; the image-build
+half was uncovered — no prior criterion asserted that container images build.
+Fix: `fail-fast: false` on the `build-and-push` matrix (one architecture's
+breakage must never withhold the other architectures' images), and the armv7
+compile toolchain (`libffi-dev openssl-dev pkgconfig rust cargo`) added to the
+`.build-deps` that are removed again after `pip install` (image size
+unchanged). Cold armv7 builds compile cryptography's Rust extension under QEMU
+(~30–60 min), amortised by the workflow's per-service/arch GHA layer cache.
+
+### DK-A1 — one failing architecture cannot tear down the release matrix
+```bash
+grep -n 'fail-fast: false' .github/workflows/docker.yml
+```
+**Expected:** exactly one match, inside the `build-and-push` job's `strategy`
+block — sibling matrix jobs keep building and pushing when one leg fails, so a
+single-architecture defect degrades the release to 8/9 images instead of 2/9.
+
+### DK-A2 — ingestor image builds for linux/arm/v7 (cryptography from source)
+```bash
+docker buildx build --platform linux/arm/v7 -f data/Dockerfile --target production .
+```
+**Expected:** exit 0 (requires QEMU binfmt:
+`docker run --privileged --rm tonistiigi/binfmt --install arm`; a cold build
+compiles `cffi` + `cryptography` from source and may take 30–60 min emulated).
+Zero-docker fallback (static form, suitable for sandboxes without a daemon):
+```bash
+sed -n '/virtual .build-deps/,/pip install/p' data/Dockerfile \
+  | grep -v '^[[:space:]]*#' | grep -cE 'libffi-dev|openssl-dev|pkgconfig|rust|cargo'
+```
+**Expected:** prints `5` — the armv7 source-build toolchain is present in
+`.build-deps` (comment lines excluded; the packages are still removed by the
+trailing `apk del .build-deps`).
+Rust-drift caveat, so the next failure of this class is recognised quickly: a
+future `cryptography` bump may require a newer Rust than the pinned Alpine
+release ships; the failure mode is this same job failing with a Rust version
+error, and the remedies are bumping `PYTHON_VERSION` (newer Alpine) or capping
+`cryptography` in `data/requirements.txt`. This drift was first hit at v0.7.3
+(run 30155699130): `cryptography` 49.0.0 requires rustc 1.83, but the then-pinned
+`3.12.6-alpine` (Alpine 3.20) ships Rust 1.78 — fixed by bumping `PYTHON_VERSION`
+to `3.12.10` (`-alpine` → Alpine 3.22 → Rust 1.87), keeping `cryptography`
+current. That bump is bounded above: Docker Hub published no
+`windowsservercore-ltsc2022` base past 3.12.10 and the `production-windows` stage
+shares this ARG, so a further bump must split the ARG per stage (or cap
+`cryptography`) rather than 404 the Windows base.
+
+### DK-R1 — Regression: prior acceptance still holds
+```bash
+grep -nA3 '^on:' .github/workflows/docker.yml
+git ls-files '.github/workflows/docker.yml' 'data/Dockerfile' \
+  | xargs grep -L 'Copyright © 2025-26 l5yth & contributors'
+```
+**Expected:** the workflow still triggers on `v*` tag pushes and
+`workflow_dispatch` (release flow unchanged); the license-notice grep prints
+nothing (B4 intact). No source code, dependency manifest, or test suite is
+touched by this fix — B1 suites are unaffected by construction; the only
+behavioral deltas are matrix cancellation policy and armv7 build-stage
+packages.
+
+---
+
+## Feature: HOT primary basemap (dark-filtered) with per-tile CARTO fallback
+
+Maps to SPEC decisions **HT1–HT8**. The shared basemap factory lives in
+`web/public/assets/js/app/basemap-config.js`; the per-tile timeout→CARTO tile
+layer in `web/public/assets/js/app/main/fallback-tile-layer.js`; the dashboard
+wiring in `web/public/assets/js/app/main.js` and federation wiring in
+`web/public/assets/js/app/federation-page.js`; the static dark filter in
+`web/public/assets/styles/base.css`; the offline last-resort tier in
+`web/public/assets/js/app/main/offline-tile-layer.js` (dashboard only). Run JS
+checks from `web/`, shell checks from the repo root.
+
+### HT-A1 — HOT is the primary basemap on both maps; CARTO retained as fallback — HT1
+
+> **⚠️ CARTO-URL half superseded by BL-A2** (§ *Bugfix: Basemap provider blend
+> (chess-pattern fix)*). The CARTO fallback source is intentionally migrated from
+> the natively-dark Dark Matter (`dark_all`) to the *colored* Voyager
+> (`rastertiles/voyager`), so the `dark_all` grep below no longer matches by
+> design. The **HOT-primary half stands** (HOT is still the primary on both maps);
+> **BL-A2 is the authoritative check** for the fallback source.
+
+```bash
+git grep -nE "tile\.openstreetmap\.fr/hot" -- web/public/assets/js
+git grep -nE "basemaps\.cartocdn\.com/dark_all" -- web/public/assets/js
+```
+**Expected:** the first prints the HOT URL
+(`{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png`) from **one** shared basemap
+module (`basemap-config.js`) referenced by both the dashboard and federation maps;
+the second still prints the CARTO Dark Matter URL
+(`{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png`) — **retained**, now as
+the per-tile fallback source, not the primary. HOT options (`subdomains:'abc'`,
+`maxZoom:19`, `crossOrigin:'anonymous'`) and CARTO options (`subdomains:'abcd'`,
+`detectRetina`, `crossOrigin:'anonymous'`) are asserted by the HT-A3/HT-A5 suites.
+**Supersedes DM-A1** (which required the HOT reference to be absent).
+
+### HT-A2 — Dark filter reintroduced for HOT only; static, dark-only, off the contract — HT2
+
+> **⚠️ Filter-scope half superseded by BL-A1** (§ *Bugfix: Basemap provider blend
+> (chess-pattern fix)*). The dark filter is intentionally **no longer HOT-only**:
+> `.map-tiles-fallback` now carries the *same* filter as `.map-tiles-hot` (BL3), so
+> the two providers blend. The greps below still pass unchanged (the filter is
+> still one static `base.css` rule, the removed Ruby/contract machinery stays
+> removed, `resolve_initial_theme` is still `"dark"`); only the *scope* prose
+> ("HOT-only", "`.map-tiles-fallback { filter: none }`") is amended. **BL-A1 is the
+> authoritative check** for the shared filter. Offline placeholder tiles still stay
+> unfiltered.
+
+```bash
+git grep -nE "grayscale\(1\) invert\(1\)" -- web/public/assets/styles/base.css
+git grep -niE "tile_filters|DEFAULT_TILE_FILTER|map_tile_filter|tileFilters|resolveTileFilter|applyFiltersToAllTiles|--map-tile" -- web/lib web/public/assets/js web/public/assets/styles web/views
+git grep -n -A2 "def resolve_initial_theme" -- web/lib/potato_mesh/application/routes/root.rb
+```
+**Expected:** the first prints the reintroduced dark filter
+(`grayscale(1) invert(1) brightness(0.9) contrast(1.08)`) as a **static** rule on
+the per-tile class `.map-tiles-hot` in `base.css` (Leaflet puts a layer's
+`className` on the tile container, not each tile, so per-tile filtering uses a
+per-tile class). The second prints **nothing** — none of the removed
+per-theme machinery returns: no Ruby `tile_filters`/`DEFAULT_TILE_FILTER_*`, no
+`data-app-config` `tileFilters`, no JS `resolveTileFilter`/`applyFiltersToAllTiles`,
+and no `--map-tile*-filter` custom property. The filter is one static CSS rule
+(shared by `.map-tiles-hot` and `.map-tiles-fallback` per BL3; offline placeholder
+tiles carry neither class and stay unfiltered); the third shows
+`resolve_initial_theme` still returns `"dark"` (app stays dark-only, so no light
+filter exists). **Supersedes the CSS/JS half of DM-A2**; the Ruby/contract half of
+DM-A2 still holds.
+
+### HT-A3 — Per-tile 1000 ms timeout swaps HOT→CARTO — HT3
+
+> **⚠️ Superseded by SB-A1 / SB-A5** (§ *Feature: Dual stacked basemap layers (HOT
+> over CARTO, no timeout)*). The per-tile timeout-and-swap mechanism this criterion
+> checks was **removed by design**: HOT and CARTO now load as two always-on stacked
+> layers with **no** per-tile deadline, so `main/fallback-tile-layer.js` **and its
+> test are deleted** and the command below no longer resolves. **SB-A1** (no
+> `FALLBACK_TIMEOUT_MS` / `fallback-tile-layer` symbols remain) and **SB-A5** (both
+> layers feed one liveness policy) are the authoritative checks. Retained for
+> historical context only — do not run the command below.
+
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/fallback-tile-layer.test.js )
+```
+**Expected:** pass. The Leaflet-free fallback logic decides: (a) a tile whose HOT
+image loads before 1000 ms keeps the HOT source (filtered) and cancels its timer;
+(b) a tile whose HOT image fires `error` is swapped to the CARTO URL for the same
+`{z}/{x}/{y}` immediately; (c) a tile whose HOT image neither loads nor errors
+within 1000 ms is swapped to CARTO on timeout; (d) a swapped tile is marked
+`.map-tiles-fallback` (unfiltered) and requests the CARTO subdomain/retina URL.
+The 1000 ms threshold is a single named constant (the source of truth).
+
+### HT-A4 — Offline placeholder only when BOTH providers fail (dashboard) — HT4
+
+> **⚠️ Superseded by SB-A5** (§ *Feature: Dual stacked basemap layers*). The
+> fallback ladder is **preserved but re-expressed**: with two independent layers
+> the single `tile-failure-policy` is now fed by **both** (any `tileload` from
+> either latches "alive"; offline fires only on a comprehensive dual outage), and
+> `main/fallback-tile-layer.js` is deleted — so the command below no longer
+> resolves. **SB-A5** (`tile-failure-policy.test.js` + the new
+> `main-app-map-init.test.js`) is the authoritative check; the federation map still
+> keeps no offline tier. Retained for historical context only — do not run the
+> command below.
+
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/fallback-tile-layer.test.js \
+                       public/assets/js/app/main/__tests__/tile-failure-policy.test.js )
+```
+**Expected:** pass. The fallback layer signals Leaflet `tileload` when **either**
+HOT or the CARTO fallback serves a tile, and signals `tileerror` **only** when the
+CARTO fallback tile *also* fails (covered by `fallback-tile-layer.test.js`). The
+DM3 `tile-failure-policy` is unchanged and stays green: the offline `GridLayer`
+(`main/offline-tile-layer.js`) activates only on comprehensive both-provider
+failure (zero successful loads across the initial viewport), preserving DM-A3
+tolerance one tier lower. The federation map has no offline tier (unchanged from
+DM3).
+
+### HT-A5 — Both maps use the one shared basemap factory — HT5
+```bash
+git grep -nE "createBasemapLayer" -- web/public/assets/js/app/basemap-config.js web/public/assets/js/app/main.js web/public/assets/js/app/federation-page.js
+git grep -nE "createOfflineTileLayer|activateOfflineTiles" -- web/public/assets/js/app/federation-page.js
+```
+**Expected:** the first shows `createBasemapLayer` **defined once** in
+`basemap-config.js` and **called by both** `main.js` and `federation-page.js` — one
+basemap definition, both maps identical (HOT-primary + CARTO fallback). The second
+prints **nothing** — the offline GridLayer tier is dashboard-only (federation gains
+no kill-basemap/offline logic, per DM3).
+
+### HT-A6 — No attribution overlay (reaffirms DM5) — HT6
+```bash
+git grep -nE "attributionControl:\s*false" -- web/public/assets/js
+git grep -nE "\battribution:" -- web/public/assets/js/app/main.js web/public/assets/js/app/federation-page.js web/public/assets/js/app/basemap-config.js
+```
+**Expected:** the first prints `attributionControl: false` on **both** maps
+(unchanged from DM-A5); the second prints **nothing** — no `attribution:` credit
+string was added for HOT or CARTO.
+
+### HT-A7 — Apex/contract untouched — HT7
+```bash
+git grep -niE 'mqtt|mosquitto|paho|amqp|kafka|broker' -- web/public/assets/js/app/basemap-config.js web/public/assets/js/app/main/fallback-tile-layer.js web/public/assets/js/app/main.js web/public/assets/js/app/federation-page.js
+git grep -nE "tileFilters" -- web/lib/potato_mesh/application/helpers/config_helpers.rb
+git diff --name-only HEAD -- web/Gemfile web/package.json data/requirements.txt matrix/Cargo.toml app/pubspec.yaml
+```
+**Expected:** the first two print **nothing** — the basemap hosts are not brokers
+(apex **A1** stays green) and `frontend_app_config` emits no `tileFilters` (no
+`/version` / `data-app-config` contract move). The third prints **nothing** — no
+dependency manifest changed, so `guard-edits.py` never triggers and the frozen
+stack (**D6**) is unaffected.
+
+### HT-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. Explicitly amended and required to
+stay green: **DM-A1** (superseded by HT-A1 — HOT is intentionally back), **DM-A2**
+(CSS/JS half superseded by HT-A2 — the static dark filter is intentionally back;
+the Ruby/contract half still holds), **DM-A3** (extended by HT-A4 — tolerance
+preserved behind the CARTO tier). Still green unchanged: **DM-A5 / DM-A6 / DM-A7**,
+**A1** (apex — no broker), **B1** (all suites), **B4** (exact Apache header on the
+new `main/fallback-tile-layer.js` and its test), and **D1 / BF1** (the `/version`
+config block is unchanged). The DM-era JS tests are **updated** to the HOT-primary
++ CARTO-fallback wiring, not removed: `__tests__/config.test.js`,
+`__tests__/federation-page.test.js`, and the leaflet-stub map-init harness.
+
+---
+
+## Bugfix: Basemap provider blend (chess-pattern fix)
+
+Maps to SPEC decisions **BL1–BL4**. The graceful timeout and colored CARTO source
+live in `web/public/assets/js/app/basemap-config.js`; the shared dark filter in
+`web/public/assets/styles/base.css`; both are locked by
+`web/public/assets/js/app/__tests__/basemap-blend.test.js`. The per-tile HOT vs
+CARTO looks (dark-filtered HOT tiles beside unfiltered CARTO tiles, on a routine
+1000 ms fallback) rendered the basemap as a **light/dark checkerboard**; the fix
+makes fallback rare (2500 ms) **and** blends the two providers to one dark look
+(colored Voyager source + shared filter). Run JS checks from `web/`, shell checks
+from the repo root.
+
+### BL-A1 — Graceful 2500 ms timeout + colored Voyager fallback + shared filter
+
+> **⚠️ Timeout half superseded by SB-A1; blend half by SB-A3/SB-A4** (§ *Feature:
+> Dual stacked basemap layers*). There is **no longer a per-tile timeout**:
+> `FALLBACK_TIMEOUT_MS` is **deleted with the mechanism**, so assertion (1) below
+> (`=== 2500`) **no longer exists** — the rewritten `basemap-blend.test.js` command
+> still passes but now verifies only the *colored-Voyager source* and the *shared
+> per-layer filter* (assertions (2)/(3) below), plus the single pane veil. The
+> Voyager source and the shared filter remain valid and are now the authoritative
+> checks under **SB-A3** (shared filter on both `.leaflet-layer.map-tiles-hot` /
+> `-fallback`) and **SB-A4** (single `.leaflet-tile-pane` `opacity: 0.5625`);
+> **SB-A1** covers the absence of the timeout constant. Read assertion (1) below as
+> historical only.
+
+```bash
+( cd web && node --test public/assets/js/app/__tests__/basemap-blend.test.js )
+```
+**Expected:** pass. Asserts (1) `FALLBACK_TIMEOUT_MS === 2500` (raised from the
+aggressive 1000 ms, so a slow-but-arriving HOT tile beats the deadline and
+fallback stays rare); (2) `CARTO_TILE_URL` targets the *colored* CARTO **Voyager**
+style (`/rastertiles/voyager/`), not the natively-dark `dark_all`; and (3)
+`base.css` applies the **same** `grayscale(1) invert(1) …` dark filter to
+`.map-tiles-fallback` as to `.map-tiles-hot` (no longer `filter:none`). Together
+these make a viewport mixing HOT and CARTO tiles render as one coherent dark
+basemap instead of a checkerboard.
+
+### BL-A2 — No Dark Matter reference remains; Voyager is the sole fallback source
+```bash
+git grep -n "dark_all" -- web/public
+git grep -nE "rastertiles/voyager" -- web/public/assets/js/app/basemap-config.js
+```
+**Expected:** the first prints **nothing** — the natively-dark Dark Matter source
+is fully replaced (production constant and test fixtures alike); the second prints
+the Voyager fallback URL from the one shared basemap module. **Supersedes the
+`dark_all` half of HT-A1**; the HOT-primary half of HT-A1 is unchanged (HOT is
+still the primary basemap on both maps).
+
+### BL-R1 — Regression: prior acceptance still holds
+
+> **⚠️ Superseded by SB-R1** (§ *Feature: Dual stacked basemap layers*). This
+> clause predates the two-layer redesign and describes state that has since
+> changed — `fallback-tile-layer.test.js` is now **deleted** (not "updated"), and
+> the per-tile swap mechanism HT-A3 checked is **gone**. **SB-R1 is the current
+> regression authority** (it re-runs `npm test` + `rspec` and enumerates every
+> amended prior criterion, including these). The command below still holds — both
+> suites stay green — so it is safe to run; only the per-criterion prose beneath is
+> historical.
+
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. Explicitly amended and required to
+stay green: **HT-A1** (the CARTO fallback URL is now Voyager, not `dark_all` — the
+`basemap-config.test.js` / `fallback-tile-layer.test.js` fixtures are **updated**,
+not removed); **HT-A2** (the dark filter now also covers `.map-tiles-fallback` —
+still one static `base.css` rule; the removed Ruby/contract `tileFilters`
+machinery stays removed, offline tiles stay unfiltered); **HT-A3** (the per-tile
+swap mechanism is unchanged — only the timeout constant and the swapped-in URL
+differ). Still green unchanged: **HT-A4 / A5 / A6 / A7** (fallback ladder, one
+shared factory on both maps, no attribution, apex/contract untouched), **A1** (no
+broker — the basemap hosts are raster CDNs), **B1** (all suites), and **B4** (exact
+Apache header on the new `basemap-blend.test.js`).
+
+---
+
+## Bugfix: Node-table telemetry hidden by newer packets of another type
+
+Meshtastic telemetry is a protobuf `oneof` — each packet carries exactly one
+metric family (device / environment / power / air-quality;
+`data/mesh_ingestor/handlers/telemetry.py`). The node table's environment
+columns exist only through the client-side per-node telemetry merge
+(`aggregateTelemetrySnapshots` → `mergeTelemetryIntoNodes`), which merged a
+fixed `SNAPSHOT_WINDOW = 7` packet window: seven newer device/power packets
+evicted the last environment packet wholesale, hiding temperature / humidity /
+pressure (and, on the node detail page, IAQ etc.) although the rows were still
+in the accumulator and the DB. Selection and precedence were also array-order
+driven (first-7-encountered, position-0 wins), which is wrong for warm
+IndexedDB cache seeds (key order) and incremental `mergeById` appends — stale
+values could beat fresh ones. Fix: `aggregateTelemetrySnapshots` now performs a
+**per-field latest-non-null merge** — each field takes the value from the
+node's newest packet (by `rx_time`, falling back to `telemetry_time`) that
+carries it non-null, order-independently, bounded by the caller's existing
+7-day accumulator window instead of a packet count. A null/absent field never
+clears an older valid value. Frontend read-side only — no API/DB/ingestor
+change; apex (I) and privacy (II) untouched; protocol-neutral (IV). The raw
+accumulators stay raw (CL-A1/bugfix A1 unchanged).
+
+### TM-A1 — per-field latest-non-null telemetry merge
+```bash
+( cd web && node --test public/assets/js/app/__tests__/snapshot-aggregator.test.js )
+```
+**Expected:** pass. With one environment packet followed by more than
+`SNAPSHOT_WINDOW` newer device/power packets for the same node, the aggregate
+retains the environment metrics (temperature / humidity / pressure) alongside
+the newest device metrics; the newest non-null value per field wins regardless
+of input array order (inputs that differ only in order produce identical
+aggregates whenever timestamps differ; an equal-timestamp conflict resolves
+deterministically to the row later in the input); a null/absent field never
+overwrites an older valid value; the hidden `snapshots` history is
+chronological and `latestSnapshot` is the newest packet by timestamp, not by
+array position.
+
+### TM-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. At risk and explicitly required
+to remain green: **CL-A1** (the Log's raw-accumulator retention —
+`main-log-snapshot-retention.test.js` — the fix changes only the aggregated
+locals, never the accumulators), the node detail page and chart suites
+(`node-details.test.js`, node-page chart tests — the aggregate keeps its
+`snapshots` / `latestSnapshot` shape), and `data-merge.test.js`
+(`mergeTelemetryIntoNodes` consumes one aggregate per node unchanged). Node /
+position / neighbor aggregation keep their existing `SNAPSHOT_WINDOW`
+semantics — only telemetry aggregation changes. No Ruby/Python surface is
+touched (**C2** and the Python suite unaffected).
+
+---
+
+## Feature: MeshCore RF metrics (RSSI/SNR/hops/path) & roster-eviction assertion
+
+Maps to SPEC decisions **RF1–RF8**. Ingestor-side logic lives in
+`data/mesh_ingestor/protocols/meshcore/` (runner, handlers, decode) and the
+Meshtastic hops computation in the packet store path; web-side, one additive
+migration adds `messages.hops`, `messages.path`, and `nodes.rssi`, mapped in
+`data_processing/` and serialized by the existing GET routes. Store + API only —
+no dashboard rendering (RF7). Unless a check says otherwise, Python commands
+assume the repo venv (`. .venv/bin/activate`).
+
+### RF-A1 — hops-travelled stored on messages, both protocols — RF1
+```bash
+( . .venv/bin/activate && pytest -q tests/ -k "hops" )
+( cd web && bundle exec rspec spec -e "message hops" )
+```
+**Expected:** pass. MeshCore: a `CHANNEL_MSG_RECV`/`CONTACT_MSG_RECV` payload
+with `path_len: N` (N ≤ 63) yields a stored packet with `hops == N`; the `255`
+"direct" sentinel yields `hops == 0`; an absent `path_len` omits the field.
+Meshtastic: a packet carrying both `hopStart` and `hopLimit` yields
+`hops == hopStart − hopLimit`; either absent → field omitted. Web: the
+`messages` table has an additive `hops INTEGER` column (NULL for legacy rows),
+`POST /api/messages` accepts it, `GET /api/messages` serializes it, and the
+existing `hop_limit` column/semantics are untouched.
+
+### RF-A2 — channel-message RSSI + path via the decrypt_channels join — RF2
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "decrypt or path or rssi" )
+( cd web && bundle exec rspec spec -e "message path" )
+```
+**Expected:** pass. `_run_meshcore` sets `mc.decrypt_channels = True` before
+`mc.connect()` returns. A channel-message payload carrying joined `RSSI`/`path`
+stores both (`rssi` → existing column; `path` → additive `messages.path TEXT`,
+lowercase hex, hashes in travel order); a payload **without** them (join miss,
+RX-log-less firmware) stores the message identically with the fields absent —
+never an error. DMs never carry `path`/`rssi` (E2E, no join — RF2's documented
+boundary). The message id (`_derive_message_id` inputs) is byte-identical with
+and without the new fields.
+
+### RF-A3 — RX-log ADVERT frames upsert full node identity + signal — RF3
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "rx_log or advert" )
+( cd web && bundle exec rspec spec -e "node rssi" )
+```
+**Expected:** pass. An `RX_LOG_DATA` event with `payload_typename == "ADVERT"`
+upserts a node keyed by the canonical id derived from the full `adv_key`
+(`_meshcore_node_id`), carrying `adv_name` (long name), the
+`_MESHCORE_ADV_TYPE_ROLE` role for `adv_type`, a position when
+`adv_lat`/`adv_lon` are present, and per-reception `snr` → `nodes.snr`,
+`path_len` → `nodes.hops_away`, `rssi` → the additive `nodes.rssi INTEGER`
+column. A malformed advert (missing/short `adv_key`, absent parse fields) is
+tolerated without raising. Non-`ADVERT` RX-log frames produce **no** upsert and
+remain in the `DEBUG`-only capture; `RX_LOG_DATA` itself no longer lands in
+`ignored-meshcore.txt`. With **zero** RX-log frames the provider still passes
+RF-A1/RF-A4 behavior (graceful degradation). Web: `POST /api/nodes` accepts
+`rssi`, `GET /api/nodes` serializes it, and it stays `NULL` for Meshtastic
+nodes (no source).
+
+### RF-A4 — roster-eviction assertion: read-modify-write, skip, tolerate — RF4
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "autoadd" )
+```
+**Expected:** pass. After connect the runner calls `get_autoadd_config`: when
+bit `0x01` is already set → **no** `set_autoadd_config` call (no flash write);
+when unset → exactly one `set_autoadd_config(config | 0x01)` (type-filter bits
+1–4 preserved, one-byte payload so `autoadd_max_hops` is untouched); when the
+query/set errors or times out (pre-1.16 firmware) → a warning is logged and
+startup **continues** (the connection still succeeds, mirroring
+`_ensure_channel_names` tolerance). No env/config knob gates the behavior
+(RF4: always-on, README-documented).
+
+### RF-A5 — CONTACT_DELETED is an explicit debug no-op — RF5
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "contact_deleted" )
+```
+**Expected:** pass. `CONTACT_DELETED` appears in the subscribed handler map; on
+event it debug-logs and performs **no** node deletion, no POST, and no ignored-
+file write — the web DB retains evicted nodes (`retention.rb` remains the only
+data-expiry authority).
+
+### RF-A6 — contract documented; migration additive; dedup frozen — RF6
+```bash
+git grep -nE 'hops|path|rssi' -- data/mesh_ingestor/CONTRACTS.md | head
+grep -nE 'ALTER TABLE (messages|nodes) ADD COLUMN' data/migrations/*rf_metric*.sql
+grep -nE 'hops|path' data/messages.sql; grep -n 'rssi' data/nodes.sql
+( . .venv/bin/activate && pytest -q tests/ -k "derive_message_id or dedup" )
+```
+**Expected:** `CONTRACTS.md` documents `messages.hops`/`messages.path` (with
+the `255`→direct rule and the path hex format) and `nodes.rssi` (advert→node
+mapping). The migration contains only additive `ALTER TABLE … ADD COLUMN`
+statements (no drops/rewrites); the base schema files carry the new columns for
+fresh databases. The dedup tests pass unchanged — the fingerprint inputs are
+byte-identical to pre-feature (MD-A1/MW-A1 hold).
+
+### RF-R1 — Regression: prior acceptance still holds
+```bash
+( . .venv/bin/activate && pytest -q tests/ )
+( cd web && bundle exec rspec ) && ( cd web && npm test )
+```
+**Expected:** every prior check still passes. At risk and explicitly required
+to remain green: **A4e** (the MeshCore adverts-gap checks — the
+bare-`ADVERTISEMENT` minimal-upsert fallback must keep working alongside the
+new RX-log enrichment; its assertions are **updated**, not removed), **C2**
+(`test_mesh.py` POST shapes — all field additions are additive), **MD-A1 /
+MW-A1** (MeshCore dedup — id derivation byte-identical), **MC-A1 / LH-A1 /
+GH-A1** (MeshCore message/contact machinery — naming, `last_heard`, and
+stale-contact behavior unchanged), and **B1/B4/B5** (all suites, headers,
+formatters). The JS suite is exercised for regression only — RF7 adds no
+frontend behavior.
+
+---
+
+## Bugfix: Missing telemetry at ingest (all families, both protocols)
+
+Two ingest-time data losses. **Meshtastic:** the telemetry protobuf `oneof` has
+eight variants, but extraction targeted only `deviceMetrics.*` /
+`environmentMetrics.*` paths — PowerMetrics (16 fields), AirQualityMetrics (25,
+incl. PM series, particle counts, CO2, formaldehyde, VOC/NOx), HealthMetrics
+(3), LocalStats (15), HostMetrics (9), TrafficManagementStats (7), and the
+repeated `oneWireTemperature` were dropped; the last four families were not
+even recognised by the discriminator, landing as rows with no `telemetry_type`
+and no metrics. The web app mirrored the drop (no columns, no metric
+definitions, `power_metrics`/`air_quality_metrics` consulted only for type
+inference). **MeshCore:** telemetry was structurally unreachable — no
+subscription to `TELEMETRY_RESPONSE`/`STATUS_RESPONSE`/`BATTERY`, no telemetry
+commands issued, no CayenneLPP mapping — although the `meshcore` library
+(≥2.3.5) exposes self battery/sensors and per-contact pulls, violating
+Invariant IV (protocol parity; the web/DB side was already protocol-ready).
+Fix: the ingestor extracts **every** field of all eight Meshtastic families
+(`telemetry_type` gains `local_stats`/`health`/`host`/`traffic`; body
+temperature stays distinct as `health_temperature`; `one_wire_temperature` is
+a JSON float list), the web app stores and serves all new columns (schema +
+boot auto-migration + insert/upsert; `GET /api/telemetry` is `SELECT *`), and
+the MeshCore provider collects host self-telemetry (no airtime) plus
+round-robin contact telemetry/status polls (conservative, env-tunable,
+disableable). Frontend intentionally untouched. `CONTRACTS.md` amended
+additively (D8); apex (I) and privacy (II) untouched.
+
+### TI-A1 — Meshtastic ingestor extracts every telemetry family
+```bash
+( . .venv/bin/activate && pytest -q tests/test_handlers_unit.py -k "ExtendedTelemetry" )
+```
+**Expected:** pass. For each `oneof` family the queued `/api/telemetry`
+payload carries the family's snake_case metric keys and the correct
+`telemetry_type`: power (`ch1_voltage`…`ch8_current`), air_quality
+(`pm*_standard/environmental`, `particles_*`, `co2*`, `form_*`, `pm_voc_idx`,
+`pm_nox_idx`, `particles_tps`), health (`heart_bpm`, `spo2`,
+`health_temperature` — never the ambient `temperature` key), local_stats
+(counters + reuse of `uptime_seconds`/`channel_utilization`/`air_util_tx`),
+host (`freemem_bytes`, `diskfree*_bytes`, `load*`, `user_string`), traffic
+(`packets_inspected`, …), and environment's `one_wire_temperature` list.
+
+### TI-A2 — Web app stores and serves the extended metrics
+```bash
+( cd web && bundle exec rspec spec/data_processing_spec.rb -e "extended metric families" )
+```
+**Expected:** pass. `insert_telemetry` persists values from the
+`power_metrics` / `air_quality_metrics` / `health_metrics` / `local_stats` /
+`host_metrics` / `traffic_management_stats` sub-objects (and their flat
+snake_case keys) into real columns; the diagnostics `telemetry_type` values
+are accepted; `one_wire_temperature` round-trips as a JSON array;
+`user_string` stores text. Existing databases gain the columns via the boot
+auto-migrator (`ensure_schema_upgrades`), fresh installs via
+`data/telemetry.sql`.
+
+### TI-A3 — MeshCore provider collects telemetry
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "telemetry" )
+```
+**Expected:** pass. The MeshCore event-handler map subscribes
+`TELEMETRY_RESPONSE`, `STATUS_RESPONSE`, and `BATTERY`; CayenneLPP entries map
+to the canonical metric keys (temperature, `relative_humidity`,
+`barometric_pressure`, voltage, current, lux, `battery_level`); status
+responses map `bat` (mV) → voltage (V) and uptime; events resolve
+`pubkey_pre` to the contact's canonical node id (host prefix → host node);
+resulting packets flow through `store_packet_dict` → `store_telemetry_packet`
+with `protocol="meshcore"`. The poll loop honours
+`MESHCORE_TELEMETRY_POLL_SECONDS` (0 disables contact polling) and
+`MESHCORE_SELF_TELEMETRY_SECONDS`, one on-air request at a time (local LoRa
+only — no broker, Invariant I). Each contact is additionally capped by a
+fixed 24 h per-node cooldown (stamped at the poll attempt; an all-fresh
+roster tick transmits nothing, and departed contacts are pruned from the
+stamp table). `RX_ONLY=1` forbids every ingestor-initiated transmission:
+contact polls stop entirely while the airtime-free companion-link self reads
+continue.
+
+### TI-R1 — Regression: prior acceptance still holds
+```bash
+( . .venv/bin/activate && pytest -q tests/ ) && ( cd web && bundle exec rspec ) && ( cd web && npm test )
+```
+**Expected:** every prior check still passes. At risk and explicitly required
+to remain green: **C2** (canonical POST shapes — the metric additions are
+additive, existing keys unchanged), **A4b/A4e** (MeshCore provider conformance
+and advert handling — new subscriptions must not disturb existing handlers),
+**A2/A2a** (privacy — telemetry remains ungated by `PRIVATE`, unchanged),
+**D2** (channel filters unaffected), and the host-telemetry suppression window
+(self-poll responses are throttled by the existing
+`store_telemetry_packet` host gate). The frontend is intentionally untouched
+(TM-A1 unchanged); `tests/` fixtures are unmodified so CI replay (C2) is
+unaffected.
+
+---
+
+## Feature: Live relative-time tick (dynamic timers)
+
+Maps to SPEC decisions **RT1–RT5**. Every rendered relative-time field — the
+node-table "last seen" / "last position" cells, an open map popup/tooltip
+"Last seen" line, the node-detail (`/n/:id`) last-seen / last-position rows,
+and the federation instances "last update" column — counts up in real time
+between data refreshes instead of holding the value stamped at render. The
+core is a new shared ticker module
+(`web/public/assets/js/app/main/relative-time-ticker.js`); the wired surfaces
+are `main.js` (table + map overlays), `node-page/single-node-table.js`, and
+`federation-page.js`. Frontend-only: no server, API, or ingestor change, so
+all checks are JS unit suites run at the repo root.
+
+### RT-A1 — Shared ticker: ~1 s cadence, write-on-change, hidden-tab idle — RT2, RT3
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/relative-time-ticker.test.js )
+```
+**Expected:** pass. One shared ~1 s interval drives every registered field: a
+tick recomputes the age string with the **existing** formatters and writes the
+DOM **only when the string changed** (a field still reading `3d 4h` is not
+rewritten); opt-in is attribute-based (`data-ts-ago`), so double-registration
+is impossible by construction — removing the attribute (or the element) stops
+its writes, and stopping the ticker clears the interval. While the
+document is hidden the ticker idles (no writes); on `visibilitychange` back to
+visible every field snaps to its correct current value in one pass. The ticker
+never consults the auto-refresh play/pause toggle — pausing data updates does
+not stop the clock (RT3) — and it performs no fetch of any kind (RT1).
+
+### RT-A2 — Dashboard ages tick in place: table cells + open map overlays — RT1, RT2
+```bash
+( cd web && node --test public/assets/js/app/__tests__/main-relative-time.test.js )
+```
+**Expected:** pass. With node-table rows rendered, advancing the clock ~1 s
+updates the "last seen" / "last position" cell text (e.g. `4s` → `5s`) **in
+place** — the row and cell element identities are unchanged (no
+re-materialization), and an open marker popup/tooltip's "Last seen:" line
+ticks while it stays open. Ticks issue **zero** network requests and
+materialize **zero** chat entries (CR-A1 posture preserved).
+
+### RT-A3 — Node-detail + federation ages tick; one shared formatter home — RT1, RT2
+```bash
+( cd web && node --test public/assets/js/app/__tests__/node-page.test.js \
+                       public/assets/js/app/__tests__/federation-page.test.js )
+```
+**Expected:** pass. The node-detail last-seen / last-position cells and the
+federation "last update" cell carry the tick opt-in markup (`data-ts-ago` +
+their format variant) and each page arms the shared ticker on init.
+`federation-page.js` no longer defines its own local relative-time formatter:
+its historical **distinct** format (`5m ago` — coarse, suffixed; *not* the
+dashboard's `5m 0s`) is hoisted verbatim into `main/format-utils.js` as
+`timeAgoSuffixed` (one definition repo-wide, RT2) and preserved exactly (RT4)
+via the ticker's `ago-suffixed` variant.
+
+### RT-A4 — Format unchanged — RT4
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/format-utils.test.js )
+```
+**Expected:** pass **with the pre-existing expectations unchanged** — the
+suite's original format fixtures (`50s`, `2m 5s`, `1h 1m`, `1d 1h`, the
+empty-string cases for missing/invalid timestamps; SPEC RT4's `4s` / `3m 12s`
+/ `5h 2m` / `3d 4h` are canonical examples of the same branches) still hold
+verbatim: the diff to this suite deletes or edits **zero** assertions (it only
+adds `timeAgoSuffixed` coverage). The feature adds no format branch; only
+*when* the strings are recomputed changes.
+
+### RT-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. At risk and explicitly required
+to remain green: **CR-A1** (`main-chat-render-incremental.test.js` — an idle
+tick still materializes 0 entries; the ticker must never re-render), **LD-A2**
+(channel-tab scroll) and **CL-A3** (chat vertical scroll — in-place text writes
+must not reset either), **LD-A3** (`marker-overlay-preservation.test.js` — an
+open overlay survives refreshes *and* ticking), **LV-A1/LV-A2** (`flash.test.js`
+/ `main-flash.test.js` — a tick write must never restart or truncate a
+role-colour fade), **TM-A1** (`snapshot-aggregator.test.js` — the node-table
+render path gains only tick registration), and **B1** (all suites). No
+Ruby/Python/Rust/Flutter surface is touched, so `rspec`, the Python suite
+(**C2**), `cargo test`, and `flutter test` are unaffected by construction —
+`rspec` is still run to prove it.
+
+---
+
+## Feature: Dual stacked basemap layers (HOT over CARTO, no timeout)
+
+Maps to SPEC decisions **SB1–SB8**. The two-layer factory lives in
+`web/public/assets/js/app/basemap-config.js`; the shared dark filter and the
+single pane-dimming veil in `web/public/assets/styles/base.css`; the dashboard
+policy wiring in `web/public/assets/js/app/main.js`; the federation wiring in
+`web/public/assets/js/app/federation-page.js`. The prior per-tile timeout+swap
+module (`web/public/assets/js/app/main/fallback-tile-layer.js`) and its test are
+**removed**. Run JS checks from `web/`, shell checks from the repo root.
+
+### SB-A1 — Two always-on stacked layers from one factory; no timeout — SB1
+```bash
+( cd web && node --test public/assets/js/app/__tests__/basemap-config.test.js )
+git grep -nE "tile\.openstreetmap\.fr/hot" -- web/public/assets/js/app/basemap-config.js
+git grep -nE "rastertiles/voyager" -- web/public/assets/js/app/basemap-config.js
+git grep -nE "FALLBACK_TIMEOUT_MS|fallback-tile-layer|wireTileFallback|buildFallbackTileUrl|prefersRetinaTiles" -- web/public/assets/js
+```
+**Expected:** the unit suite passes; the first grep prints the **HOT** URL
+(`{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png`) and the second the **CARTO
+Voyager** URL (`{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png`)
+from the **one** shared `basemap-config.js`. The **fourth grep prints nothing** —
+the per-tile timeout constant, the retired `fallback-tile-layer` module, and its
+helpers (`wireTileFallback` / `buildFallbackTileUrl` / `prefersRetinaTiles`) are
+gone. `createBasemapLayer(L)` returns the **base + overlay pair** (CARTO base
+`className:'map-tiles-fallback'` `zIndex:1` `detectRetina:true`; HOT overlay
+`className:'map-tiles-hot'` `zIndex:2` `maxZoom:19`), each a plain `L.tileLayer`
+(no `TileLayer.extend` subclass), and `createBasemapLayer(null)` degrades to a
+null-ish/empty result the callers guard. **Amends the URL/mechanism half of
+HT-A1 and supersedes HT-A3** (there is no per-tile swap to exercise); the
+HOT-primary intent survives as HOT being the opaque top layer.
+
+### SB-A2 — HOT overlay opaque over CARTO; Leaflet-native per-tile fade kept — SB2
+```bash
+( cd web && node --test public/assets/js/app/__tests__/basemap-config.test.js )
+git grep -nE "fadeAnimation\s*:\s*false" -- web/public/assets/js
+```
+**Expected:** the unit suite asserts the HOT overlay option set carries **no**
+layer-opacity reduction (HOT renders opaque, `zIndex:2`, above the CARTO base
+`zIndex:1`), so a loaded HOT tile fully covers the CARTO cell beneath it. The
+grep prints **nothing** — `fadeAnimation` is never disabled, so Leaflet's native
+~200 ms per-tile opacity fade drives the CARTO→HOT dissolve, and no competing
+custom tile-opacity transition is introduced to fight it. A slow HOT tile shows
+the already-present CARTO tile underneath rather than a blank cell.
+
+### SB-A3 — Shared dark filter on the per-layer containers (blend) — SB3
+```bash
+( cd web && node --test public/assets/js/app/__tests__/basemap-blend.test.js )
+git grep -niE "tile_filters|DEFAULT_TILE_FILTER|map_tile_filter|tileFilters|resolveTileFilter|applyFiltersToAllTiles|--map-tile" -- web/lib web/public/assets/js web/public/assets/styles web/views
+```
+**Expected:** the blend suite passes — `base.css` applies the **same**
+`grayscale(1) invert(1) brightness(0.9) contrast(1.08)` filter (with its
+`-webkit-` twin) to **both** `.map-tiles-hot` and `.map-tiles-fallback`, in one
+rule, and the CARTO fallback filter equals the HOT filter (never `none`). The
+second grep prints **nothing**: the removed per-theme Ruby/JS/`data-app-config`
+tile-filter machinery stays removed (the filter is one static CSS constant). The
+selectors now target the layer **containers** (`#map .leaflet-layer.map-tiles-hot`
+/ `.map-tiles-fallback`) rather than individual `<img>` tiles, because with no
+per-tile swap Leaflet stamps the `className` on the layer container. **Amends the
+filter-selector half of HT-A2 / BL-A1(3)**; the filter *value* and its single-rule
+home are unchanged.
+
+### SB-A4 — Single pane dimming veil; brightness parity — SB4
+```bash
+git grep -nE "leaflet-tile-pane" -- web/public/assets/styles/base.css
+git grep -nE "\.leaflet-tile\.map-tiles\b" -- web/public/assets/styles/base.css
+```
+**Expected:** the first prints a single `#map .leaflet-tile-pane { opacity: 0.5625 }`
+rule (`0.5625 = 0.75 × 0.75`, the effective brightness the single pre-SB layer
+rendered at). The second prints **nothing** — the former
+`#map .leaflet-tile.map-tiles { opacity: 0.75 }` selector and the bare `map-tiles`
+container class are gone (the filter now sits on the `.leaflet-layer.map-tiles-hot`
+/ `.leaflet-layer.map-tiles-fallback` per-layer containers, never on
+`.leaflet-tile.map-tiles`). (The grep is anchored to `.leaflet-tile.map-tiles` on
+purpose — a bare `\.map-tiles\b` would false-match at the hyphen inside the
+surviving `.map-tiles-hot` / `-fallback` class names.)
+Dimming once at the pane makes brightness independent of the layer count, so the
+two stacked layers (and the offline placeholder as a possible third) composite to
+today's look.
+
+### SB-A5 — One liveness policy fed by both layers; dual-outage-only offline — SB5
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/tile-failure-policy.test.js )
+( cd web && node --test public/assets/js/app/__tests__/main-app-map-init.test.js )
+```
+**Expected:** both pass. The Leaflet-free policy (`main/tile-failure-policy.js`,
+unchanged) is wired on the dashboard so that a `tileload` from **either** layer
+latches the basemap "alive" and `activateOfflineTiles` fires **only** when the
+initial viewport produced zero successes across **both** layers: with HOT down
+but CARTO up (or vice-versa) the map stays live and the placeholder never shows;
+only a both-providers outage reaches it, and the offline switch removes **both**
+online layers. The federation map keeps **no** kill-basemap/offline logic
+(unchanged from DM3/HT5). **Extends HT-A4** (the ladder's top rung is now two
+parallel providers).
+
+### SB-A6 — Always-on dual egress documented; no phone-home — SB6
+```bash
+git grep -niE "carto|cartocdn|openstreetmap\.fr|both (tile )?providers|two CDNs|third-party tile" -- README.md
+git grep -niE "\bapi[_-]?key\b|\btoken\b|\banalytics\b|\bcookie\b" -- web/public/assets/js/app/basemap-config.js
+```
+**Expected:** the README documents, operator-visibly, that **both** basemap CDNs
+(HOT + CARTO) are requested on every viewport (the doubled third-party tile
+egress is disclosed, not silent). The second grep prints **nothing**:
+`basemap-config.js` sends no API key, token, cookie, or analytics parameter to
+either CDN — only `{z}/{x}/{y}` tile coordinates — so D11 (no phone-home) holds.
+(The alternatives are `\b`-anchored on purpose — an un-anchored `cookie` would
+false-match the doc word *cookieless*, which asserts the very absence being
+checked.)
+Both providers keep `attributionControl:false` (no attribution overlay; reaffirms
+HT-A6/DM-A5). The basemap hosts are raster CDNs, not brokers (apex A1 holds;
+`guard-edits.py` untriggered — no manifest change).
+
+### SB-A7 — Stack & contract untouched; both maps share the factory — SB7
+```bash
+git grep -nE "createBasemapLayer" -- web/public/assets/js/app/main.js web/public/assets/js/app/federation-page.js
+git grep -nE "tileFilters|map-tile" -- web/lib/potato_mesh/application/helpers/config_helpers.rb
+```
+**Expected:** the first prints `createBasemapLayer` called from **both**
+`main.js` and `federation-page.js` (one shared factory owns the whole basemap on
+both maps; HT5/BL4 preserved). The second prints **nothing** — no tile config
+leaks into `/version` or `data-app-config`; the filter, pane opacity, and layer
+z-indices are frontend constants, so there is no contract change and no version
+bump (D7/D8). Native Leaflet only — two `L.tileLayer`s, no custom subclass, no
+new dependency or build step.
+
+### SB-A8 — Retired module gone; suites green; exact headers — SB8
+```bash
+test ! -e web/public/assets/js/app/main/fallback-tile-layer.js && echo "module removed"
+test ! -e web/public/assets/js/app/main/__tests__/fallback-tile-layer.test.js && echo "test removed"
+( cd web && npm test )
+head -n 15 web/public/assets/js/app/basemap-config.js
+```
+**Expected:** both `echo`s print (the retired module **and** its test are deleted
+together — never left dangling); `npm test` is fully green with the JS coverage
+floor held; the header check shows the exact Apache block with
+`Copyright © 2025-26 l5yth & contributors`. Every new/changed unit ships full
+JSDoc and clean linters (`black`/`rufo` untouched — no Python/Ruby change).
+
+### SB-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. Explicitly amended and required to
+stay green: **HT-A1** (HOT is still the top/primary-visible basemap on both maps;
+its URL half holds — only the CARTO-as-per-tile-fallback framing is amended to
+CARTO-as-base-layer), **HT-A2 / BL-A1** (the shared dark filter is unchanged in
+value and still one static `base.css` rule — only the selector granularity moves
+from per-tile to per-layer; the removed Ruby/contract `tileFilters` machinery
+stays removed; offline tiles stay unfiltered), **HT-A3** (superseded — the
+per-tile swap mechanism it checked no longer exists; the checkerboard it guarded
+against is removed structurally), **BL-A1(1)** (the `FALLBACK_TIMEOUT_MS === 2500`
+assertion is **deleted with the constant** — there is no timeout), **BL-A2** (no
+`dark_all` reference; Voyager remains the CARTO source). Still green unchanged:
+**HT-A4 / SB-A5** (fallback ladder → offline last tier), **HT-A5 / SB-A7** (one
+shared factory on both maps), **HT-A6 / SB-A6** (no attribution), **HT-A7 /
+DM-A4** (apex/contract untouched), **A1** (no broker — the basemap hosts are
+raster CDNs), **B1** (all suites), and **B4** (exact Apache header on the changed
+`basemap-config.js` / `basemap-config.test.js` / `basemap-blend.test.js`). No
+Ruby/Python/Rust/Flutter production surface is touched, so `rspec` (run above),
+the Python suite, `cargo test`, and `flutter test` are unaffected by construction.
+
+---
+
+## Bugfix: MeshCore duplicate-node reconciliation (stale same-name identities)
+
+Maps to SPEC decisions **MR1–MR6**. One physical node had surfaced as three
+rows (`!ae46e493` live real, `!25ee3330` retired real still name-resolved by a
+stale roster, `!f0b61f1e` name-derived synthetic): the #755/#803 merge
+deadlocked on the absolute same-name-real ambiguity guard, duplicate message
+copies granted the retired identity eternal `last_heard` liveness, and one
+advert flood minted four position rows. Reproduced deterministically before
+fixing; the checks below are the regression captures.
+
+### MR-A1 — Keyed-evidence tracking (`nodes.last_advert_heard`) — MR1
+```bash
+( cd web && bundle exec rspec spec/data_processing_spec.rb -e "keyed-evidence tracking" )
+```
+**Expected:** pass. A non-synthetic upsert carrying `user.publicKey` records
+its own heard time in `last_advert_heard` and advances it forward-only; a
+message touch (`touch_node_last_seen`) advances `last_heard` but **never** the
+evidence column; a synthetic placeholder upsert records no evidence (`NULL`).
+
+### MR-A2 — Positive-staleness merge ambiguity, both directions — MR2
+```bash
+( cd web && bundle exec rspec spec/data_processing_spec.rb \
+    -e "stale keyed evidence" -e "fresh keyed evidence" -e "evidence-fresh real" \
+    -e "legacy row" -e "no evidence either way" )
+```
+**Expected:** pass. `merge_synthetic_nodes` absorbs the synthetic although a
+same-name real row exists that is positively stale — both when its
+`last_advert_heard` is old and when it is a **legacy row** whose only signal is
+an old `position_time` (the production shape), in each case even though message
+touches polluted that row's `last_heard` to "now". It still **refuses** when the
+rival is evidence-fresh, and — critically — when the rival has **no evidence
+either way** (`NULL` / `NULL`, the state of every row right after the
+migration): absence of evidence is never treated as staleness.
+`merge_into_real_node` folds the synthetic into the survivor when the other
+candidate is positively stale, and still refuses when both are live. The retired
+real row itself is never deleted (retention stays the only expiry authority).
+
+### MR-A3 — Duplicate-copy sender resolution (no steal, no phantom liveness) — MR3
+```bash
+( cd web && bundle exec rspec spec/data_processing_spec.rb \
+    -e "duplicate-copy sender resolution" -e "ConstraintException recovery" )
+```
+**Expected:** pass. For MeshCore copies of one message (same id, divergent
+`from_id`): two evidence-fresh reals keep the **existing** attribution (no
+last-writer-wins); a stale-keyed copy neither steals attribution from an
+evidence-fresh real nor advances its own node's `last_heard` (the reception is
+credited to the resolved winner instead); a keyed real copy still upgrades a
+synthetic-attributed row; and a nil/blank/unknown sender ranks 0 (never
+supersedes). The **same rank rule holds on the `ConstraintException` insert-race
+fallback** — the path MR3 names as "where two ingestors' copies meet" — in both
+hash- and array-row DB modes, and a Meshtastic message keeps last-writer-wins
+(the rule is MeshCore-scoped).
+
+### MR-A4 — One advert flood → one position identity — MR5
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py \
+    -k "adv_timestamp or flood or falls_back_to_recv" )
+```
+**Expected:** pass. Four RX-log copies of one advert (same `adv_key` +
+`adv_timestamp`, distinct `recv_time`) hand the **sender-side** timestamp to
+the position store and collapse to a single `/api/positions` id;
+`_rx_advert_to_node_dict` anchors `position.time` on `adv_timestamp` while
+`lastHeard` stays receiver-side; absent/zero `adv_timestamp` degrades to
+`recv_time`.
+
+### MR-A5 — `synthetic` flag on the node API — MR4
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "synthetic flag" )
+```
+**Expected:** pass. `GET /api/nodes/:id` and `GET /api/nodes` emit
+`synthetic: true` on placeholder rows and omit the key entirely on real rows
+(compact convention, no `synthetic: false` noise).
+
+### MR-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && bundle exec rspec ) && ( cd web && npm test )
+( . .venv/bin/activate && pytest -q tests/ )
+```
+**Expected:** every prior check still passes. At risk and explicitly required
+to remain green: **MC-A1/MC-A2** (#803 placeholder naming/repair — unchanged
+paths), the **#755/#756** merge and dedup suites (`database_spec.rb`,
+`data_processing_spec.rb` — the pre-existing "refuses when two reals share the
+long_name" examples stay green because raw-seeded rows carry no keyed evidence
+and two-candidate/zero-fresh ambiguity still refuses), **LH-A1/LH-A2**
+(last-heard carry through both merge helpers), **A4e/RF3** (RX-advert node
+upserts — only the position anchor moved), **MD-A1/MW-A1** (message dedup
+fingerprint untouched), and **B1** (all suites). MC-R1's wording "the merge
+helpers are unchanged" is **superseded** by SPEC MR2 for the ambiguity bound;
+everything else it protects still holds.
+
+---
+
+## Bugfix: MeshCore roster sync must not warm `last_heard` (issue #853)
+
+Maps to SPEC decision **RS1**. Loading the MeshCore contact roster
+(`ensure_contacts()` at launch and on every reconnect; `auto_update_contacts`
+re-fetches on adverts) re-POSTed each positioned contact's position with
+`rx_time = now`, and the web folds `rx_time` into `last_heard` via `MAX`
+(`update_node_from_position`), so a contact that was actually last heard months
+ago was stamped **active** on every sync — a long-dead node reappearing in the
+7-day list. The node-upsert path already used the contact's real `last_advert`
+(MR1's stated intent); only the position path violated it. Fix is ingestor-side:
+the two roster-sync callers stamp the position `rx_time` from the contact's
+`last_advert`, so `last_heard = MAX(last_advert, last_advert) = last_advert`.
+Genuinely-live paths (self-info, RX-log adverts) keep `rx_time = now`.
+
+### RS-A1 — Roster-sync positions carry the contact's real reception time
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py \
+    -k "rx_time_uses_last_advert or honours_rx_time_override or defaults_rx_time_to_now" )
+```
+**Expected:** pass. `_process_contacts` (bulk) and `_process_contact_update`
+(per-contact `NEW_CONTACT`/`NEXT_CONTACT`) queue `/api/positions` with
+`rx_time == last_advert` (not the wall clock), so the web-side
+`last_heard = MAX(rx_time, position_time)` resolves to `last_advert` rather than
+`now`. `_store_meshcore_position` accepts an explicit `rx_time` override and,
+absent one, still defaults to the wall clock (live-path behavior unchanged).
+
+### RS-A2 — Live advert paths still stamp `now` (fix is roster-scoped)
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py \
+    -k "rx_log_data_advert_position_rx_time_is_now or self_info" )
+```
+**Expected:** pass. An on-air RX-log `ADVERT` (`on_rx_log_data`) and the host
+`SELF_INFO` position keep `rx_time = now` — they are genuinely-live receptions,
+so their `last_heard` must still advance to now. Only the roster-replay paths
+change; MR5's sender-side `position_time` anchor for RX-log adverts is untouched.
+
+### RS-R1 — Regression: prior acceptance still holds
+```bash
+( . .venv/bin/activate && pytest -q tests/ )
+( cd web && bundle exec rspec ) && ( cd web && npm test )
+```
+**Expected:** every prior check still passes. At risk and explicitly required to
+remain green: **A4e/RF3** and **MR-A4/MR5** (RX-log advert node upserts and the
+`adv_timestamp` position anchor — the RX path keeps `rx_time = now`), the
+existing `_store_meshcore_position` / `_process_contacts` /
+`_process_contact_update` position specs (updated to assert the roster
+`rx_time`, not removed), and **C2** (`test_mesh.py` end-to-end). No web/DB/API
+shape changes, so the Ruby and JS suites are unaffected by construction.
+
+---
+
+## Bugfix: Frontend design & UX audit remediation (D-001…D-040)
+
+Maps to SPEC decisions **UX1–UX15**. The executable guards live in
+`web/spec/ux_audit_spec.rb` (server-rendered markup), the JS unit files named
+below (behaviour), and grep checks (stylesheet state). Every check below was
+written **before** the fix and demonstrated failing against the unfixed tree
+(Phase 2 of the bugfix protocol); D-039 is deliberately absent (rejected, UX1).
+Unless noted, run rspec/node commands from `web/`.
+
+### UX-A1 — Token integrity & WCAG text contrast — UX2, UX3
+```bash
+( cd web && node --test public/assets/js/app/__tests__/role-badge-contrast.test.js )
+grep -nE -- '--border:|--surface:|--table-header-bg:|--hover-bg:|--danger:' web/public/assets/styles/base.css
+git grep -nE '#4a90e2|#c62828|#b00020|body\.dark a \{' -- web/public/assets/styles/base.css
+```
+**Expected:** the JS suite passes — for **every** role in **both** protocol
+palettes, `renderShortHtml` emits an inline text colour whose WCAG contrast on
+the badge background is ≥ 4.5:1 (the no-short `#ccc` badge included). The first
+grep prints all five token definitions inside `:root`; the second prints **no
+output** (no hardcoded focus-ring blue, no sub-AA error reds, no second link
+accent).
+
+### UX-A2 — Degenerate states have a voice — UX4
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "degenerate-state" )
+( cd web && node --test public/assets/js/app/main/__tests__/table-empty-state.test.js )
+awk '/^#map\[data-map-status="placeholder"\]/,/^}/' web/public/assets/styles/base.css
+```
+**Expected:** rspec passes — the layout ships one `<noscript>` block naming
+`/api/nodes`, and the server HTML of `/` contains
+`<tr class="nodes-empty-row">` with the waiting message. The JS suite passes —
+`renderTable` keeps/restores the empty row for an empty node set, removes it
+once nodes render, and formats null telemetry cells as a muted `—` (dash) —
+distinct from `''`. The stripe grep finds the placeholder gradient at ≥ 8 %
+white.
+
+### UX-A3 — Age buckets on rows & markers — UX5
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/age-bucket.test.js )
+grep -nE 'data-age="stale"|data-age="live"' web/public/assets/styles/base.css
+```
+**Expected:** pass. `nodeAgeBucket` returns `live` < 3 h, `today` < 24 h,
+`stale` otherwise; `renderTable` stamps `data-age`/`data-age-ts` on each row;
+the shared RT2 tick refreshes the bucket attribute write-on-change
+(`updateAgeBucketElements`); markers receive bucket-scaled `fillOpacity`
+(.85/.55/.30). CSS dims stale rows and accent-rules live rows.
+
+### UX-A4 — Live/paused is visible text — UX6
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/autorefresh-control.test.js )
+```
+**Expected:** pass. The control renders `● live` while streaming and
+`❚❚ paused HH:MM` (pause-moment timestamp) when paused; aria-label/pressed
+semantics preserved.
+
+### UX-A5 — Protocol shape channel & legend line key — UX7
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/node-marker.test.js )
+( cd web && node --test public/assets/js/app/main/__tests__/legend-line-samples.test.js )
+```
+**Expected:** the marker-factory suite passes — MeshCore nodes produce a square
+`L.divIcon` chip (role-coloured), Meshtastic nodes stay `L.circleMarker`, both
+carrying identical interaction wiring; the legend's neighbor/trace toggles
+carry an inline line sample (solid vs `6 6`-dashed) so the two line encodings
+are keyed.
+
+### UX-A6 — Legend defaults & honest toggle label — UX8
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "legend" )
+( cd web && node --test public/assets/js/app/__tests__/legend-toggle-label.test.js )
+```
+**Expected:** pass. `/map` renders `data-legend-collapsed="false"` (dashboard
+stays `true`; ≤ 659 px collapses at init); the toggle text is exactly
+`Hide legend` / `Show legend` with ` (filters active)` appended **only** when
+role filters are active.
+
+### UX-A7 — Nodes-table IA: groups, tiers, affordance, semantics — UX9
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "table IA" )
+( cd web && node --test public/assets/js/app/main/__tests__/nodes-table-ia.test.js )
+awk '/max-width: 659px/,/^}/' web/public/assets/styles/base.css
+```
+**Expected:** rspec passes — `_nodes_table.erb` carries a visually-hidden
+`<caption>`, `scope="col"` on every header, and the grouped second header row;
+`index.erb` exposes visually-hidden section `h2`s; `_instances_table.erb`
+carries caption/scope with priority column order and lat/lon tier classes. The
+JS suite passes — group colspans track hidden tiers, the `+` disclosure row
+lists hidden fields, row hover/click follows the long-name link, numeric cells
+carry the `num` class. The awk block shows `.nodes-col--role` hidden at
+≤ 659 px and `.nodes-col--battery` **not** hidden.
+
+### UX-A8 — Number honesty — UX10
+```bash
+( cd web && node --test public/assets/js/app/__tests__/telemetry-format-honesty.test.js )
+```
+**Expected:** pass. Utilisation formats to 1 decimal (`1.7%`); battery > 100
+renders `100% ⚡`; |voltage| < 0.01 V renders the dash; existing formatter
+behaviour otherwise unchanged.
+
+### UX-A9 — Shell economics — UX11
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "shell" )
+( cd web && node --test public/assets/js/app/__tests__/shell-counts.test.js \
+             public/assets/js/app/main/__tests__/colocated-hub-icon.test.js )
+grep -nE 'clamp\(18px|max-width: 1100px|order: 2;|max-height: 4\.8em|scroll-behavior: auto|width: 28px' web/public/assets/styles/base.css
+```
+**Expected:** rspec passes — static pages render in the footer links row and in
+**neither** nav; the Charts links carry no protocol icon; the region selector
+sits behind the compact 🌐 toggle with `Other regions…` as its placeholder
+option. The JS suite passes — the week count is **not** appended to the
+h1/document title; the meta line reads `N nodes today · M this week`; the
+federation nav count carries a `title` tooltip; the colocated-hub icon hit area
+is 32 px. The grep finds the title clamp, the 1100 px nav breakpoint, the
+mobile map-first `order`, the announcement wrap cap, the reduced-motion scroll
+override, and the 28 px tab arrows.
+
+### UX-A10 — Preset config migration & join strip — UX12
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "join strip" -e "preset config" )
+```
+**Expected:** pass. `Config.meshtastic_preset`/`meshtastic_freq` resolve
+`MESHTASTIC_PRESET`/`MESHTASTIC_FREQ` → deprecated `CHANNEL`/`FREQUENCY` →
+defaults (`#LongFast`, `915MHz` — the pre-existing constants, so a stock
+instance keeps today's advertised strings); `Config.meshcore_preset`/`meshcore_freq`
+render the MeshCore join line only when both are set. The meta row renders the
+`join-line` strip; the federation table header says **Preset** (sort key and
+wire keys unchanged: `channel` carries the resolved preset — FS1/BF3 intact).
+README documents the deprecation.
+
+### UX-A11 — Keyboard/AT map equivalence — UX14
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "map equivalence" )
+```
+**Expected:** pass. Every `#map` region carries `aria-describedby` naming a
+visually-hidden note that points keyboard users at the nodes table/page.
+
+### UX-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+( . .venv/bin/activate && pytest -q tests/ )
+```
+**Expected:** every prior check still passes. At risk and explicitly required to
+stay green: **LD-A2** (horizontal tab scroll — desktop strip untouched),
+**RT-A1/RT-A2** (the shared tick — the age-bucket pass must not break
+write-on-change or hidden-tab idling), **LV-A***/**VF-A*** (flash/fade target
+rows/markers — `data-node-row` hooks and marker wiring preserved across the
+square-chip factory), **HT-A***/**DM-A*** (basemap untouched), **A4c**
+(protocol-aware chat naming), and **FS-A2/FS-A4** (the signed federation wire —
+`channel` key unchanged). View specs asserting the old nav/title/⏸ markup are
+updated, not removed.
+
+---
+
+## Bugfix: UX audit follow-up (design review remediation)
+
+Maps to SPEC decisions **FU1–FU13**. Presentation-layer only; run JS checks
+from `web/`, rspec from `web/`, greps from the repo root.
+
+### FU-A1 — Chat badge sits in its colour box — FU1
+```bash
+git grep -nE "text-indent: 0" -- web/public/assets/styles/base.css
+git grep -nE "chat-entry-msg, .chat-entry-node\)\s*$|:where\(.short-name" -- web/public/assets/styles/base.css
+```
+**Expected:** `base.css` carries a `:where(.chat-entry-msg, .chat-entry-node) :where(.short-name, .protocol-icon, .chat-entry-reply) { text-indent: 0 }`
+reset, so the inline badge/icon/reply no longer inherit the hanging indent.
+
+### FU-A2 — Region toggle is 🌍, greyscale-until-open — FU2
+```bash
+git grep -nF "🌍" -- web/views/layouts/app.erb
+git grep -nE "instance-selector-toggle|grayscale\(1\)|aria-expanded=.true.\]" -- web/public/assets/styles/base.css
+```
+**Expected:** `app.erb` renders the 🌍 glyph (no 🌐); `base.css` dims the toggle
+with `filter: grayscale(1); opacity: .72` and restores `filter: none` on
+`:hover` / `[aria-expanded="true"]`, with an accent border frame when open.
+
+### FU-A3 — MeshCore marker is an equal-area diamond — FU3
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/node-marker.test.js )
+git grep -nE "radius \* 1\.78" -- web/public/assets/js/app/main/node-marker.js
+git grep -nE "rotate\(45deg\)|border-radius: 3px" -- web/public/assets/styles/base.css
+```
+**Expected:** the marker suite passes with `iconSize` `[16, 16]` at radius 9;
+`node-marker.js` sizes the chip `round(radius * 1.78)`; `base.css` rotates the
+`.node-marker-chip__fill` 45° with rounded corners and keeps the container
+`overflow: visible`.
+
+### FU-A4 — Join strip → footer; counts → toggles; `details` dropped — FU4
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "follow-up 04" )
+( cd web && node --test public/assets/js/app/__tests__/main-update-counts.test.js )
+git grep -nE "footer-join" -- web/views/shared/_footer.erb
+git grep -nE "protocolToggleMeshcoreCount|protocol-toggle-count" -- web/views/layouts/app.erb
+git grep -nE "join-line__more|class=\"join-line\"" -- web/views/layouts/app.erb
+```
+**Expected:** rspec + the JS suite pass; `_footer.erb` renders the `footer-join`
+strip; `app.erb` carries the two `protocol-toggle-count` spans; the **last grep
+prints nothing** — the join strip and its `details` link are gone from the meta
+row. `updateProtocolToggleCounts` fills the toggles from the 7-day per-protocol
+figure.
+
+### FU-A5 — Legend dash sample inks both ends — FU5
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/legend-line-samples.test.js )
+git grep -nE "stroke-dasharray=.6 2." -- web/public/assets/js/app/main/legend-line-samples.js
+```
+**Expected:** the suite passes; the trace **sample** uses `6 2`. The on-map
+traceroute polylines are untouched (still `6 6`).
+
+### FU-A6 — Condensed nodes table — FU6
+```bash
+git grep -nE "#nodes tbody td" -- web/public/assets/styles/base.css
+git grep -nE "#nodes .nodes-empty-row td" -- web/public/assets/styles/base.css
+```
+**Expected:** `#nodes tbody td { padding: 3px 8px; line-height: 1.35 }` (with
+`#nodes thead th` 5/8 and the group row 3/8); the waiting row keeps `12px 8px`
+via the id-scoped `#nodes .nodes-empty-row td` selector.
+
+### FU-A7 — Disclosure row lists only reported fields, keeping honest zeros — FU7
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/nodes-table-ia.test.js )
+git grep -nE "filterReportedFields|isReportedField" -- web/public/assets/js/app/main.js web/public/assets/js/app/main/nodes-table-ia.js
+```
+**Expected:** the suite passes — `isReportedField` keeps `0.0%` / `0 V` (honest
+zeros) and drops `''` / `—`; an all-absent set renders one
+`node-extra__empty` "No additional fields reported." line; `main.js` wraps the
+15 entries in `filterReportedFields`.
+
+### FU-A8 — Footer chrome on every route — FU8
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "opaque footer" )
+git grep -nE "app-footer--slim" -- web/public/assets/styles/base.css web/views
+git grep -nE "box-shadow: 0 -8px 24px" -- web/public/assets/styles/base.css
+```
+**Expected:** rspec passes (Charts + Federation render `class="app-footer"` and
+**not** `app-footer--slim`); the **second grep prints nothing** — the slim
+variant and its `slim` local are gone; `.app-footer` gains the lift shadow.
+
+### FU-A9 — Chat hang is the real prefix width — FU9
+```bash
+git grep -nE "padding-left: 19ch|text-indent: -19ch" -- web/public/assets/styles/base.css
+```
+**Expected:** both lines are present (the old `8ch` is gone), so wrapped chat
+lines hang under the message column.
+
+### FU-A10 — Both nodes-table header rows pin — FU10
+```bash
+git grep -nE "nodes-group-header th" -- web/public/assets/styles/base.css
+git grep -nE "thead tr:not\(.nodes-group-header\) th" -- web/public/assets/styles/base.css
+```
+**Expected:** `.nodes-group-header th` is `position: sticky; top: 0` (was
+`static`) with a 24 px border-box height; the column row pins at `top: 24px`.
+
+### FU-A11 — Badge meets the 44 px touch floor — FU11
+```bash
+git grep -nE "pointer: coarse" -- web/public/assets/styles/base.css
+git grep -nE "min-width: 44px|min-height: 44px" -- web/public/assets/styles/base.css
+```
+**Expected:** a `@media (pointer: coarse)` block gives
+`.short-name[data-node-info]::after` a ≥ 44 px transparent hit box; fine
+pointers keep the tight target (no unconditional rule).
+
+### FU-A12 — Legend columns share a top baseline — FU12
+```bash
+git grep -nE "legend-column--bottom" -- web/public/assets/styles/base.css web/public/assets/js/app/main.js
+```
+**Expected:** **prints nothing** — the bottom-align modifier is gone from both
+the stylesheet and the legend builder, so both columns top-align.
+
+### FU-R1 — Regression: prior acceptance still holds — FU13
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. Explicitly amended and required to
+stay green: **UX-A5** (D-013/D-014 — the marker is now a diamond and the dash
+sample `6 2`, but the shape channel and the neighbor/trace key survive),
+**UX-A7** (the nodes-table IA — group colspans, disclosure row, sticky header
+all still hold under the density/filter/pin changes), **UX-A9** (shell — the
+region toggle, chat indent and footer links survive their tweaks), and
+**UX-A10** (the join strip still renders from the resolved preset config, now
+in the footer; the `channel` wire key is unchanged). No Python/Rust/Flutter
+surface is touched, so `pytest`, `cargo test`, and `flutter test` are
+unaffected by construction.
+
+---
+
+## Bugfix: Post-deploy design review (detail view, footer, marker recency)
+
+Maps to SPEC decisions **PD1–PD5**. Each check below was written **before** the
+fix and demonstrated failing against `992d6bb` (the deployed audit tree). Run
+node/rspec from `web/`, greps from the repo root.
+
+### PD-A1 — /nodes/:id is a spec sheet: nothing hidden, absent reads as dash — PD1
+```bash
+( cd web && node --test public/assets/js/app/__tests__/node-page.test.js )
+git grep -nE 'class="[^"]*nodes-col|<table' -- web/public/assets/js/app/node-page/single-node-table.js
+git grep -nE "node-detail-sheet|node-detail__row|—|&mdash;" -- web/public/assets/js/app/node-page/single-node-table.js
+```
+**Expected:** the node-page suite passes; the **second grep prints nothing** —
+the detail view emits no `<table>` and **no applied** `.nodes-col--*` class
+(so no column is `display:none`'d on a single-record page, and no disclosure
+column is needed; a JSDoc comment may still name the retired classes to explain
+the fix — the grep is anchored to `class="…nodes-col` on purpose so a doc
+mention does not read as a defect); the third grep shows the spec-sheet markup
+and the muted dash it renders for absent telemetry (fixing the blank-cell half).
+The detail render reflows to one column on mobile with every field legible.
+
+### PD-A2 — Footer tiers with dot separators; no dangling em-dash — PD2
+```bash
+( cd web && bundle exec rspec spec/ux_audit_spec.rb -e "footer dot separators" )
+git grep -nE "footer-separator" -- web/views/shared/_footer.erb
+git grep -nE "footer-links-row|flex-basis: 100%" -- web/public/assets/styles/base.css
+```
+**Expected:** rspec passes — every `.footer-separator` renders `·` (never `—`),
+so the em-dash the wrapping links row stranded on line one is gone; the links
+become their own footer tier (`flex-basis: 100%`) so the wrap is intentional,
+and the chat label is shortened to `chat:` (the instance name is already the
+title and logo). The `≤600px` stack rule is unchanged.
+
+### PD-A3 — Marker stacking: three freshness panes, role orders within — PD3
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/age-bucket.test.js )
+( cd web && node --test public/assets/js/app/__tests__/main-app-map-init.test.js )
+git grep -nE "createPane|freshnessPaneForBucket" -- web/public/assets/js/app/main.js
+```
+**Expected:** both suites pass — `freshnessPaneForBucket` maps `live`/`today`/
+`stale` to three distinct panes (unknown → stale); `main.js` creates the three
+panes with ascending z-index (stale < today < live) and assigns every marker —
+circle **and** chip — its bucket's pane, so recency is the coarse stacking
+channel and the existing `getRoleRenderPriority` ladder orders within each pane.
+A live Meshtastic circle now paints over a stale MeshCore chip (the pre-fix
+protocol split had every chip top every circle).
+
+### PD-A4 — Sticky group-header offset is guarded, not a bare magic number — PD4
+```bash
+awk '/^\.nodes-group-header th \{/,/^}/' web/public/assets/styles/base.css | grep -nE "white-space: nowrap|height: 24px"
+```
+**Expected:** the group-header rule pins its height **and** sets
+`white-space: nowrap`, so a longer label / translation / narrow tier cannot wrap
+the group row and overlap the column row pinned at `top: 24px` (an explanatory
+comment names the coupling).
+
+### PD-R1 — Regression: prior acceptance still holds — PD5
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. Explicitly at risk and required to
+stay green: **UX-A3/UX-A5** (marker fill-opacity buckets and the protocol shape
+channel survive the pane assignment), **UX-A7** (the `#nodes` dashboard table IA
+is untouched — only the detail view changes), **FU-A4/UX-A10** (the footer join
+strip still renders from the resolved preset config), and the node-page tick
+specs (RT1/RT2 timestamps) updated to the spec-sheet markup, not removed. No
+Python/Rust/Flutter surface is touched.
+
+---
+
+## Bugfix: Legend shape key & chat log overflow
+
+Maps to SPEC decisions **LC1–LC4**. Each check below was written **before** the
+fix and demonstrated failing against `80d3ca6`. Run node/rspec from `web/`,
+greps from the repo root.
+
+### LC-A1 — Legend swatches carry the marker shape — LC1
+```bash
+( cd web && node --test public/assets/js/app/__tests__/main-filter.test.js )
+git grep -nE "legend-swatch--diamond|legend-swatch--circle" -- web/public/assets/js/app/main.js web/public/assets/styles/base.css
+```
+**Expected:** the filter suite passes — `buildRoleButtons` stamps each swatch
+with its protocol's marker shape (MeshCore → `legend-swatch--diamond`,
+Meshtastic → `legend-swatch--circle`), so the panel keys the shape channel the
+map uses. `base.css` sizes the diamond as an equal-area rotated square (the
+map's `side = radius × 1.78`) with the marker's 1px ring + 3px corner in a
+16px slot so the diagonal never clips the label.
+
+### LC-A2 — Legend pressed state actually paints — LC2
+```bash
+git grep -nE 'button\.legend-item\[aria-pressed="true"\]' -- web/public/assets/styles/base.css
+git grep -nE '^\.legend-item\[aria-pressed="true"\]' -- web/public/assets/styles/base.css
+```
+**Expected:** the first grep prints the rule (the `button`-prefixed selector,
+specificity (0,2,1), outranks the `button:not(.chat-tab):not(.sort-button)`
+reset that previously flattened every chip to `#333`); the **second grep prints
+nothing** — the bare `.legend-item[aria-pressed="true"]` selector (0,2,0), which
+the reset overrode, is gone. Pressed role chips now paint their selected blue.
+
+### LC-A3 — Chat log never scrolls horizontally — LC3
+```bash
+awk '/^\.chat-entry-msg,/,/^}/' web/public/assets/styles/base.css | grep -nE "overflow-wrap: anywhere"
+git grep -nE "overflow-x: hidden" -- web/public/assets/styles/base.css | grep -i chat || echo "no chat overflow-x:hidden (correct)"
+```
+**Expected:** the chat hanging-indent rule (`.chat-entry-msg, .chat-entry-node`)
+carries `overflow-wrap: anywhere`, so an unbreakable token (long hex, URL, or
+39-char long name) wraps under the 19ch hang instead of forcing the panel into a
+horizontal scroll container. `anywhere` (not `break-word`) also lowers the
+entry's min-content width, so it can never demand more width than the panel —
+and no `overflow-x: hidden` is added on the panel (which would only mask the
+next regression).
+
+### LC-R1 — Regression: prior acceptance still holds — LC4
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. At risk and required to stay
+green: **UX-A5/UX-A6** (the legend line-sample key and toggle-label behaviour
+survive the swatch-shape change), **FU-A2** (the region toggle) and **UX-A9**
+(chat hanging indent — the `overflow-wrap` addition rides the same D-033 rule),
+and the `buildRoleButtons` filter specs (swatch/dataset/compound-key behaviour
+unchanged). No Ruby/Python/Rust/Flutter surface is touched.
+
+---
+
+## Feature: Mesh activity reporting & announcements
+
+Maps to SPEC decisions **MA1–MA10**. Each ingestor counts **every** frame it
+handles (all RX, incl. ignored/errored/unimplemented, plus its own TX) as one
+merged `packets` figure, appends the per-interval delta to its hourly
+`POST /api/ingestors` heartbeat (MA1–MA2); the web app persists a per-ingestor
+`ingestor_activity` time-series (MA3) from which `GET /api/stats` derives a
+`MAX`-per-protocol 24 h packets/hour moving average (MA4–MA5). Each ingestor then
+periodically broadcasts a one-line activity summary — numbers **dogfed from the
+target instance's own API** — on its protocol's default channel (MA6), gated by
+`RX_ONLY` (reused as the transmit gate), the target's `/version` privacy flag
+(fail-closed), and a ≥ 24 h post-start delay (MA7–MA8), via an **optional**
+duck-typed provider send
+that leaves `MeshProtocol` conformance intact (MA9). Unless a check says
+otherwise, start the server in **public** mode
+(`API_TOKEN=acctest PRIVATE=0 FEDERATION=0 bundle exec ruby app.rb`).
+
+### MA-A1 — Every frame is counted, including drops; TX too — MA1
+```bash
+( . .venv/bin/activate && pytest -q tests/test_activity_unit.py -k "count" )
+```
+**Expected:** pass. The merged `packets` counter increments once per received
+frame at the earliest seam (`handlers/_state._mark_packet_seen`) — verified for a
+**stored** packet, an **ignored** packet (`unsupported-port` / `no-message-payload`),
+and an **errored** packet (one that raises inside `store_packet_dict`) — and once
+per ingestor **transmission** (the announcement send and a MeshCore
+telemetry/status poll). The count is taken *before* any drop/dispatch decision, so
+no receive or transmit path bypasses it ("we don't want to under-report").
+
+### MA-A2 — Heartbeat carries a per-interval delta that resets — MA2
+```bash
+( . .venv/bin/activate && pytest -q tests/test_activity_unit.py -k "heartbeat_delta" )
+( . .venv/bin/activate && pytest -q tests/test_mesh.py -k "ingestor" )
+```
+**Expected:** pass. `queue_ingestor_heartbeat` includes `packets` = frames counted
+since the previous heartbeat and **zeroes** the running counter afterward: two
+heartbeats bracketing N then M frames report N then M (never N then N+M). A
+heartbeat with no traffic sends `0` (or omits the field). A pre-feature payload
+without `packets` is still accepted by `POST /api/ingestors` (additive, D8).
+
+### MA-A3 — Activity time-series: append per heartbeat, pruned by retention — MA3
+```bash
+( cd web && bundle exec rspec spec/activity_spec.rb )
+( cd web && bundle exec rspec spec/retention_spec.rb -e "ingestor_activity" )
+git grep -nE 'ingestor_activity' -- data/ingestor_activity.sql web/lib
+```
+**Expected:** pass, and the grep shows a new **append-only** `ingestor_activity`
+table (`ingestor_id`, `at`, `packets`, `protocol`, index on `at`). Each
+`POST /api/ingestors` carrying `packets` appends exactly one row (the `ingestors`
+snapshot row is still upserted, one per node); two ingestors of one protocol write
+**independent** rows (not pre-summed). The retention worker deletes activity rows
+older than the configured window (≥ 24 h), so the table cannot grow unbounded.
+
+### MA-A4 — MAX-per-protocol packets/hour over 24 h — MA4
+```bash
+( cd web && bundle exec rspec spec/queries_spec.rb -e "packets_per_hour" )
+```
+**Expected:** pass. With two `meshcore` ingestors reporting different 24 h packet
+totals, the meshcore rate = `MAX(total_A, total_B) ÷ 24` — the busiest single
+vantage, so the quieter ingestor and any overlap never inflate it. `total` is the
+**SUM** of the per-protocol rates (distinct protocols never share the air, so they
+add — e.g. meshcore + meshtastic), a protocol with no active ingestor reads `0`,
+and rows older than 24 h do not contribute. `query_packets_per_hour` returns these
+per-protocol rates, which the `GET /api/stats` route folds into each scope as
+`<scope>.packets.hour` (MA-A5).
+
+### MA-A5 — `/api/stats` exposes packets as an additive `<scope>.packets.hour` metric — MA5
+```bash
+curl -s http://127.0.0.1:41447/api/stats \
+  | python3 -c 'import sys,json; d=json.load(sys.stdin); \
+SC=("total","meshcore","meshtastic","reticulum"); \
+print("packets_per_hour" not in d \
+and all(isinstance(d[s]["packets"]["hour"],(int,float)) for s in SC) \
+and d["reticulum"]["packets"]["hour"]==0 \
+and all(m in d["total"] for m in ("nodes","messages","telemetry","packets")))'
+```
+**Expected:** prints `True` — each scope carries an additive `packets` metric with
+a single `hour` window (`<scope>.packets.hour`, the MA4 rate; `reticulum` a `0`
+stub), the old top-level `packets_per_hour` map is **gone**, **and** the
+pre-existing scope × metric × window tree (S1: each scope still carrying
+`nodes`/`messages`/`telemetry`) is unchanged and still present. No version bump —
+**S-A1** still passes.
+
+### MA-A6 — Announcement content is dogfed from the instance API — MA6
+```bash
+( . .venv/bin/activate && pytest -q tests/test_announce_unit.py -k "message or dogfeed" )
+```
+**Expected:** pass. The announcement string is exactly
+`"<Protocol> activity in the last 24h: <N> active nodes, <M> packets/hour. https://<domain>"`,
+where `<N>` = the target's `GET /api/stats` `<protocol>.nodes.day` and `<M>` =
+`GET /api/stats` `<protocol>.packets.hour` — both fetched over HTTP from
+`<domain>`, never computed from the ingestor's local counters — and the rendered
+line is truncated to the protocol's character limit. `<domain>` = the configured
+`INSTANCE_DOMAIN`.
+
+### MA-A7 — Announcement gates: RX_ONLY, privacy fail-closed, 24 h — MA7
+```bash
+( . .venv/bin/activate && pytest -q tests/test_announce_unit.py \
+    -k "gate or private or rx_only or elapsed" )
+```
+**Expected:** pass. **No** announcement is sent when any gate fails: `RX_ONLY=1`
+(the **reused** receive-only flag — its existing MeshCore-poll TX suppression now
+also covers the announcement, so it is the sole opt-out; no separate `ENABLE_TX`
+env exists); the target `/version` reports `private_mode: true`; the `/version`
+fetch **errors or is unparseable** (fail-closed — treated as private/skip); or
+`< 24 h` have elapsed since ingestor start. With `RX_ONLY` unset (the default
+`0`), `private_mode: false`, and `≥ 24 h` elapsed, exactly one announcement per
+24 h per domain is transmitted.
+
+### MA-A8 — Default channel/scope + 24 h cadence — MA8
+```bash
+( . .venv/bin/activate && pytest -q tests/test_announce_unit.py \
+    -k "channel or cadence or interval or domains" )
+```
+**Expected:** pass. The announcement is sent on Meshtastic channel `CHANNEL_INDEX`
+(default `0`) / MeshCore's public channel; the first fires no earlier than 24 h
+post-start and subsequent ones no more often than every 24 h; an ingestor with
+several `INSTANCE_DOMAIN` targets announces each once per cycle with that domain's
+own numbers and link.
+
+### MA-A9 — Send is optional and duck-typed; MeshProtocol conformance intact — MA9
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py \
+    -k "send_channel_announcement or MeshProtocol" )
+```
+**Expected:** pass. Both `MeshtasticProvider` and `MeshcoreProvider` expose
+`send_channel_announcement(...)`; the announce scheduler resolves it via
+`getattr(provider, "send_channel_announcement", None)` and **no-ops when absent**
+(e.g. a receive-only transport). The `@runtime_checkable MeshProtocol` interface is
+unchanged — **A4b**'s `isinstance(provider, MeshProtocol)` conformance still passes
+and `send_channel_announcement` is **not** a required member.
+
+### MA-A10 — Additive contract is documented — MA10 / D8
+```bash
+git grep -nE 'packets|ingestor_activity|packets_per_hour' -- data/mesh_ingestor/CONTRACTS.md
+```
+**Expected:** the additive heartbeat `packets` field, the `ingestor_activity`
+schema, and the `GET /api/stats` `<scope>.packets.hour` addition are all documented in
+`CONTRACTS.md` (Layer C source of truth). The engineering bar (100 % tests/docs/
+headers/lint) is enforced by Layer **B** (B1–B5); behavior is covered by
+MA-A1…MA-A9.
+
+### MA-R1 — Regression: prior acceptance still holds
+```bash
+( . .venv/bin/activate && pytest -q tests/ )
+( cd web && bundle exec rspec ) && ( cd web && npm test )
+```
+**Expected:** every prior check still passes. At risk and explicitly required to
+remain green: **A1a/A1b** (apex — the new ingestor→instance GET and the LoRa
+announcement add no broker term or dependency); **A4b** (MeshProtocol isinstance
+conformance — send stays optional/duck-typed, MA9); **S-A1** (the `/api/stats`
+scope × metric × window tree is unchanged; `packets.hour` is an additive metric
+under each scope — no version bump, so `test_version_sync.py` is unaffected); **A2a/A2b**
+(privacy — the message API still 404s under `PRIVATE`, and the announcement
+fail-closes on the same flag, MA7); **C2** (`tests/test_mesh.py` — the
+`POST /api/ingestors` `packets` field is additive and old payloads still validate);
+and **B1** (all suites). No `/api/*` response shape is broken by construction.
+
+---
+
+## Feature: Mesh activity map card (frontend)
+
+Maps to SPEC decisions **MA-F1…MA-F6**. The card logic lives in
+`web/public/assets/js/app/map-activity-card.js` (DOM-building, 100 % unit-tested)
+and the packets parsing in `web/public/assets/js/app/stats.js`; `main.js` wires a
+Leaflet `bottomleft` control and renders it from the `/api/stats` stats callback.
+Behaviour is verified by the JS unit suite.
+
+### MA-FA1 — Card renders the total + per-protocol rows from `/api/stats` — MA-F1/MA-F2
+```bash
+( cd web && node --test public/assets/js/app/__tests__/map-activity-card.test.js \
+                       public/assets/js/app/__tests__/stats.test.js )
+```
+**Expected:** pass. `stats.js` attaches `stats.packets = { total, meshcore, meshtastic }`
+from the payload's `<scope>.packets.hour`; `buildMeshActivityModel({total,meshtastic,meshcore})`
+returns the total plus one row per protocol (Meshtastic then MeshCore), each with a
+`barPct` sized to the busiest visible protocol; `renderMeshActivityCardHtml` emits the
+total, a `packets/h` unit, both protocol icons, and the row rates.
+
+### MA-FA2 — Reticulum is never rendered — MA-F2
+**Expected (covered by the MA-FA1 suite):** `buildMeshActivityModel` with a `reticulum`
+rate present still returns only `meshtastic`/`meshcore` rows — reticulum is absent from
+the card (forward-looking zero stub, S6).
+
+### MA-FA3 — Zero / absent activity unmounts the card — MA-F3
+**Expected (covered by the MA-FA1 suite):** a `0` total, all-zero protocol rates, or an
+absent `packets` payload yield `model.visible === false`; `createMeshActivityCard().render(...)`
+then adds `.map-activity-card--hidden`, sets `hidden`, and empties the element.
+
+### MA-FA4 — A hidden protocol drops its row and rebases the total — MA-F4
+**Expected (covered by the MA-FA1 suite):** `buildMeshActivityModel({total:120,
+meshtastic:76, meshcore:44}, new Set(['meshcore']))` returns only the Meshtastic row with
+`total === 76` (the sum of the *visible* protocols), and `card.render(...)` sets the
+aria-label to `"Mesh activity: 76 packets per hour"` — the same rebasing the node counts
+already do (Invariant IV parity). Hiding both protocols unmounts the card.
+
+### MA-FA5 — Sparkline (superseded by F2-A2) — MA-F5
+**Superseded by F2-A2 (and SPEC F2-4).** F1 shipped the sparkline as a deterministic
+placeholder (`data-placeholder="true"`); F2 replaced it with the real 24 h series from
+`/api/stats/activity`. The card now emits **no** `data-placeholder` and draws the
+sparkline only when real data is present — verified by **F2-A2** (and the MA-FA1 suite,
+which now asserts `data-placeholder` is *absent*). Retained for provenance; the live
+requirement is F2-A2.
+
+### MA-FR1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test )
+```
+**Expected:** every prior check still passes. Frontend/read-side only: no `/api/*`
+response shape changes (so **S-A1**, **MA-A5**, **C2** are untouched), and the packets
+figures are the same public aggregate MA5 already exposes (privacy **A2**/**S-A4**
+unchanged). The stats consumer (`stats.js`) gains `packets` parsing additively — the
+existing `normaliseActiveNodeStatsPayload` node-count assertions are unchanged, not removed.
+
+---
+
+## Feature: Mesh activity time-series (F2)
+
+Maps to SPEC decisions **F2-1…F2-6**. The bucket query lives in
+`ingestor_queries.rb` (`query_activity_buckets`) and the route in
+`application/routes/api.rb`; the sparkline + charts wiring is JS. Behaviour is
+verified by the Ruby and JS unit suites.
+
+### F2-A1 — `/api/stats/activity` serves a snake_case packets/hour series — F2-1/F2-2
+```bash
+( cd web && bundle exec rspec spec/queries_spec.rb -e "query_activity_buckets" \
+                               spec/app_spec.rb -e "/api/stats/activity" )
+```
+**Expected:** pass. `GET /api/stats/activity?window_seconds=&bucket_seconds=` returns an
+ascending array of `{ bucket_start, bucket_end, total, meshcore, meshtastic }`; each
+protocol's value is the MAX over that protocol's ingestors of their summed `packets` in
+the bucket ÷ the bucket's hour-span, and `total` is the SUM across protocols (MA4).
+`reticulum` folds into `total` with no series key. A non-positive
+`window_seconds`/`bucket_seconds`, or a bucket count over `MAX_QUERY_LIMIT`, is a `400`;
+the window is clamped to the 28-day floor. Params are **snake_case** (no camelCase).
+
+### F2-A2 — The map card draws its 24h sparkline from `/api/stats/activity` — F2-4
+```bash
+( cd web && node --test public/assets/js/app/__tests__/map-activity-card.test.js \
+                       public/assets/js/app/__tests__/stats.test.js )
+```
+**Expected:** pass. `fetchActivitySeries` GETs
+`/api/stats/activity?window_seconds=86400&bucket_seconds=3600`, caches it, and fails
+soft to `null` (non-OK / network error / empty). `sparklinePathsFromSeries` maps a
+≥2-point total series to an SVG path (null otherwise). The card is stateful:
+`render(rates)` and `setSeries(series)` each repaint from the last-known other; the
+sparkline appears only once a real series arrives (no `data-placeholder`, no fake
+curve) and is omitted on failure while the live total/rows still render.
+
+### F2-A3 — `/charts` shows a protocol-aware Mesh activity figure — F2-5
+```bash
+( cd web && node --test public/assets/js/app/__tests__/mesh-activity-chart.test.js \
+                       public/assets/js/app/__tests__/node-page.test.js \
+                       public/assets/js/app/__tests__/charts-page.test.js )
+```
+**Expected:** pass. `renderMeshActivityChart` draws a two-line (Meshtastic `#8856a7`,
+MeshCore `#3182bd`) packets/hour figure with an **"Activity (pkt/h)"** y-axis, fed by
+`fetchActivityChartBuckets` (`/api/stats/activity`, 7 d / 2 h; fails soft to `[]`).
+`renderTelemetryCharts` accepts an `insertBefore` map that places the figure
+immediately before the `environment` spec — i.e. **between** the channel-utilization
+and environmental figures — and `initializeChartsPage` wires it there. The `/charts`
+intro no longer names a single protocol (the aggregate is all-protocol).
+
+---
+
+## Bugfix: Neighbor/trace legend toggles highlight when visible
+
+Maps to SPEC decision **NT1**.
+
+### NT-A1 — Neighbor/trace toggles are pressed when their lines are visible — NT1
+```bash
+git grep -nE "aria-pressed', neighborLinesVisible \? 'true'|aria-pressed', traceLinesVisible \? 'true'" \
+  -- web/public/assets/js/app/main.js
+```
+**Expected:** both matches present — the neighbor- and trace-line legend toggles set
+`aria-pressed` to `'true'` when their lines are **visible** (`…Visible ? 'true' : 'false'`),
+so the highlighted state (`button.legend-item[aria-pressed="true"]`, LC2) marks *shown*
+lines, consistent with the role chips and the meta-row protocol toggles. Previously
+reversed (pressed when hidden).
+
+---
+
+## Bugfix: Mesh activity design-review remediation
+
+Maps to SPEC decisions **MR1…MR8**.
+
+### MR-A1 — Sparkline rebasing, headroom, and card role — MR4/MR5/MR6
+```bash
+( cd web && node --test public/assets/js/app/__tests__/map-activity-card.test.js \
+                       public/assets/js/app/__tests__/stats.test.js )
+```
+**Expected:** pass. `normaliseActivitySeries` returns per-bucket `{meshcore, meshtastic}`
+(not a pre-summed total); `buildMeshActivityModel` sums only the **visible** protocols
+for the sparkline, so toggling a protocol changes the curve (a rebasing test asserts the
+paths differ); `sparklinePathsFromSeries` scales to `max × 1.15` (headroom); and
+`createMeshActivityCard` sets `role="group"` on the card root.
+
+### MR-A2 — Idle card stays hidden on mobile + protocol-neutral intro — MR1/MR3/MR7
+```bash
+grep -n 'max-width: 659px' web/public/assets/styles/base.css
+awk '/max-width: 659px/{f=1} f&&/map-activity-card--hidden \{/{print "  re-declared --hidden in media block"; exit}' web/public/assets/styles/base.css
+git grep -n 'meshtastic.svg' -- web/views/charts.erb
+```
+**Expected:** the `≤659px` media query exists; `.map-activity-card--hidden { display: none }`
+is re-declared inside it (so an idle card cannot paint an empty pill over the map,
+restoring MA-F3 on phones — the `awk` prints its confirmation line); and the last command
+prints **nothing** — the `/charts` intro heading no longer references `meshtastic.svg`.
+
+## Bugfix: MeshCore RX packet undercount & position radio metadata
+
+Regression coverage for the two MeshCore ingestor under-reporting defects: the
+`RX_LOG_DATA` counting gap (PC1–PC4) and the position radio-metadata omission
+(PC5).
+
+### PC-A1 — Every MeshCore RX-log frame is counted, once, at the RX-log seam — PC1/PC2/PC3
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "on_rx_log_data or process_contacts_marks_packet_activity or queue_meshcore_telemetry_packet_shape" )
+( . .venv/bin/activate && pytest -q tests/test_activity_unit.py -k "mark_packet_activity or mark_packet_seen" )
+```
+**Expected:** pass. A non-`ADVERT` `RX_LOG_DATA` frame (e.g. `GRP_TXT`) now increments
+the merged counter (`test_on_rx_log_data_non_advert_counts_frame`) **and** still routes to
+the `DEBUG`-only capture without upserting (`..._routes_to_debug_capture`, RF3 preserved) —
+counting precedes the drop, so the ~4× MeshCore undercount is closed. The decoded
+high-level seams do **not** re-count: `_process_contacts` and `_queue_meshcore_telemetry`
+call `_mark_packet_activity` (clock only), never `_mark_packet_seen`, so a frame already
+counted at its `RX_LOG_DATA` seam is not double-counted. `_mark_packet_activity` advances
+the inactivity-reconnect clock without counting, while `_mark_packet_seen` does both — so
+reconnect timing is unchanged.
+
+### PC-A2 — MeshCore position POSTs carry captured LoRa radio metadata — PC5
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "store_meshcore_position_includes_radio_metadata or store_meshcore_position_queues" )
+```
+**Expected:** pass. With `config.LORA_FREQ`/`MODEM_PRESET` captured, a MeshCore position
+POST body carries `lora_freq`/`modem_preset` (was nil on every `/api/positions` row),
+matching MeshCore message/node POSTs; when the ingestor has not captured them the fields
+are omitted (never nil-stamped), so the existing position-shape test still passes.
+
+---
+
+## Bugfix: Matrix bridge tolerates compacted `/api/messages` rows
+
+Live outage (2026-07-26): the bridge logged `Error fetching PotatoMesh
+messages: … missing field channel_name` on every poll and forwarded nothing.
+`GET /api/messages` compacts NULL/empty columns *out* of each row
+(`compact_api_row`), and `CONTRACTS.md` marks only `id`/`rx_time`/`rx_iso` as
+required — everything else is conditionally present: `channel_name` explicitly
+"only when not encrypted and known", `text` is `string|nil`, and any nullable
+column (`to_id`, `lora_freq`, `modem_preset`, …) simply vanishes from the
+response under compaction — so a row without them is contract-conformant. The bridge's `PotatoMessage` modeled those fields as
+**required**, and one conformant row (a MeshCore message on an unnamed channel
+slot) made serde fail the ENTIRE batch: an implementation defect in the bridge
+against **D8** (the `CONTRACTS.md` shapes are the contract) and **§4.3/D10**
+(the bridge is a consumer of the public API). No SPEC amendment — the contract
+already permitted the row; the bridge's model was stricter than the contract.
+
+### MB-A1 — one compacted row cannot poison the message fetch — D8/D10
+```bash
+( cd matrix && cargo test deserialize_batch_with_row_missing_channel_name \
+            && cargo test deserialize_maximally_compacted_row \
+            && cargo test poll_once_bridges_batch_containing_row_without_channel_name \
+            && cargo test poll_once_advances_watermark_past_unforwardable_rows )
+```
+**Expected:** all pass. `PotatoMessage` keeps only the contract-required
+`id`/`rx_time`/`rx_iso` as required; every conditionally-present field
+(`from_id`, `to_id`, `channel`, `text`, `lora_freq`, `modem_preset`,
+`channel_name`, `node_id`, …) is `Option` with `#[serde(default)]`, so the
+production row (replayed verbatim in the first test) and a maximally-compacted
+reaction row both parse. A batch containing such rows bridges every
+forwardable message: a missing `channel_name` renders empty channel brackets
+`[]` in the prefix (the web frontend's empty-bracket convention), a missing
+`modem_preset` renders the existing `??` slot, and a missing `lora_freq`
+renders the existing `0` sentinel. Rows the bridge can never forward — no
+`text` (e.g. emoji reactions) or no `node_id` (unresolved sender) — are
+skipped with the watermark advanced, exactly like non-text ports, so they are
+neither retried forever nor able to stall the batch.
+
+### MB-R1 — Regression: prior acceptance still holds
+```bash
+( cd matrix && cargo test --all --all-features && cargo fmt --all -- --check \
+            && cargo clippy --all-targets --all-features -- -D warnings \
+            && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps )
+```
+**Expected:** all green. At risk and explicitly required to stay green: the
+watermark/poison-tracker suite (`poll_once_*` — the skip path reuses their
+advance-and-persist semantics), the preset/tag rendering suite
+(`handle_message_*` — prefix layout unchanged for fully-populated rows), and
+the fetch/deserialize suite in `potatomesh.rs`.
+
+---
+
+## Bugfix: Canonical node-id lookups (bridge bang-stripping, digit-only refs)
+
+Maps to SPEC decisions **NL1/NL2**. Live failure (2026-07-27): the bridge
+logged `Error handling message 506429242193513: HTTP status client error (404
+Not Found) for url (https://potatomesh.net/api/nodes/27336717)` five polls in
+a row, then dropped the message via the poison tracker — while `/api/nodes`
+listed the node and `/api/nodes/!27336717` returned 200. The bridge strips
+the canonical `!` (D8) and a bare all-decimal-digit ref is resolved by
+`canonical_node_parts` as a Meshtastic node num before the hex interpretation
+is ever tried.
+
+### NL-A1 — bridge node lookups use the canonical `%21`-encoded id — NL1/D8
+```bash
+( cd matrix && cargo test get_node_requests_canonical_bang_id )
+```
+**Expected:** pass. `PotatoClient::node_url` builds `/api/nodes/%21<hex>`;
+the test mounts ONLY the percent-encoded canonical path (for the live
+offender `!27336717`), so a bare-hex request matches no mock and fails the
+lookup. Verified against production before the fix:
+`GET /api/nodes/27336717` → 404, `GET /api/nodes/%2127336717` → 200.
+
+### NL-A2 — digit-only refs fall back to the hex id on a num miss — NL2
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "digit-only hex ids" \
+         && bundle exec rspec spec/queries_spec.rb -e digit_only_hex_node_ref )
+```
+**Expected:** pass. `GET /api/nodes/27336717` returns the `!27336717` row
+when no node matches num 27336717 (the outage case); with a genuine num-27336717
+node present the num interpretation keeps precedence and wins; refs that are
+not exactly eight digits (`123`, `123456789`) or already unambiguous
+(`!27336717`, `7e590852`) are never reinterpreted, so every previously
+resolving ref resolves identically.
+
+### NL-R1 — Regression: prior acceptance still holds
+```bash
+( cd matrix && cargo test --all --all-features && cargo fmt --all -- --check \
+            && cargo clippy --all-targets --all-features -- -D warnings \
+            && RUSTDOCFLAGS='-D warnings' cargo doc --no-deps )
+( cd web && bundle exec rspec ) && ( cd web && bundle exec rufo --check . )
+```
+**Expected:** all green. At risk and explicitly required to stay green: the
+bridge poll/handle suites (every node mock now serves the `%21` path), the
+MB-A1 compacted-row suite, and the per-id node route specs (synthetic flag,
+stale/fresh, since-filter, opt-out) — the fallback fires only on the
+empty-result path, so none of their outcomes may change.

@@ -61,14 +61,20 @@
   <link rel="icon" type="image/svg+xml" sizes="any" href="/potatomesh-logo.svg" />
   <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
   <% if (defined?(current_view_mode) ? current_view_mode : nil).to_s == "dashboard" %>
+  <% # Escape characters that could prematurely close the <script> element
+     # (or be misinterpreted as HTML) when meta_name/canonical_base/
+     # meta_description are attacker-influenced. JSON string escaping alone
+     # is not enough here since a literal "</script>" inside a JSON string
+     # value still terminates the element in HTML parsing. %>
+  <% instance_ld_json = JSON.generate({
+       "@context" => "https://schema.org",
+       "@type" => "WebSite",
+       "name" => meta_name,
+       "url" => canonical_base,
+       "description" => meta_description,
+     }).gsub("<", "\\u003c").gsub(">", "\\u003e").gsub("&", "\\u0026") %>
   <script type="application/ld+json">
-    <%= JSON.generate({
-          "@context" => "https://schema.org",
-          "@type" => "WebSite",
-          "name" => meta_name,
-          "url" => canonical_base,
-          "description" => meta_description,
-        }) %>
+    <%= instance_ld_json %>
   </script>
   <% end %>
   <%# Import map versions the entire served JS module graph (SPEC AV3); must
@@ -116,7 +122,6 @@
    main_classes << "page-main--full-screen" if full_screen_view
    show_header = true
    show_footer = !full_screen_view || %i[charts federation].include?(view_mode) || page_view
-   footer_slim = %i[charts federation].include?(view_mode) || page_view
    show_filter_input = !(%i[node_detail charts federation].include?(view_mode) || page_view)
    show_meta_row = !(%i[node_detail charts federation].include?(view_mode) || page_view)
    nodes_nav_href = "/nodes"
@@ -130,6 +135,12 @@
   data-private-mode="<%= private_mode ? "true" : "false" %>"
 >
   <div class="<%= shell_classes.join(" ") %>">
+    <noscript>
+      <p class="noscript-notice">
+        This dashboard needs JavaScript to render live mesh data.
+        The raw data is available at <a href="/api/nodes">/api/nodes</a>.
+      </p>
+    </noscript>
     <% if show_header %>
       <% if announcement_markup && !announcement_markup.empty? %>
         <div class="announcement-banner" role="status" aria-live="polite">
@@ -147,9 +158,18 @@
           <% if federation_nav_enabled %>
             <div class="header-federation">
               <div class="instance-selector">
+                <button
+                  id="instanceSelectToggle"
+                  class="icon-button instance-selector-toggle"
+                  type="button"
+                  aria-expanded="false"
+                  aria-controls="instanceSelect"
+                  aria-label="Choose another region"
+                  title="Choose another region"
+                >🌍</button>
                 <label class="visually-hidden" for="instanceSelect">Select a region</label>
-                <select id="instanceSelect" class="instance-select" aria-label="Select instance region">
-                  <option value=""><%= Rack::Utils.escape_html("Select region ...") %></option>
+                <select id="instanceSelect" class="instance-select" aria-label="Select instance region" hidden>
+                  <option value=""><%= Rack::Utils.escape_html("Other regions…") %></option>
                 </select>
               </div>
             </div>
@@ -163,10 +183,6 @@
             <a href="<%= nodes_nav_href %>" class="site-nav__link<%= nodes_nav_active ? " is-active" : "" %>"<%= nodes_nav_active ? ' aria-current="page"' : "" %>>Nodes</a>
             <% if federation_nav_enabled %>
               <a href="/federation" class="site-nav__link js-federation-nav<%= view_mode == :federation ? " is-active" : "" %>" data-federation-label="Federation"<%= view_mode == :federation ? ' aria-current="page"' : "" %>>Federation</a>
-            <% end %>
-            <% static_pages.each do |sp| %>
-              <% sp_active = view_mode.to_s == "page_#{sp.slug}" %>
-              <a href="/pages/<%= Rack::Utils.escape_path(sp.slug) %>" class="site-nav__link<%= sp_active ? " is-active" : "" %>"<%= sp_active ? ' aria-current="page"' : "" %>><%= Rack::Utils.escape_html(sp.title) %></a>
             <% end %>
           </nav>
           <button
@@ -198,10 +214,6 @@
             <% if federation_nav_enabled %>
               <a href="/federation" class="mobile-nav__link js-federation-nav<%= view_mode == :federation ? " is-active" : "" %>" data-federation-label="Federation"<%= view_mode == :federation ? ' aria-current="page"' : "" %>>Federation</a>
             <% end %>
-            <% static_pages.each do |sp| %>
-              <% sp_active = view_mode.to_s == "page_#{sp.slug}" %>
-              <a href="/pages/<%= Rack::Utils.escape_path(sp.slug) %>" class="mobile-nav__link<%= sp_active ? " is-active" : "" %>"<%= sp_active ? ' aria-current="page"' : "" %>><%= Rack::Utils.escape_html(sp.title) %></a>
-            <% end %>
           </nav>
         </div>
       </div>
@@ -215,14 +227,21 @@
             <button type="button" id="filterClear" class="filter-clear" aria-label="Clear filter" hidden>&times;</button>
           </div>
         <% end %>
+        <%# Protocol toggles carry the live per-protocol count (audit follow-up
+            04): the two icon buttons were unlabelled, so a count both names them
+            and states the MeshCore/Meshtastic split. JS fills the counts. %>
         <button id="protocolToggleMeshcore" type="button" class="icon-button protocol-toggle-btn" aria-label="Hide MeshCore nodes" aria-pressed="false" title="Toggle MeshCore node visibility" hidden>
           <img src="/assets/img/meshcore.svg" alt="" width="20" height="20" aria-hidden="true" class="protocol-toggle-icon" loading="lazy" decoding="async" />
+          <span id="protocolToggleMeshcoreCount" class="protocol-toggle-count" aria-hidden="true"></span>
         </button>
         <button id="protocolToggleMeshtastic" type="button" class="icon-button protocol-toggle-btn" aria-label="Hide Meshtastic nodes" aria-pressed="false" title="Toggle Meshtastic node visibility" hidden>
           <img src="/assets/img/meshtastic.svg" alt="" width="20" height="20" aria-hidden="true" class="protocol-toggle-icon" loading="lazy" decoding="async" />
+          <span id="protocolToggleMeshtasticCount" class="protocol-toggle-count" aria-hidden="true"></span>
         </button>
         <span id="footerActiveNodes" class="meta-active-nodes"></span>
-        <button id="autorefreshToggle" type="button" aria-label="Pause auto-refresh" aria-pressed="false" title="Pause or resume automatic data refresh">⏸</button>
+        <%# The join strip moved to the footer (audit follow-up 04), freeing the
+            meta row for the per-minute vital signs. %>
+        <button id="autorefreshToggle" type="button" aria-label="Pause auto-refresh" aria-pressed="false" title="Pause or resume automatic data refresh">● live</button>
       </div>
     <% end %>
 
@@ -241,7 +260,7 @@
     </main>
 
     <% if show_footer %>
-      <%= erb :"shared/_footer", locals: { site_name: site_name, version: version, contact_link: contact_link, contact_link_url: contact_link_url, slim: footer_slim } %>
+      <%= erb :"shared/_footer", locals: { site_name: site_name, version: version, contact_link: contact_link, contact_link_url: contact_link_url, static_pages: static_pages, current_view_mode: view_mode } %>
     <% end %>
   </div>
 

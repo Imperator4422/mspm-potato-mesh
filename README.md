@@ -93,8 +93,12 @@ The web app can be configured with environment variables (defaults shown):
 | `API_TOKEN` | _required_ | Shared secret that authorizes ingestors and API clients making `POST` requests. |
 | `INSTANCE_DOMAIN` | _auto-detected_ | Public hostname (optionally with port) used for metadata, federation, and generated API links. |
 | `SITE_NAME` | `"PotatoMesh Demo"` | Title and header displayed in the UI. |
-| `CHANNEL` | `"#LongFast"` | Default channel name displayed in the UI. |
-| `FREQUENCY` | `"915MHz"` | Default frequency description displayed in the UI. |
+| `MESHTASTIC_PRESET` | `"#LongFast"` | Meshtastic radio preset shown in the join strip, meta description, and federation directory (e.g. `MediumFast`). |
+| `MESHTASTIC_FREQ` | `"915MHz"` | Meshtastic frequency shown alongside the preset. |
+| `MESHCORE_PRESET` | _unset_ | MeshCore radio preset for the join strip; the MeshCore line is hidden until both `MESHCORE_*` values are set. |
+| `MESHCORE_FREQ` | _unset_ | MeshCore frequency for the join strip. |
+| `CHANNEL` | `"#LongFast"` | **Deprecated** — legacy alias still honoured as the fallback for `MESHTASTIC_PRESET`. |
+| `FREQUENCY` | `"915MHz"` | **Deprecated** — legacy alias still honoured as the fallback for `MESHTASTIC_FREQ`. |
 | `CONTACT_LINK` | `"#potatomesh:dod.ngo"` | Chat link or Matrix alias rendered in the footer and overlays. |
 | `ANNOUNCEMENT` | _unset_ | Optional announcement banner text rendered above the header on every page. |
 | `MAP_CENTER` | `38.761944,-27.090833` | Latitude and longitude that centre the map on load. |
@@ -103,6 +107,16 @@ The web app can be configured with environment variables (defaults shown):
 | `DEBUG` | `0` | Set to `1` for verbose logging in the web and ingestor services. |
 | `ALLOWED_CHANNELS` | _unset_ | Comma-separated channel names the ingestor accepts; when set, all other channels are skipped before hidden filters. |
 | `HIDDEN_CHANNELS` | _unset_ | Comma-separated channel names the ingestor will ignore when forwarding packets. |
+| `TRANSPORT` | `api` | Ingestor transport: `api` (Meshtastic library over serial/TCP/BLE) or `udp` (passive LAN multicast; see [Passive UDP transport](#passive-udp-transport)). |
+| `PRIMARY_CHANNEL_ONLY` | `0` | Set to `1` to ingest only the primary channel (index 0) and drop all other channels. In UDP transport this requires `PRIMARY_CHANNEL_NAME`; without it, every packet is dropped (fail closed). |
+| `PRIMARY_CHANNEL_KEY` | `AQ==` | Base64 PSK used to decrypt the primary channel in UDP transport (default = Meshtastic default key). |
+| `PRIMARY_CHANNEL_NAME` | _unset_ | Name of channel 0 (e.g. `MediumFast`/`LongFast` — the preset name the firmware uses when the channel name is blank, as shown by `meshtastic --info`). Used to compute the channel hash that identifies primary traffic on the UDP multicast. Required by UDP `PRIMARY_CHANNEL_ONLY=1`, because a secondary channel can share the default `AQ==` key — only the per-channel hash of *(name, key)* distinguishes them. |
+| `MESH_UDP_GROUP` | `224.0.0.69` | Multicast group joined in UDP transport. |
+| `MESH_UDP_PORT` | `4403` | Multicast port joined in UDP transport. |
+| `INGESTOR_NODE_ID` | _unset_ | `!xxxxxxxx` id used for the ingestor heartbeat in UDP transport (which cannot auto-detect "self"). |
+| `MESHCORE_TELEMETRY_POLL_SECONDS` | `300` | Seconds between MeshCore contact telemetry polls (one on-air request per interval, round-robin over the roster; each contact is additionally polled at most once per 24 h — when every contact is fresh the tick sends nothing). Set `0` to disable on-air polling. |
+| `MESHCORE_SELF_TELEMETRY_SECONDS` | `3600` | Seconds between MeshCore host self-telemetry reads (battery/sensors over the companion link, no airtime). Set `0` to disable. |
+| `RX_ONLY` | `0` | Set to `1` to forbid every ingestor-initiated mesh transmission (receive-only listening post). Currently disables the MeshCore contact telemetry/status polls; local companion-link reads (self telemetry, roster, channels) continue. |
 | `FEDERATION` | `1` | Set to `1` to announce your instance and crawl peers, or `0` to disable federation. Private mode overrides this. |
 | `PRIVATE` | `0` | Set to `1` to hide the chat UI, disable message APIs, and exclude hidden clients from public listings. |
 | `EVENTS` | `1` | Set to `0` to disable the live-update SSE stream (`GET /api/events`); clients then fall back to polling at the refresh interval. |
@@ -153,6 +167,26 @@ well-known document is staged in
 `$XDG_CONFIG_HOME/potato-mesh/well-known/potato-mesh`.
 
 The database can be found in `$XDG_DATA_HOME/potato-mesh`.
+
+### Map Basemap & Tile Egress
+
+The node map is drawn with two third-party raster tile CDNs stacked and loaded
+**together on every viewport**: an OpenStreetMap France **HOT**
+(`openstreetmap.fr/hot`) overlay on top of a **CARTO Voyager**
+(`basemaps.cartocdn.com`) base, both greyed by the same dark filter so they blend
+into one look. Loading both at once (rather than the previous per-tile
+fallback-after-a-timeout) is deliberate: a slow HOT tile simply shows the
+already-present CARTO tile underneath instead of leaving a blank or checkerboard
+cell, so there is no fallback deadline to tune.
+
+The trade-off is that map tiles are fetched from **two** third-party CDNs on every
+pan/zoom, not one. Both providers are keyless and cookieless: the browser sends
+only standard `{z}/{x}/{y}` tile coordinates (plus the request's own IP/`Referer`,
+inherent to any CDN fetch) — no API key, credential, cookie, analytics beacon, or
+node/mesh identifier. Tiles are fetched **browser→CDN** directly; PotatoMesh
+proxies nothing and receives no tile telemetry, so the local-LoRa-only and
+no-phone-home posture is unaffected. Operators who must avoid third-party tile
+egress entirely should front the map with their own tile cache/proxy.
 
 ### Custom Pages
 
@@ -267,6 +301,57 @@ example `ALLOWED_CHANNELS="Chat,Ops"`); packets on other channels are discarded.
 Use `HIDDEN_CHANNELS` to block specific channels from the web UI even when they
 appear in the allowlist.
 
+### MeshCore
+
+Set `PROTOCOL=meshcore` to ingest from a MeshCore companion-firmware node
+instead (serial, TCP, or BLE via the same `CONNECTION` formats). Alongside
+contacts and messages, the ingestor captures RF metrics: per-message SNR and
+hop counts, per-channel-message RSSI and repeater path (decoded from the
+radio's RX log), and per-advert SNR/RSSI/hops for every node heard on air —
+including nodes the radio's contact roster has no room for.
+
+**Note — the ingestor writes one radio setting.** At startup it enables the
+firmware's *overwrite-oldest-contact* flag (`autoadd_config` bit `0x01`,
+firmware ≥ 1.16) so a full contact roster evicts its oldest non-favourite
+entry instead of rejecting new nodes. The write happens only when the bit is
+not already set, preserves all other auto-add settings, persists on the
+device, and never evicts favourites. Older firmware without the command is
+left untouched. Evicted contacts remain in the dashboard's database — only
+the radio's local roster rotates.
+
+### Passive UDP transport
+
+The Meshtastic node radio accepts only **one** API client at a time (serial or
+TCP), so an ingestor connected over `CONNECTION` monopolizes the node — the
+phone app, CLI, and message sending fight it for the single slot. Setting
+`TRANSPORT=udp` switches the ingestor to a **passive** listener that never
+connects to the node's API at all: it joins the node's LAN multicast group
+(Meshtastic "Mesh via UDP", `224.0.0.69:4403`) and decodes packets off the wire,
+leaving the node's API slot completely free.
+
+Enable "Mesh via UDP" on the node first (`meshtastic --set
+network.enabled_protocols 1`). The ingestor decrypts the primary channel with
+`PRIMARY_CHANNEL_KEY` (the Meshtastic default key `AQ==` by default). Private
+channels with their own secret keys are cryptographically unreadable and
+dropped. To guarantee **only** channel 0 is ingested, set
+`PRIMARY_CHANNEL_ONLY=1` **and** `PRIMARY_CHANNEL_NAME` (e.g. `MediumFast`): each
+packet advertises the hash of its channel *(name + key)*, and only packets whose
+hash matches the primary channel's are accepted. This is stricter than decrypting
+with the primary key — a secondary channel created with the default `AQ==` key
+would decrypt too, but has a different name and therefore a different hash, so it
+is dropped. If `PRIMARY_CHANNEL_NAME` is not set while `PRIMARY_CHANNEL_ONLY=1`,
+the ingestor fails closed and drops everything. Because there is no API
+connection, the node's bulk node database is not read — the node list rebuilds
+over the air from observed packets, and payloads (position, telemetry,
+traceroute, …) are decoded into the exact same shape the API/serial transport
+produces, so the collector receives identical records.
+
+`TRANSPORT=udp` requires host networking so the container can receive LAN
+multicast (`network_mode: host`). A ready-to-use Raspberry Pi (arm64) deployment
+is provided in [`data/tools/compose.udp.pi.yml`](data/tools/compose.udp.pi.yml).
+Capture live packets for testing with
+[`data/tools/capture_udp_fixtures.py`](data/tools/capture_udp_fixtures.py).
+
 ## Nix
 
 For the dev shell, run:
@@ -326,9 +411,9 @@ docker pull ghcr.io/l5yth/potato-mesh-matrix-bridge-linux-arm64:latest
 docker pull ghcr.io/l5yth/potato-mesh-matrix-bridge-linux-armv7:latest
 
 # version-pinned examples
-docker pull ghcr.io/l5yth/potato-mesh-web-linux-amd64:v0.7.1
-docker pull ghcr.io/l5yth/potato-mesh-ingestor-linux-amd64:v0.7.1
-docker pull ghcr.io/l5yth/potato-mesh-matrix-bridge-linux-amd64:v0.7.1
+docker pull ghcr.io/l5yth/potato-mesh-web-linux-amd64:v0.7.4
+docker pull ghcr.io/l5yth/potato-mesh-ingestor-linux-amd64:v0.7.4
+docker pull ghcr.io/l5yth/potato-mesh-matrix-bridge-linux-amd64:v0.7.4
 ```
 
 Note: `latest` is only published for non-prerelease versions. Pre-release tags

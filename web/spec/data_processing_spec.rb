@@ -317,6 +317,230 @@ RSpec.describe PotatoMesh::App::DataProcessing do
   end
 
   # ---------------------------------------------------------------------------
+  # insert_telemetry (extended metric families — TI-A2)
+  # ---------------------------------------------------------------------------
+  describe "#insert_telemetry — extended metric families" do
+    include_context "with isolated db"
+
+    # Insert +payload+ and return the stored telemetry row as a Hash.
+    #
+    # @param payload [Hash] inbound telemetry payload.
+    # @return [Hash] stored row for the payload's id.
+    def stored_row(payload)
+      db = open_db
+      dp.insert_telemetry(db, payload)
+      row = db.execute("SELECT * FROM telemetry WHERE id = ?", [payload["id"]]).first
+      db.close
+      row
+    end
+
+    it "stores power metric values from power_metrics" do
+      row = stored_row(
+        "id" => 91_001,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "power_metrics" => { "ch1Voltage" => 3.94, "ch2Current" => 121.5 },
+      )
+      expect(row["telemetry_type"]).to eq("power")
+      expect(row["ch1_voltage"]).to eq(3.94)
+      expect(row["ch2_current"]).to eq(121.5)
+    end
+
+    it "stores air quality metric values from air_quality_metrics" do
+      row = stored_row(
+        "id" => 91_002,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "air_quality_metrics" => { "pm25Standard" => 8, "co2" => 700 },
+      )
+      expect(row["telemetry_type"]).to eq("air_quality")
+      expect(row["pm25_standard"]).to eq(8)
+      expect(row["co2"]).to eq(700)
+    end
+
+    it "stores health metric values under dedicated columns" do
+      row = stored_row(
+        "id" => 91_003,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "health_metrics" => { "heartBpm" => 72, "spO2" => 97, "temperature" => 36.6 },
+      )
+      expect(row["telemetry_type"]).to eq("health")
+      expect(row["heart_bpm"]).to eq(72)
+      expect(row["spo2"]).to eq(97)
+      expect(row["health_temperature"]).to eq(36.6)
+      expect(row["temperature"]).to be_nil
+    end
+
+    it "accepts the diagnostics telemetry_type values and counters" do
+      row = stored_row(
+        "id" => 91_004,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "telemetry_type" => "local_stats",
+        "local_stats" => { "numPacketsRx" => 42, "noiseFloor" => -95 },
+      )
+      expect(row["telemetry_type"]).to eq("local_stats")
+      expect(row["num_packets_rx"]).to eq(42)
+      expect(row["noise_floor"]).to eq(-95)
+    end
+
+    it "stores host metrics including the user string" do
+      row = stored_row(
+        "id" => 91_005,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "host_metrics" => { "freememBytes" => 1_048_576, "load1" => 35, "userString" => "potato" },
+      )
+      expect(row["telemetry_type"]).to eq("host")
+      expect(row["freemem_bytes"]).to eq(1_048_576)
+      expect(row["load1"]).to eq(35)
+      expect(row["user_string"]).to eq("potato")
+    end
+
+    it "stores one_wire_temperature as a JSON array" do
+      row = stored_row(
+        "id" => 91_006,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "environment_metrics" => { "temperature" => 21.5, "oneWireTemperature" => [20.0, 21.25] },
+      )
+      expect(row["telemetry_type"]).to eq("environment")
+      expect(row["temperature"]).to eq(21.5)
+      expect(JSON.parse(row["one_wire_temperature"])).to eq([20.0, 21.25])
+    end
+
+    it "never leaks a flat ambient temperature into health_temperature" do
+      # The exact shape the Python ingestor posts for every EnvironmentMetrics
+      # packet (flat snake_case keys): ambient temperature must stay out of
+      # the body-temperature column even though their camelCase twins collide.
+      row = stored_row(
+        "id" => 91_009,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "temperature" => 21.5,
+        "relative_humidity" => 40.2,
+        "telemetry_type" => "environment",
+      )
+      expect(row["temperature"]).to eq(21.5)
+      expect(row["health_temperature"]).to be_nil
+    end
+
+    it "still reads body temperature from the nested health_metrics object" do
+      row = stored_row(
+        "id" => 91_010,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "health_metrics" => { "temperature" => 36.6 },
+      )
+      expect(row["health_temperature"]).to eq(36.6)
+      expect(row["temperature"]).to be_nil
+    end
+
+    it "infers the local_stats type from the sub-object when no type is sent" do
+      row = stored_row(
+        "id" => 91_008,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "local_stats" => { "numPacketsTx" => 10 },
+      )
+      expect(row["telemetry_type"]).to eq("local_stats")
+      expect(row["num_packets_tx"]).to eq(10)
+    end
+
+    it "stores the traffic management counters" do
+      row = stored_row(
+        "id" => 91_007,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "traffic_management_stats" => { "packetsInspected" => 100, "rateLimitDrops" => 3 },
+      )
+      expect(row["telemetry_type"]).to eq("traffic")
+      expect(row["packets_inspected"]).to eq(100)
+      expect(row["rate_limit_drops"]).to eq(3)
+    end
+
+    it "round-trips every extended metric column from flat snake_case keys" do
+      # Data-driven over the full definition list: one synthetic value per
+      # column, typed to its coercion strategy, exactly as the Python ingestor
+      # posts them (flat snake_case). Guards every INSERT/upsert list entry.
+      defs = PotatoMesh::App::DataProcessing::EXTENDED_TELEMETRY_METRIC_DEFINITIONS
+      payload = { "id" => 91_100, "node_id" => "!11223344", "rx_time" => now }
+      expected = {}
+      defs.each_with_index do |(column, type, _key_map), index|
+        value = case type
+          when :float then 1.5 + index
+          when :integer then 100 + index
+          when :string then "value-#{index}"
+          when :float_array then [1.0 + index, 2.0 + index]
+          end
+        payload[column] = value
+        expected[column] = type == :float_array ? JSON.generate(value) : value
+      end
+      row = stored_row(payload)
+      expected.each do |column, value|
+        expect(row[column]).to eq(value), "column #{column} did not round-trip"
+      end
+    end
+
+    it "keeps stored extended values when an upsert carries NULL for them" do
+      db = open_db
+      dp.insert_telemetry(
+        db,
+        {
+          "id" => 91_200, "node_id" => "!11223344", "rx_time" => now,
+          "power_metrics" => { "ch1Voltage" => 3.94 },
+        },
+      )
+      dp.insert_telemetry(
+        db,
+        {
+          "id" => 91_200, "node_id" => "!11223344", "rx_time" => now + 1,
+          "device_metrics" => { "batteryLevel" => 80 },
+        },
+      )
+      row = db.execute("SELECT ch1_voltage, battery_level FROM telemetry WHERE id = 91200").first
+      db.close
+      expect(row["ch1_voltage"]).to eq(3.94)
+      expect(row["battery_level"]).to eq(80.0)
+    end
+
+    it "treats blank user strings and junk one-wire lists as absent" do
+      row = stored_row(
+        "id" => 91_300,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "host_metrics" => { "userString" => "   ", "load1" => 12 },
+        "environment_metrics" => { "oneWireTemperature" => ["junk"] },
+      )
+      expect(row["user_string"]).to be_nil
+      expect(row["one_wire_temperature"]).to be_nil
+      expect(row["load1"]).to eq(12)
+    end
+
+    it "filters junk entries out of a mixed one-wire list" do
+      row = stored_row(
+        "id" => 91_301,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "environment_metrics" => { "oneWireTemperature" => ["junk", 20.0, nil, 21.25] },
+      )
+      expect(JSON.parse(row["one_wire_temperature"])).to eq([20.0, 21.25])
+    end
+
+    it "ignores a non-array one_wire_temperature value" do
+      row = stored_row(
+        "id" => 91_302,
+        "node_id" => "!11223344",
+        "rx_time" => now,
+        "environment_metrics" => { "temperature" => 21.5, "oneWireTemperature" => "20.0" },
+      )
+      expect(row["one_wire_temperature"]).to be_nil
+      expect(row["temperature"]).to eq(21.5)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # upsert_node — Bug 1: lastHeard = 0 must not be stored as 0
   # ---------------------------------------------------------------------------
   describe "#upsert_node — last_heard zero handling" do
@@ -745,6 +969,129 @@ RSpec.describe PotatoMesh::App::DataProcessing do
   end
 
   # ---------------------------------------------------------------------------
+  # upsert_node — MeshCore ghost nodes: a bare-advert placeholder row (stamped
+  # with the receiver's wall clock) must not starve the follow-up roster
+  # contact record, whose lastHeard is the sender-stamped last_advert and is
+  # therefore always older (seconds for healthy clocks, years for broken
+  # ones). The freshness guard may skip the stale record's timestamps, but
+  # its identity fields (name, role, public key, …) must still fill columns
+  # that are NULL, or the node stays a permanently nameless "ghost".
+  # ---------------------------------------------------------------------------
+  describe "#upsert_node — stale contact record enrichment (ghost nodes)" do
+    include_context "with isolated db"
+
+    let(:pub_key) { "60e53d9b#{"ab" * 28}" }
+
+    # Mirror the ingestor's bare-advert placeholder (_advert_to_node_dict +
+    # radio metadata): wall-clock lastHeard, shortName/publicKey, no name/role.
+    def upsert_advert_placeholder(db, heard_at)
+      dp.upsert_node(db, "!60e53d9b", {
+        "lastHeard" => heard_at,
+        "lora_freq" => 869,
+        "modem_preset" => "SF8/BW62/CR8",
+        "user" => { "shortName" => "60e5", "publicKey" => pub_key },
+      }, protocol: "meshcore")
+    end
+
+    # Mirror the follow-up roster contact (_contact_to_node_dict): the full
+    # record named from the advert, stamped with the sender-side last_advert.
+    def upsert_contact_record(db, last_advert, long_name: "Alpha Repeater")
+      dp.upsert_node(db, "!60e53d9b", {
+        "lastHeard" => last_advert,
+        "lora_freq" => 869,
+        "modem_preset" => "SF8/BW62/CR8",
+        "user" => {
+          "longName" => long_name,
+          "shortName" => "60e5",
+          "publicKey" => pub_key,
+          "role" => "REPEATER",
+        },
+      }, protocol: "meshcore")
+    end
+
+    def node_row(db)
+      db.execute("SELECT * FROM nodes WHERE node_id = '!60e53d9b'").first
+    end
+
+    it "fills name and role from a contact record stamped seconds older (healthy clock)" do
+      db = open_db
+      upsert_advert_placeholder(db, now)
+      upsert_contact_record(db, now - 17)
+      row = node_row(db)
+      db.close
+      expect(row["long_name"]).to eq("Alpha Repeater")
+      expect(row["role"]).to eq("REPEATER")
+      expect(row["public_key"]).to eq(pub_key)
+    end
+
+    it "fills name and role from a contact record stamped years older (broken node clock)" do
+      db = open_db
+      upsert_advert_placeholder(db, now)
+      upsert_contact_record(db, now - 66_988_974)
+      row = node_row(db)
+      db.close
+      expect(row["long_name"]).to eq("Alpha Repeater")
+      expect(row["role"]).to eq("REPEATER")
+    end
+
+    it "keeps the newer last_heard when a stale contact record enriches the row" do
+      db = open_db
+      upsert_advert_placeholder(db, now)
+      upsert_contact_record(db, now - 17)
+      row = node_row(db)
+      db.close
+      expect(row["last_heard"]).to eq(now)
+    end
+
+    it "does not overwrite an existing name or role with stale data" do
+      db = open_db
+      upsert_contact_record(db, now, long_name: "Fresh Name")
+      dp.upsert_node(db, "!60e53d9b", {
+        "lastHeard" => now - 3600,
+        "user" => { "longName" => "Old Name", "shortName" => "OLD", "role" => "COMPANION" },
+      }, protocol: "meshcore")
+      row = node_row(db)
+      db.close
+      expect(row["long_name"]).to eq("Fresh Name")
+      expect(row["role"]).to eq("REPEATER")
+    end
+
+    it "does not fill a missing name with a stale empty adv_name" do
+      db = open_db
+      upsert_advert_placeholder(db, now)
+      upsert_contact_record(db, now - 17, long_name: "")
+      row = node_row(db)
+      db.close
+      expect(row["long_name"]).to be_nil
+    end
+
+    it "does not fill a missing short_name with a stale empty shortName" do
+      db = open_db
+      dp.upsert_node(db, "!60e53d9b", { "lastHeard" => now }, protocol: "meshcore")
+      dp.upsert_node(db, "!60e53d9b", {
+        "lastHeard" => now - 17,
+        "user" => { "shortName" => "", "longName" => "Alpha Repeater" },
+      }, protocol: "meshcore")
+      row = node_row(db)
+      db.close
+      expect(row["short_name"]).to be_nil
+      expect(row["long_name"]).to eq("Alpha Repeater")
+    end
+
+    it "still ignores stale synthetic placeholders for real rows" do
+      db = open_db
+      upsert_advert_placeholder(db, now)
+      dp.upsert_node(db, "!60e53d9b", {
+        "lastHeard" => now - 17,
+        "user" => { "longName" => "Chat Alias", "synthetic" => true },
+      }, protocol: "meshcore")
+      row = node_row(db)
+      db.close
+      expect(row["long_name"]).to be_nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # upsert_node — synthetic flag + merge
   # ---------------------------------------------------------------------------
   describe "#upsert_node — synthetic node handling", :db do
@@ -1035,6 +1382,62 @@ RSpec.describe PotatoMesh::App::DataProcessing do
   end
 
   # ---------------------------------------------------------------------------
+  # upsert_node — keyed-evidence tracking (MeshCore duplicate reconciliation,
+  # SPEC MR1): last_advert_heard records the newest key-authenticated record
+  # time so the merge guards can tell a live same-name real node from a stale
+  # one that only message touches keep refreshing.
+  # ---------------------------------------------------------------------------
+  describe "#upsert_node — keyed-evidence tracking" do
+    include_context "with isolated db"
+
+    let(:now) { Time.now.to_i }
+
+    it "records and advances last_advert_heard for keyed non-synthetic upserts" do
+      db = open_db
+      dp.upsert_node(db, "!evid0001", {
+        "lastHeard" => now - 500,
+        "protocol" => "meshcore",
+        "user" => { "longName" => "Evie", "shortName" => "ev", "publicKey" => "ff" * 32 },
+      }, protocol: "meshcore")
+      expect(db.get_first_value("SELECT last_advert_heard FROM nodes WHERE node_id = '!evid0001'")).to eq(now - 500)
+
+      dp.upsert_node(db, "!evid0001", {
+        "lastHeard" => now - 100,
+        "protocol" => "meshcore",
+        "user" => { "longName" => "Evie", "shortName" => "ev", "publicKey" => "ff" * 32 },
+      }, protocol: "meshcore")
+      expect(db.get_first_value("SELECT last_advert_heard FROM nodes WHERE node_id = '!evid0001'")).to eq(now - 100)
+    ensure
+      db&.close
+    end
+
+    it "does not advance keyed evidence from message touches or synthetic upserts" do
+      db = open_db
+      dp.upsert_node(db, "!evid0002", {
+        "lastHeard" => now - 500,
+        "protocol" => "meshcore",
+        "user" => { "longName" => "Evan", "shortName" => "ev", "publicKey" => "ee" * 32 },
+      }, protocol: "meshcore")
+
+      # A message touch advances last_heard but is name-inferred, not
+      # key-authenticated — the evidence column must not move.
+      dp.touch_node_last_seen(db, "!evid0002", rx_time: now)
+      expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = '!evid0002'")).to eq(now)
+      expect(db.get_first_value("SELECT last_advert_heard FROM nodes WHERE node_id = '!evid0002'")).to eq(now - 500)
+
+      # A synthetic placeholder upsert carries no key: no evidence either.
+      dp.upsert_node(db, "!evid0003", {
+        "lastHeard" => now,
+        "protocol" => "meshcore",
+        "user" => { "longName" => "Evan Synth", "shortName" => "", "role" => "COMPANION", "synthetic" => true },
+      }, protocol: "meshcore")
+      expect(db.get_first_value("SELECT last_advert_heard FROM nodes WHERE node_id = '!evid0003'")).to be_nil
+    ensure
+      db&.close
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # merge_synthetic_nodes
   # ---------------------------------------------------------------------------
   describe "#merge_synthetic_nodes" do
@@ -1095,6 +1498,146 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       )
       dp.merge_synthetic_nodes(db, real_id, "Rupert")
       expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [real_id])).to eq(now)
+    ensure
+      db&.close
+    end
+
+    # MeshCore duplicate reconciliation (SPEC MR2): a same-name real row whose
+    # keyed evidence is stale — e.g. a retired keypair that only name-inferred
+    # message touches keep "alive" — must not deadlock the synthetic merge.
+    it "absorbs the synthetic despite a same-name real row with stale keyed evidence" do
+      db = open_db
+      stale_real = "!25ee3330"
+      fresh_real = "!ae46e493"
+      synth_id = "!f0b61f1e"
+      name = "Afri @l5yth \u{1F336}"
+
+      # Retired identity: keyed upsert long ago, then last_heard polluted to
+      # "now" by a name-resolved message copy (the production failure mode).
+      dp.upsert_node(db, stale_real, {
+        "lastHeard" => now - 60 * 86_400,
+        "protocol" => "meshcore",
+        "user" => { "longName" => name, "shortName" => "25ee", "role" => "COMPANION", "publicKey" => "25ee3330" + "00" * 28 },
+      }, protocol: "meshcore")
+      dp.touch_node_last_seen(db, stale_real, rx_time: now, source: :message)
+
+      dp.upsert_node(db, fresh_real, {
+        "lastHeard" => now - 60,
+        "protocol" => "meshcore",
+        "user" => { "longName" => name, "shortName" => "ae46", "role" => "COMPANION", "publicKey" => "ae46e493" + "00" * 28 },
+      }, protocol: "meshcore")
+
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, name, "meshcore", 1, now, now],
+      )
+      db.execute(
+        "INSERT INTO messages(id,rx_time,rx_iso,from_id,to_id,protocol) VALUES (?,?,?,?,?,?)",
+        [91, now, "2026-07-21T19:55:26Z", synth_id, "^all", "meshcore"],
+      )
+
+      dp.merge_synthetic_nodes(db, fresh_real, name)
+
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
+      expect(db.execute("SELECT from_id FROM messages WHERE id = 91").first[0]).to eq(fresh_real)
+      # The stale real row itself is left alone: retention stays the only
+      # data-expiry authority.
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [stale_real]).first).not_to be_nil
+    ensure
+      db&.close
+    end
+
+    # The production shape (potatomesh.net): the retired row predates the
+    # evidence column, so its only positive staleness signal is the
+    # position_time left by its last real advert.  A MeshCore position is only
+    # ever written from a key-authenticated record, so it is valid historical
+    # evidence — and it is what distinguishes a retired identity from a node we
+    # simply know nothing about yet.
+    it "treats an old position_time as positive staleness for a legacy row" do
+      db = open_db
+      retired = "!25ee3330"
+      live = "!ae46e493"
+      synth_id = "!f0b61f1e"
+      name = "Afri @l5yth \u{1F336}"
+
+      # Legacy row: no last_advert_heard at all, last real fix long ago, and a
+      # last_heard polluted to "now" by name-resolved message touches.
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard,public_key,position_time) " \
+        "VALUES (?,?,?,?,?,?,?,?)",
+        [retired, name, "meshcore", 0, now, now - 90 * 86_400, "25ee3330" + "00" * 28, now - 90 * 86_400],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, name, "meshcore", 1, now, now],
+      )
+      db.execute(
+        "INSERT INTO messages(id,rx_time,rx_iso,from_id,to_id,protocol) VALUES (?,?,?,?,?,?)",
+        [93, now, "2026-07-21T20:18:07Z", synth_id, "^all", "meshcore"],
+      )
+
+      # The live device adverts: its own upsert stamps fresh keyed evidence and
+      # fires the forward merge.
+      dp.upsert_node(db, live, {
+        "lastHeard" => now - 30,
+        "protocol" => "meshcore",
+        "user" => { "longName" => name, "shortName" => "ae46", "role" => "COMPANION", "publicKey" => "ae46e493" + "00" * 28 },
+      }, protocol: "meshcore")
+
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
+      expect(db.execute("SELECT from_id FROM messages WHERE id = 93").first[0]).to eq(live)
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [retired]).first).not_to be_nil
+    ensure
+      db&.close
+    end
+
+    # Absence of evidence is not evidence of absence (SPEC MR2): a rival we know
+    # nothing about — no keyed evidence and no position history, the state of
+    # every row right after the migration — must keep blocking, or the very
+    # first upsert after a deploy could mis-attribute a placeholder.
+    it "keeps refusing when the rival has no evidence either way" do
+      db = open_db
+      unknown_rival = "!unknwn01"
+      claimant = "!claimnt1"
+      synth_id = "!synthunk"
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard,public_key) VALUES (?,?,?,?,?,?,?)",
+        [unknown_rival, "Unproven", "meshcore", 0, now - 200, now - 200, "ab" * 32],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Unproven", "meshcore", 1, now, now],
+      )
+
+      dp.merge_synthetic_nodes(db, claimant, "Unproven")
+
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).not_to be_nil
+    ensure
+      db&.close
+    end
+
+    # Guard retention (SPEC MR2): with two evidence-fresh same-name reals the
+    # ambiguity is genuine and the merge must still refuse.
+    it "still refuses when a second same-name real row has fresh keyed evidence" do
+      db = open_db
+      real_a = "!fresh00a"
+      real_b = "!fresh00b"
+      synth_id = "!synthfr1"
+      %w[aa bb].zip([real_a, real_b]).each do |key_byte, node_id|
+        dp.upsert_node(db, node_id, {
+          "lastHeard" => now - 30,
+          "protocol" => "meshcore",
+          "user" => { "longName" => "Twin", "shortName" => key_byte, "role" => "COMPANION", "publicKey" => key_byte * 32 },
+        }, protocol: "meshcore")
+      end
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Twin", "meshcore", 1, now, now],
+      )
+
+      dp.merge_synthetic_nodes(db, real_a, "Twin")
+
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).not_to be_nil
     ensure
       db&.close
     end
@@ -1231,6 +1774,195 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       )
       dp.merge_into_real_node(db, synth_id, "Quinn")
       expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [real_id])).to eq(now)
+    ensure
+      db&.close
+    end
+
+    # MeshCore duplicate reconciliation (SPEC MR2): when two same-name reals
+    # exist but only one has fresh keyed evidence, the synthetic folds into
+    # the evidence-fresh one instead of deadlocking.
+    it "folds into the evidence-fresh real when the other candidate is stale" do
+      db = open_db
+      stale_real = "!stalerl1"
+      fresh_real = "!freshrl1"
+      synth_id = "!synthrl1"
+
+      dp.upsert_node(db, stale_real, {
+        "lastHeard" => now - 60 * 86_400,
+        "protocol" => "meshcore",
+        "user" => { "longName" => "Ronda", "shortName" => "st", "role" => "COMPANION", "publicKey" => "cc" * 32 },
+      }, protocol: "meshcore")
+      dp.touch_node_last_seen(db, stale_real, rx_time: now, source: :message)
+      dp.upsert_node(db, fresh_real, {
+        "lastHeard" => now - 30,
+        "protocol" => "meshcore",
+        "user" => { "longName" => "Ronda", "shortName" => "fr", "role" => "COMPANION", "publicKey" => "dd" * 32 },
+      }, protocol: "meshcore")
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Ronda", "meshcore", 1, now, now],
+      )
+      db.execute(
+        "INSERT INTO messages(id,rx_time,rx_iso,from_id,to_id,protocol) VALUES (?,?,?,?,?,?)",
+        [92, now, "2026-07-21T20:18:07Z", synth_id, "^all", "meshcore"],
+      )
+
+      dp.merge_into_real_node(db, synth_id, "Ronda")
+
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
+      expect(db.execute("SELECT from_id FROM messages WHERE id = 92").first[0]).to eq(fresh_real)
+    ensure
+      db&.close
+    end
+
+    # Guard retention (SPEC MR2): both candidates evidence-fresh -> genuine
+    # ambiguity, the reverse merge still refuses.
+    it "still refuses when both same-name real candidates have fresh keyed evidence" do
+      db = open_db
+      synth_id = "!synthrl2"
+      %w[a1 b2].each_with_index do |key_byte, i|
+        dp.upsert_node(db, "!freshr#{i}x", {
+          "lastHeard" => now - 30,
+          "protocol" => "meshcore",
+          "user" => { "longName" => "Rivals", "shortName" => key_byte, "role" => "COMPANION", "publicKey" => key_byte * 32 },
+        }, protocol: "meshcore")
+      end
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Rivals", "meshcore", 1, now, now],
+      )
+
+      dp.merge_into_real_node(db, synth_id, "Rivals")
+
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).not_to be_nil
+    ensure
+      db&.close
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # insert_message — meshcore duplicate-copy sender resolution (SPEC MR3).
+  #
+  # Co-operating ingestors post the same channel message with divergent
+  # from_id values (each roster resolves the sender name independently: the
+  # real key, a retired key, or a name-derived synthetic).  The losing copy
+  # must neither steal the attribution (last-writer-wins) nor feed liveness
+  # to its own node.  Message texts here carry no "Name:" prefix so the
+  # sender-placeholder machinery stays out of the way and the resolution rule
+  # is observed in isolation.
+  # ---------------------------------------------------------------------------
+  describe "#insert_message — meshcore duplicate-copy sender resolution" do
+    include_context "with isolated db"
+
+    let(:now) { Time.now.to_i }
+
+    # Seed a keyed (synthetic=0) meshcore node whose evidence age is
+    # controlled by +heard+.
+    def seed_keyed_node(db, node_id, name, key_byte, heard)
+      dp.upsert_node(db, node_id, {
+        "lastHeard" => heard,
+        "protocol" => "meshcore",
+        "user" => { "longName" => name, "shortName" => key_byte, "role" => "COMPANION", "publicKey" => key_byte * 32 },
+      }, protocol: "meshcore")
+    end
+
+    def duplicate_copy(from_id, rx_time)
+      {
+        "id" => 7001,
+        "rx_time" => rx_time,
+        "from_id" => from_id,
+        "to_id" => "^all",
+        "channel" => 3,
+        "text" => "copy without a sender prefix",
+        "portnum" => "TEXT_MESSAGE_APP",
+        "protocol" => "meshcore",
+        "ingestor" => "!634069bc",
+      }
+    end
+
+    it "keeps the existing attribution when two evidence-fresh reals disagree" do
+      db = open_db
+      seed_keyed_node(db, "!duporig1", "Dup Twin A", "1a", now - 40)
+      seed_keyed_node(db, "!dupothr1", "Dup Twin B", "2b", now - 40)
+
+      dp.insert_message(db, duplicate_copy("!duporig1", now - 10))
+      dp.insert_message(db, duplicate_copy("!dupothr1", now))
+
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 7001")).to eq("!duporig1")
+    ensure
+      db&.close
+    end
+
+    it "does not let a stale-keyed copy steal attribution or liveness from a fresh real" do
+      db = open_db
+      stale_real = "!dupstal2"
+      fresh_real = "!dupfrsh2"
+      seed_keyed_node(db, stale_real, "Dup Old", "3c", now - 60 * 86_400)
+      seed_keyed_node(db, fresh_real, "Dup New", "4d", now - 40)
+
+      dp.insert_message(db, duplicate_copy(fresh_real, now - 10))
+      dp.insert_message(db, duplicate_copy(stale_real, now))
+
+      # Attribution stays on the evidence-fresh identity...
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 7001")).to eq(fresh_real)
+      # ...the losing copy's node gains no liveness (it must age out)...
+      expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [stale_real])).to eq(now - 60 * 86_400)
+      # ...and the surviving sender is the one credited with the reception.
+      expect(db.get_first_value("SELECT last_heard FROM nodes WHERE node_id = ?", [fresh_real])).to eq(now)
+    ensure
+      db&.close
+    end
+
+    it "upgrades a synthetic-attributed row when a keyed real copy arrives" do
+      db = open_db
+      synth_id = "!dupsyn3a"
+      real_id = "!dupreal3"
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Dup Up", "meshcore", 1, now - 50, now - 50],
+      )
+      seed_keyed_node(db, real_id, "Dup Up", "5e", now - 40)
+
+      dp.insert_message(db, duplicate_copy(synth_id, now - 10))
+      dp.insert_message(db, duplicate_copy(real_id, now))
+
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 7001")).to eq(real_id)
+    ensure
+      db&.close
+    end
+
+    # The rank-based resolution is MeshCore-specific: a firmware-assigned
+    # Meshtastic sender keeps the historical last-writer-wins overwrite, so the
+    # rule never changes attribution for the other protocol.
+    it "ranks a nil, blank, or unknown sender id as zero and never supersedes on it" do
+      db = open_db
+      expect(dp.meshcore_sender_rank(db, nil)).to eq(0)
+      expect(dp.meshcore_sender_rank(db, "   ")).to eq(0)
+      expect(dp.meshcore_sender_rank(db, "!deadbeef")).to eq(0)
+      # A rank-0 incoming id can never exceed a rank-0 (nil) incumbent.
+      expect(dp.meshcore_sender_supersedes?(db, nil, "!deadbeef")).to be(false)
+    ensure
+      db&.close
+    end
+
+    it "keeps last-writer-wins for a meshtastic message with a differing sender" do
+      db = open_db
+      first_sender = "!aaaa1111"
+      second_sender = "!bbbb2222"
+      base = {
+        "id" => 7101,
+        "rx_time" => now,
+        "to_id" => "!dddd4444",
+        "channel" => 0,
+        "text" => "meshtastic copy",
+        "portnum" => "TEXT_MESSAGE_APP",
+        "protocol" => "meshtastic",
+        "ingestor" => "!634069bc",
+      }
+      dp.insert_message(db, base.merge("from_id" => first_sender))
+      dp.insert_message(db, base.merge("from_id" => second_sender))
+
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 7101")).to eq(second_sender)
     ensure
       db&.close
     end
@@ -2101,6 +2833,86 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       expect(db.get_first_value("SELECT text FROM messages WHERE id = 9002")).to eq("decrypted")
       expect(db.get_first_value("SELECT lora_freq FROM messages WHERE id = 9002")).to eq(869525)
       expect(db.get_first_value("SELECT modem_preset FROM messages WHERE id = 9002")).to eq("MEDIUM_SLOW")
+    ensure
+      db&.close
+    end
+
+    # SPEC MR3 names the insert-race fallback as "precisely where two ingestors'
+    # copies meet", so the sender-resolution rule must hold on this path too, in
+    # both DB result modes.  Force the fallback the same way as above: seed the
+    # row, then stub the existing-row SELECT to nil so the INSERT trips the PK.
+    def stub_missing_existing_row(db)
+      allow(db).to receive(:get_first_row).and_wrap_original do |original, sql, *args|
+        if sql.include?("SELECT from_id, to_id, text, encrypted, lora_freq")
+          nil
+        else
+          original.call(sql, *args)
+        end
+      end
+    end
+
+    # Two hex node ids so canonical normalisation keeps them verbatim; a synth
+    # (rank 0) and a key-backed real (rank 2) so the copies disagree by evidence.
+    let(:synth_sender) { "!5a5a5a5a" }
+    let(:real_sender) { "!ee11ee11" }
+
+    def seed_rank_nodes(db)
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_sender, "Synth Placeholder", "meshcore", 1, now, now],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard,public_key,last_advert_heard) " \
+        "VALUES (?,?,?,?,?,?,?,?)",
+        [real_sender, "Real Contact", "meshcore", 0, now, now, "ee" * 32, now],
+      )
+    end
+
+    def meshcore_copy(id, from_id)
+      { "id" => id, "to_id" => "^all", "channel" => 3, "text" => "shared", "protocol" => "meshcore", "from_id" => from_id }
+    end
+
+    it "promotes the better-evidenced meshcore sender on the constraint fallback" do
+      db = open_db
+      seed_rank_nodes(db)
+      fb_harness.insert_message(db, meshcore_copy(9201, synth_sender))
+      stub_missing_existing_row(db)
+
+      fb_harness.insert_message(db, meshcore_copy(9201, real_sender))
+
+      # Incoming real (rank 2) supersedes the stored synthetic (rank 0).
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 9201")).to eq(real_sender)
+    ensure
+      db&.close
+    end
+
+    it "keeps the incumbent meshcore sender when the fallback copy is weaker (array-row DB)" do
+      # Raw handle → results_as_hash = false, so the fallback reads the row by
+      # positional index: exercises the non-Hash arm of the existing-row reads.
+      db = SQLite3::Database.new(PotatoMesh::Config.db_path)
+      seed_rank_nodes(db)
+      fb_harness.insert_message(db, meshcore_copy(9202, real_sender))
+      stub_missing_existing_row(db)
+
+      fb_harness.insert_message(db, meshcore_copy(9202, synth_sender))
+
+      # Incoming synthetic (rank 0) does NOT displace the stored real (rank 2).
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 9202")).to eq(real_sender)
+    ensure
+      db&.close
+    end
+
+    it "skips fallback from_id handling when the racing copy carries no sender" do
+      db = open_db
+      fb_harness.insert_message(db, meshcore_copy(9203, real_sender))
+      stub_missing_existing_row(db)
+
+      fb_harness.insert_message(db, { "id" => 9203, "to_id" => "^all", "channel" => 3, "text" => "senderless", "protocol" => "meshcore" })
+
+      # No incoming sender → the stored attribution is untouched, and the text
+      # still reconciles through the fallback.
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 9203")).to eq(real_sender)
+      expect(db.get_first_value("SELECT text FROM messages WHERE id = 9203")).to eq("senderless")
     ensure
       db&.close
     end

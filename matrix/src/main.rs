@@ -25,7 +25,7 @@ use anyhow::Result;
 #[cfg(not(test))]
 use clap::Parser;
 use tokio::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[cfg(not(test))]
 use crate::cli::Cli;
@@ -36,6 +36,14 @@ use crate::matrix_server::run_synapse_listener;
 use crate::potatomesh::{FetchParams, PotatoClient, PotatoMessage, PotatoNode};
 #[cfg(not(test))]
 use tokio::time::sleep;
+
+/// Consecutive poll attempts a single message may fail before it is skipped
+/// (advanced past, with a warning) so it cannot block every message queued
+/// behind it forever. Transient failures (a brief homeserver/API hiccup)
+/// recover well within this bound; a message still failing after this many
+/// polls is treated as poison and dropped — a far better outcome than silently
+/// losing everything queued behind it.
+const MAX_FORWARD_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
 pub struct BridgeState {
@@ -50,6 +58,14 @@ pub struct BridgeState {
     /// Legacy checkpoint timestamp used before last_rx_time was added.
     #[serde(default, skip_serializing)]
     last_checked_at: Option<u64>,
+    /// Id of the message currently blocking the batch, and how many consecutive
+    /// polls it has failed to forward. In-memory only (never persisted — a
+    /// restart is itself a fresh attempt); used to skip a poison message after
+    /// [`MAX_FORWARD_ATTEMPTS`] instead of retrying it forever.
+    #[serde(skip)]
+    failing_msg_id: Option<u64>,
+    #[serde(skip)]
+    failing_msg_attempts: u32,
 }
 
 impl BridgeState {
@@ -178,9 +194,60 @@ async fn poll_once(
                     }
                 }
 
+                // Contract-conformant rows may arrive with conditional fields
+                // compacted away entirely (ACCEPTANCE MB-A1). A row without
+                // text (e.g. an emoji reaction) or without a resolved sender
+                // can never be forwarded — treat it like a non-text port:
+                // advance the watermark and move on rather than retrying it.
+                if !is_forwardable(msg) {
+                    state.update_with(msg);
+                    log_state_update(state);
+                    persist_state(state, state_path);
+                    continue;
+                }
+
                 if let Err(e) = handle_message(potato, matrix, state, msg).await {
                     error!("Error handling message {}: {:?}", msg.id, e);
-                    continue;
+                    // Track consecutive failures of THIS specific message across
+                    // polls (the batch is refetched each poll while the
+                    // watermark is stuck, so the same id reappears at the head).
+                    if state.failing_msg_id == Some(msg.id) {
+                        state.failing_msg_attempts += 1;
+                    } else {
+                        state.failing_msg_id = Some(msg.id);
+                        state.failing_msg_attempts = 1;
+                    }
+
+                    if state.failing_msg_attempts >= MAX_FORWARD_ATTEMPTS {
+                        // Poison message: it has failed too many polls in a row,
+                        // so skip it rather than block the whole batch behind it
+                        // indefinitely. Advance the watermark past it (as if
+                        // processed) and continue with the rest. Dropping this
+                        // one message is the lesser evil versus stalling forever.
+                        warn!(
+                            "Skipping message {} after {} failed forward attempts; advancing past it",
+                            msg.id, state.failing_msg_attempts
+                        );
+                        state.failing_msg_id = None;
+                        state.failing_msg_attempts = 0;
+                        state.update_with(msg);
+                        persist_state(state, state_path);
+                        continue;
+                    }
+
+                    // Below the skip threshold: stop the batch here. The failed
+                    // message and everything after it stay uncommitted and are
+                    // retried, in order, on the next poll — so a *transient*
+                    // failure never loses, reorders, or duplicates anything. (The
+                    // watermark advances only on success, so a later success can
+                    // never jump past this failure — the silent-loss bug.)
+                    break;
+                }
+
+                // Success clears any failure tracking for this message.
+                if state.failing_msg_id == Some(msg.id) {
+                    state.failing_msg_id = None;
+                    state.failing_msg_attempts = 0;
                 }
 
                 // persist after each processed message
@@ -217,7 +284,13 @@ async fn main() -> Result<()> {
     let cfg = config::load(cli.to_inputs())?;
     log_config(&cfg);
 
-    let http = reqwest::Client::builder().build()?;
+    // Bound every HTTP request so a hung homeserver or PotatoMesh API cannot
+    // stall the single-threaded poll loop indefinitely. `timeout` caps the
+    // whole request/response; `connect_timeout` caps TCP/TLS establishment.
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()?;
     let potato = PotatoClient::new(http.clone(), cfg.potatomesh.clone());
     potato.health_check().await?;
     let matrix = MatrixAppserviceClient::new(http.clone(), cfg.matrix.clone());
@@ -240,14 +313,35 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Whether `poll_once` can bridge this message at all: it needs a resolved
+/// sender (`node_id`, to puppet the Matrix user) and non-blank text (the
+/// Matrix body). Compacted rows lacking either — emoji reactions, unresolved
+/// senders (ACCEPTANCE MB-A1) — are skipped with the watermark advanced.
+fn is_forwardable(msg: &PotatoMessage) -> bool {
+    let has_text = msg
+        .text
+        .as_deref()
+        .map(|text| !text.trim().is_empty())
+        .unwrap_or(false);
+    has_text && msg.node_id.is_some()
+}
+
 async fn handle_message(
     potato: &PotatoClient,
     matrix: &MatrixAppserviceClient,
     state: &mut BridgeState,
     msg: &PotatoMessage,
 ) -> Result<()> {
-    let node = potato.get_node(&msg.node_id).await?;
-    let localpart = MatrixAppserviceClient::localpart_from_node_id(&msg.node_id);
+    // `poll_once` gates on `is_forwardable`, so a missing sender is
+    // unreachable from the poll loop; the early return keeps the function
+    // total for direct callers.
+    let Some(node_id) = msg.node_id.as_deref() else {
+        return Ok(());
+    };
+    let text = msg.text.as_deref().unwrap_or("");
+
+    let node = potato.get_node(node_id).await?;
+    let localpart = MatrixAppserviceClient::localpart_from_node_id(node_id);
     let user_id = matrix.user_id(&localpart);
 
     // Ensure puppet exists & has display name
@@ -256,25 +350,28 @@ async fn handle_message(
     let display_name = display_name_for_node(&node);
     matrix.set_display_name(&user_id, &display_name).await?;
 
-    // Format the bridged message. `lora_freq` is `u32`, so 0 stands in for
-    // "unknown" — collapse that to `None` to match the JS pipeline (which
-    // runs `normalizeFrequency` and discards 0/non-finite before reaching
-    // the preset lookup).
-    let freq_mhz = if msg.lora_freq > 0 {
-        Some(msg.lora_freq as f64)
+    // Format the bridged message. A compacted-away `lora_freq` renders as the
+    // existing `0` "unknown" sentinel — collapse that to `None` to match the
+    // JS pipeline (which runs `normalizeFrequency` and discards 0/non-finite
+    // before reaching the preset lookup). A missing `modem_preset` falls
+    // through to the `??` slot and a missing `channel_name` renders empty
+    // brackets, mirroring the web frontend's unknown-metadata convention.
+    let lora_freq = msg.lora_freq.unwrap_or(0);
+    let freq_mhz = if lora_freq > 0 {
+        Some(lora_freq as f64)
     } else {
         None
     };
-    let abbr = preset::abbreviate_preset(&msg.modem_preset, freq_mhz);
+    let abbr = preset::abbreviate_preset(msg.modem_preset.as_deref().unwrap_or(""), freq_mhz);
     let preset_short = preset::normalize_preset_slot(abbr.as_deref());
     let tag = protocol_tag(msg.protocol.as_deref());
     let prefix = format!(
         "{tag}[{freq}][{preset_short}][{channel}]",
-        freq = msg.lora_freq,
+        freq = lora_freq,
         preset_short = preset_short,
-        channel = msg.channel_name,
+        channel = msg.channel_name.as_deref().unwrap_or(""),
     );
-    let (body, formatted_body) = format_message_bodies(&prefix, &msg.text);
+    let (body, formatted_body) = format_message_bodies(&prefix, text);
 
     matrix
         .send_formatted_message_as(&user_id, &body, &formatted_body)
@@ -348,19 +445,19 @@ mod tests {
             id,
             rx_time: 0,
             rx_iso: "2025-11-27T00:00:00Z".to_string(),
-            from_id: "!abcd1234".to_string(),
-            to_id: "^all".to_string(),
-            channel: 1,
+            from_id: Some("!abcd1234".to_string()),
+            to_id: Some("^all".to_string()),
+            channel: Some(1),
             portnum: Some("TEXT_MESSAGE_APP".to_string()),
-            text: "Ping".to_string(),
+            text: Some("Ping".to_string()),
             rssi: Some(-100),
             hop_limit: Some(1),
-            lora_freq: 868,
-            modem_preset: "MediumFast".to_string(),
-            channel_name: "TEST".to_string(),
+            lora_freq: Some(868),
+            modem_preset: Some("MediumFast".to_string()),
+            channel_name: Some("TEST".to_string()),
             snr: Some(0.0),
             reply_id: None,
-            node_id: "!abcd1234".to_string(),
+            node_id: Some("!abcd1234".to_string()),
             protocol: Some("meshtastic".to_string()),
         }
     }
@@ -378,6 +475,64 @@ mod tests {
             longitude: None,
             altitude: None,
         }
+    }
+
+    #[test]
+    fn is_forwardable_requires_text_and_node_id() {
+        // Fully populated sample: forwardable.
+        assert!(is_forwardable(&sample_msg(1)));
+        // Compacted-away text (emoji reaction row): not forwardable.
+        assert!(!is_forwardable(&PotatoMessage {
+            text: None,
+            ..sample_msg(1)
+        }));
+        // Blank text is as unforwardable as absent text.
+        assert!(!is_forwardable(&PotatoMessage {
+            text: Some("   ".to_string()),
+            ..sample_msg(1)
+        }));
+        // Unresolved sender (no node_id): not forwardable.
+        assert!(!is_forwardable(&PotatoMessage {
+            node_id: None,
+            ..sample_msg(1)
+        }));
+    }
+
+    /// The `poll_once` gate makes a sender-less message unreachable from the
+    /// poll loop, but `handle_message` stays total: called directly with no
+    /// `node_id` it returns `Ok` without touching any endpoint (no mock
+    /// server is even running here — an HTTP call would error the test).
+    #[tokio::test]
+    async fn handle_message_returns_ok_without_node_id() {
+        let http_client = reqwest::Client::new();
+        let potato_client = PotatoClient::new(
+            http_client.clone(),
+            PotatomeshConfig {
+                base_url: "http://127.0.0.1:9".to_string(),
+                poll_interval_secs: 1,
+            },
+        );
+        let matrix_client = MatrixAppserviceClient::new(
+            http_client,
+            MatrixConfig {
+                homeserver: "http://127.0.0.1:9".to_string(),
+                as_token: "AS_TOKEN".to_string(),
+                hs_token: "HS_TOKEN".to_string(),
+                server_name: "example.org".to_string(),
+                room_id: "!roomid:example.org".to_string(),
+            },
+        );
+        let mut state = BridgeState::default();
+        let msg = PotatoMessage {
+            node_id: None,
+            ..sample_msg(7)
+        };
+
+        let result = handle_message(&potato_client, &matrix_client, &mut state, &msg).await;
+
+        assert!(result.is_ok());
+        // The message was not marked processed — the caller decides that.
+        assert_eq!(state.last_message_id, None);
     }
 
     #[test]
@@ -462,6 +617,7 @@ mod tests {
             last_rx_time: None,
             last_rx_time_ids: vec![],
             last_checked_at: None,
+            ..Default::default()
         };
         let older = sample_msg(9);
         let newer = sample_msg(11);
@@ -506,6 +662,7 @@ mod tests {
             last_rx_time: Some(99),
             last_rx_time_ids: vec![123],
             last_checked_at: Some(77),
+            ..Default::default()
         };
         state.save(path_str).unwrap();
 
@@ -568,6 +725,7 @@ mod tests {
             last_rx_time: Some(123),
             last_rx_time_ids: vec![],
             last_checked_at: None,
+            ..Default::default()
         };
 
         let params = build_fetch_params(&state);
@@ -582,6 +740,7 @@ mod tests {
             last_rx_time: Some(123),
             last_rx_time_ids: vec![],
             last_checked_at: None,
+            ..Default::default()
         };
 
         let params = build_fetch_params(&state);
@@ -596,6 +755,7 @@ mod tests {
             last_rx_time: None,
             last_rx_time_ids: vec![],
             last_checked_at: None,
+            ..Default::default()
         };
 
         let params = build_fetch_params(&state);
@@ -620,6 +780,7 @@ mod tests {
             last_rx_time: Some(123),
             last_rx_time_ids: vec![42],
             last_checked_at: None,
+            ..Default::default()
         };
 
         persist_state(&state, path_str);
@@ -690,6 +851,7 @@ mod tests {
             last_rx_time: Some(100),
             last_rx_time_ids: vec![1],
             last_checked_at: None,
+            ..Default::default()
         };
 
         poll_once(&potato, &matrix, &mut state, state_str).await;
@@ -746,18 +908,626 @@ mod tests {
         assert_eq!(loaded.last_rx_time_ids, vec![1]);
     }
 
+    /// Regression test for the watermark-advance bug: within a single batch,
+    /// an *earlier* message (lower `rx_time`) that fails to forward must not be
+    /// silently skipped forever just because a *later* message would succeed.
+    ///
+    /// The batch is `[A(rx_time=10, fails), B(rx_time=20, would succeed)]`.
+    /// `A` fails because its node lookup returns 500; `B`'s full forward chain
+    /// is mocked to succeed. With the fix, `poll_once` stops at the first
+    /// failure, so the watermark never advances past `A` and `A` stays eligible
+    /// for retry. Under the old code, `B` succeeded and pushed `last_rx_time` to
+    /// 20, permanently stranding `A` — which this test would catch.
+    #[tokio::test]
+    async fn poll_once_does_not_advance_watermark_past_failed_message() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let state_path = tmp_dir.path().join("state.json");
+        let state_str = state_path.to_str().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+
+        // Batch of two TEXT messages; poll_once sorts ascending by rx_time so A
+        // (rx_time=10) is processed before B (rx_time=20) regardless of order.
+        let mock_msgs = server
+            .mock("GET", "/api/messages")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"id":1,"rx_time":10,"rx_iso":"2025-11-27T00:00:00Z","from_id":"!aaaaaaaa","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!aaaaaaaa"},
+                    {"id":2,"rx_time":20,"rx_iso":"2025-11-27T00:00:00Z","from_id":"!bbbbbbbb","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!bbbbbbbb"}
+                ]"#,
+            )
+            .create();
+
+        // Earlier message A fails: its node lookup returns 500.
+        let mock_node_a = server
+            .mock("GET", "/api/nodes/%21aaaaaaaa")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .create();
+
+        // Later message B would fully succeed (node + register + join +
+        // displayname + send). These stay unused under the fix, but make the
+        // test a true regression: under the buggy code B forwards and advances
+        // the watermark to 20.
+        let _mock_node_b = server
+            .mock("GET", "/api/nodes/%21bbbbbbbb")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"!bbbbbbbb","long_name":"Node B","short_name":"NB"}"#)
+            .create();
+        let _mock_register = server
+            .mock("POST", "/_matrix/client/v3/register")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_join = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/join".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_display = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/profile/.+/displayname".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_send = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/send/.+".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+
+        let http_client = reqwest::Client::new();
+        let potatomesh_cfg = PotatomeshConfig {
+            base_url: server.url(),
+            poll_interval_secs: 1,
+        };
+        let matrix_cfg = MatrixConfig {
+            homeserver: server.url(),
+            as_token: "AS_TOKEN".to_string(),
+            hs_token: "HS_TOKEN".to_string(),
+            server_name: "example.org".to_string(),
+            room_id: "!roomid:example.org".to_string(),
+        };
+
+        let potato = PotatoClient::new(http_client.clone(), potatomesh_cfg);
+        let matrix = MatrixAppserviceClient::new(http_client, matrix_cfg);
+        let mut state = BridgeState::default();
+
+        poll_once(&potato, &matrix, &mut state, state_str).await;
+
+        // A's node lookup was attempted and failed.
+        mock_msgs.assert();
+        mock_node_a.assert();
+
+        // The watermark must NOT have advanced past the failed message, so A
+        // remains eligible to be refetched and retried on the next poll.
+        let msg_a = PotatoMessage {
+            id: 1,
+            rx_time: 10,
+            node_id: Some("!aaaaaaaa".to_string()),
+            ..sample_msg(1)
+        };
+        assert_eq!(
+            state.last_rx_time, None,
+            "watermark advanced despite a failed earlier message"
+        );
+        assert_ne!(
+            state.last_rx_time,
+            Some(20),
+            "watermark jumped past the failed message to the later success"
+        );
+        assert!(
+            state.should_forward(&msg_a),
+            "failed message must remain eligible for retry"
+        );
+    }
+
+    /// Regression (live outage 2026-07-26, ACCEPTANCE MB-A1): one
+    /// contract-conformant row missing `channel_name` (the API compacts NULL
+    /// columns away) poisoned the WHOLE fetch — serde failed the entire batch,
+    /// `poll_once` logged "Error fetching PotatoMesh messages: … missing field
+    /// `channel_name`" every poll, and nothing was ever bridged again. The
+    /// batch below is [full row, row without `channel_name`]; both must
+    /// forward, the nameless one rendering empty channel brackets `[]` in the
+    /// prefix (mirroring the web frontend's empty-bracket convention).
+    #[tokio::test]
+    async fn poll_once_bridges_batch_containing_row_without_channel_name() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let state_path = tmp_dir.path().join("state.json");
+        let state_str = state_path.to_str().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+
+        let mock_msgs = server
+            .mock("GET", "/api/messages")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"id":1,"rx_time":10,"rx_iso":"2026-07-26T00:00:00Z","from_id":"!aaaaaaaa","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!aaaaaaaa"},
+                    {"id":2,"rx_time":20,"rx_iso":"2026-07-26T18:30:51Z","from_id":"!88e00b48","to_id":"^all","channel":24,"portnum":"TEXT_MESSAGE_APP","text":"lilygo: moin moin","lora_freq":869,"modem_preset":"SF8/BW62/CR5","snr":-5.25,"ingestor":"!930d4a21","protocol":"meshcore","node_id":"!88e00b48"}
+                ]"#,
+            )
+            .create();
+
+        let mock_node_a = server
+            .mock("GET", "/api/nodes/%21aaaaaaaa")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"!aaaaaaaa","long_name":"Node A","short_name":"NA"}"#)
+            .create();
+        let mock_node_b = server
+            .mock("GET", "/api/nodes/%2188e00b48")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"!88e00b48","long_name":"lilygo","short_name":"LG"}"#)
+            .create();
+        let _mock_register = server
+            .mock("POST", "/_matrix/client/v3/register")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .expect(2)
+            .create();
+        let _mock_join = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/join".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .expect(2)
+            .create();
+        let _mock_display = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/profile/.+/displayname".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .expect(2)
+            .create();
+        // The compacted row must render EMPTY channel brackets — the trailing
+        // `[]` — exactly like the web frontend renders unknown metadata.
+        let mock_send_compacted = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/send/.+".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "body": "`[MC][869][NA][]` lilygo: moin moin",
+            })))
+            .with_status(200)
+            .create();
+        let _mock_send_rest = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/send/.+".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+
+        let http_client = reqwest::Client::new();
+        let potatomesh_cfg = PotatomeshConfig {
+            base_url: server.url(),
+            poll_interval_secs: 1,
+        };
+        let matrix_cfg = MatrixConfig {
+            homeserver: server.url(),
+            as_token: "AS_TOKEN".to_string(),
+            hs_token: "HS_TOKEN".to_string(),
+            server_name: "example.org".to_string(),
+            room_id: "!roomid:example.org".to_string(),
+        };
+
+        let potato = PotatoClient::new(http_client.clone(), potatomesh_cfg);
+        let matrix = MatrixAppserviceClient::new(http_client, matrix_cfg);
+        let mut state = BridgeState::default();
+
+        poll_once(&potato, &matrix, &mut state, state_str).await;
+
+        mock_msgs.assert();
+        mock_node_a.assert();
+        mock_node_b.assert();
+        mock_send_compacted.assert();
+
+        // Both messages forwarded: the watermark reached the compacted row.
+        assert_eq!(
+            state.last_rx_time,
+            Some(20),
+            "batch was poisoned instead of bridging past the compacted row"
+        );
+        assert_eq!(state.last_message_id, Some(2));
+        assert_eq!(state.last_rx_time_ids, vec![2]);
+    }
+
+    /// Companion to the compacted-row regression (ACCEPTANCE MB-A1): rows the
+    /// bridge cannot forward at all — no `text` (e.g. an emoji reaction) or no
+    /// resolvable sender (`node_id` absent) — must be SKIPPED with the
+    /// watermark advanced, like non-text ports, instead of poisoning the batch
+    /// or being retried forever. Batch: [textless reaction, senderless text,
+    /// normal text]; only the normal row reaches Matrix.
+    #[tokio::test]
+    async fn poll_once_advances_watermark_past_unforwardable_rows() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let state_path = tmp_dir.path().join("state.json");
+        let state_str = state_path.to_str().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+
+        let mock_msgs = server
+            .mock("GET", "/api/messages")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"id":1,"rx_time":10,"rx_iso":"2026-07-26T00:00:00Z","from_id":"!aaaaaaaa","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","reply_id":99,"emoji":"1","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!aaaaaaaa"},
+                    {"id":2,"rx_time":20,"rx_iso":"2026-07-26T00:00:01Z","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"anonymous","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST"},
+                    {"id":3,"rx_time":30,"rx_iso":"2026-07-26T00:00:02Z","from_id":"!cccccccc","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!cccccccc"}
+                ]"#,
+            )
+            .create();
+
+        // Only the normal row may touch the node API / Matrix at all.
+        let mock_node_c = server
+            .mock("GET", "/api/nodes/%21cccccccc")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"!cccccccc","long_name":"Node C","short_name":"NC"}"#)
+            .create();
+        let _mock_register = server
+            .mock("POST", "/_matrix/client/v3/register")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .expect(1)
+            .create();
+        let _mock_join = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/join".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .expect(1)
+            .create();
+        let _mock_display = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/profile/.+/displayname".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .expect(1)
+            .create();
+        let mock_send = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/send/.+".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let http_client = reqwest::Client::new();
+        let potatomesh_cfg = PotatomeshConfig {
+            base_url: server.url(),
+            poll_interval_secs: 1,
+        };
+        let matrix_cfg = MatrixConfig {
+            homeserver: server.url(),
+            as_token: "AS_TOKEN".to_string(),
+            hs_token: "HS_TOKEN".to_string(),
+            server_name: "example.org".to_string(),
+            room_id: "!roomid:example.org".to_string(),
+        };
+
+        let potato = PotatoClient::new(http_client.clone(), potatomesh_cfg);
+        let matrix = MatrixAppserviceClient::new(http_client, matrix_cfg);
+        let mut state = BridgeState::default();
+
+        poll_once(&potato, &matrix, &mut state, state_str).await;
+
+        mock_msgs.assert();
+        mock_node_c.assert();
+        mock_send.assert();
+
+        // The unforwardable rows were skipped, not retried: the watermark
+        // covers the whole batch and the state file reflects it.
+        assert_eq!(state.last_rx_time, Some(30));
+        assert_eq!(state.last_message_id, Some(3));
+        assert_eq!(state.last_rx_time_ids, vec![3]);
+        assert!(state_path.exists());
+    }
+
+    #[tokio::test]
+    async fn poll_once_skips_poison_message_after_max_attempts() {
+        // A permanently-failing message must not block the batch forever. A
+        // (rx_time=10) always fails (node lookup 500); B (rx_time=20) succeeds.
+        // After MAX_FORWARD_ATTEMPTS polls the bridge skips A (advances past it)
+        // and then forwards B, so the watermark reaches 20 — progress is made
+        // while earlier polls still refused to jump past the failure.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let state_path = tmp_dir.path().join("state.json");
+        let state_str = state_path.to_str().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+
+        let _mock_msgs = server
+            .mock("GET", "/api/messages")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"id":1,"rx_time":10,"rx_iso":"2025-11-27T00:00:00Z","from_id":"!aaaaaaaa","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!aaaaaaaa"},
+                    {"id":2,"rx_time":20,"rx_iso":"2025-11-27T00:00:00Z","from_id":"!bbbbbbbb","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!bbbbbbbb"}
+                ]"#,
+            )
+            .create();
+
+        // A always fails; B's full forward chain always succeeds.
+        let _mock_node_a = server
+            .mock("GET", "/api/nodes/%21aaaaaaaa")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .create();
+        let _mock_node_b = server
+            .mock("GET", "/api/nodes/%21bbbbbbbb")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"!bbbbbbbb","long_name":"Node B","short_name":"NB"}"#)
+            .create();
+        let _mock_register = server
+            .mock("POST", "/_matrix/client/v3/register")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_join = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/join".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_display = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/profile/.+/displayname".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_send = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/send/.+".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+
+        let http_client = reqwest::Client::new();
+        let potato = PotatoClient::new(
+            http_client.clone(),
+            PotatomeshConfig {
+                base_url: server.url(),
+                poll_interval_secs: 1,
+            },
+        );
+        let matrix = MatrixAppserviceClient::new(
+            http_client,
+            MatrixConfig {
+                homeserver: server.url(),
+                as_token: "AS_TOKEN".to_string(),
+                hs_token: "HS_TOKEN".to_string(),
+                server_name: "example.org".to_string(),
+                room_id: "!roomid:example.org".to_string(),
+            },
+        );
+        let mut state = BridgeState::default();
+
+        // Poll up to (and including) the skip threshold.
+        for _ in 0..MAX_FORWARD_ATTEMPTS {
+            poll_once(&potato, &matrix, &mut state, state_str).await;
+        }
+
+        // A was skipped on the final poll and B then forwarded, so the watermark
+        // advanced to B's rx_time. A is no longer eligible (it is behind the
+        // watermark), and the failure tracker was cleared.
+        assert_eq!(
+            state.last_rx_time,
+            Some(20),
+            "poison message should have been skipped and the later message forwarded"
+        );
+        let msg_a = PotatoMessage {
+            id: 1,
+            rx_time: 10,
+            node_id: Some("!aaaaaaaa".to_string()),
+            ..sample_msg(1)
+        };
+        assert!(
+            !state.should_forward(&msg_a),
+            "skipped message must not be reprocessed"
+        );
+    }
+
+    /// Companion to the two failure-path tests above, covering the
+    /// success-path tracker reset (the `if state.failing_msg_id == Some(msg.id)`
+    /// clear after a successful `handle_message`): a message that failed
+    /// transiently and then succeeds on a later poll must clear the tracker
+    /// and let the watermark advance. Neither prior test executes that reset —
+    /// the watermark test stops at the first failure and never re-polls, and
+    /// in the poison test the tracker is already cleared by the skip before
+    /// the next message succeeds. Without this test a regression in the reset
+    /// (not clearing, or clearing the wrong id) would pass CI, and the stale
+    /// attempt count would let a single later transient failure of the same
+    /// message hit `MAX_FORWARD_ATTEMPTS` and drop it.
+    #[tokio::test]
+    async fn poll_once_clears_failure_tracker_when_failed_message_recovers() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let state_path = tmp_dir.path().join("state.json");
+        let state_str = state_path.to_str().unwrap();
+
+        let mut server = mockito::Server::new_async().await;
+
+        // Batch of two TEXT messages, refetched on every poll while the
+        // watermark is stuck (same shape as the watermark/poison tests).
+        let _mock_msgs = server
+            .mock("GET", "/api/messages")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[
+                    {"id":1,"rx_time":10,"rx_iso":"2025-11-27T00:00:00Z","from_id":"!aaaaaaaa","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!aaaaaaaa"},
+                    {"id":2,"rx_time":20,"rx_iso":"2025-11-27T00:00:00Z","from_id":"!bbbbbbbb","to_id":"^all","channel":1,"portnum":"TEXT_MESSAGE_APP","text":"Ping","lora_freq":868,"modem_preset":"MediumFast","channel_name":"TEST","node_id":"!bbbbbbbb"}
+                ]"#,
+            )
+            .create();
+
+        // Poll 1: A's node lookup fails transiently (500), arming the tracker.
+        let mock_node_a_fail = server
+            .mock("GET", "/api/nodes/%21aaaaaaaa")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .create();
+
+        // B's node lookup and the Matrix forward chain (shared by A once its
+        // node lookup recovers) always succeed.
+        let _mock_node_b = server
+            .mock("GET", "/api/nodes/%21bbbbbbbb")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"!bbbbbbbb","long_name":"Node B","short_name":"NB"}"#)
+            .create();
+        let _mock_register = server
+            .mock("POST", "/_matrix/client/v3/register")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_join = server
+            .mock(
+                "POST",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/join".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_display = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/profile/.+/displayname".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+        let _mock_send = server
+            .mock(
+                "PUT",
+                mockito::Matcher::Regex(r"/_matrix/client/v3/rooms/.+/send/.+".to_string()),
+            )
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .create();
+
+        let http_client = reqwest::Client::new();
+        let potato = PotatoClient::new(
+            http_client.clone(),
+            PotatomeshConfig {
+                base_url: server.url(),
+                poll_interval_secs: 1,
+            },
+        );
+        let matrix = MatrixAppserviceClient::new(
+            http_client,
+            MatrixConfig {
+                homeserver: server.url(),
+                as_token: "AS_TOKEN".to_string(),
+                hs_token: "HS_TOKEN".to_string(),
+                server_name: "example.org".to_string(),
+                room_id: "!roomid:example.org".to_string(),
+            },
+        );
+        let mut state = BridgeState::default();
+
+        poll_once(&potato, &matrix, &mut state, state_str).await;
+
+        // The transient failure armed the tracker and stalled the watermark.
+        assert_eq!(state.failing_msg_id, Some(1));
+        assert_eq!(state.failing_msg_attempts, 1);
+        assert_eq!(state.last_rx_time, None);
+
+        // Poll 2: A's node lookup now succeeds, like B's.
+        mock_node_a_fail.remove_async().await;
+        let _mock_node_a_ok = server
+            .mock("GET", "/api/nodes/%21aaaaaaaa")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"!aaaaaaaa","long_name":"Node A","short_name":"NA"}"#)
+            .create();
+
+        poll_once(&potato, &matrix, &mut state, state_str).await;
+
+        // The success-path reset cleared the tracker for the recovered id...
+        assert_eq!(
+            state.failing_msg_id, None,
+            "tracker id must be cleared when the failing message finally forwards"
+        );
+        assert_eq!(
+            state.failing_msg_attempts, 0,
+            "attempt count must be reset when the failing message finally forwards"
+        );
+        // ...and the watermark advanced through A to B.
+        assert_eq!(
+            state.last_rx_time,
+            Some(20),
+            "watermark should advance once the transient failure recovers"
+        );
+        let msg_a = PotatoMessage {
+            id: 1,
+            rx_time: 10,
+            node_id: Some("!aaaaaaaa".to_string()),
+            ..sample_msg(1)
+        };
+        assert!(
+            !state.should_forward(&msg_a),
+            "recovered message must not be reprocessed"
+        );
+    }
+
     /// Drive `handle_message` end-to-end against a mocked Matrix homeserver
     /// and PotatoMesh API, asserting that the bridged message body carries
-    /// the expected protocol tag and preset abbreviation. Shared by the
-    /// per-protocol test cases below. `lora_freq` is plumbed through both
-    /// the input message and the expected body so the missing-freq path
-    /// (`lora_freq = 0`) can be exercised alongside the populated cases.
-    async fn assert_handle_message_emits_tag(
-        protocol: Option<&str>,
-        expected_tag: &str,
-        modem_preset: &str,
-        lora_freq: u32,
-        expected_preset_slot: &str,
+    /// `expected_prefix` followed by `expected_text`. Core harness shared by
+    /// the per-protocol tag cases and the compacted-metadata fallback case;
+    /// the message must name node `!abcd1234` (the mocked node lookup).
+    async fn assert_handle_message_emits_body(
+        msg: PotatoMessage,
+        expected_prefix: &str,
+        expected_text: &str,
     ) {
         let mut server = mockito::Server::new_async().await;
 
@@ -780,7 +1550,7 @@ mod tests {
         let encoded_room = urlencoding::encode(&room_id);
 
         let mock_get_node = server
-            .mock("GET", "/api/nodes/abcd1234")
+            .mock("GET", "/api/nodes/%21abcd1234")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"node_id": "!abcd1234", "long_name": "Test Node", "short_name": "TN"}"#)
@@ -822,10 +1592,8 @@ mod tests {
             .txn_counter
             .load(std::sync::atomic::Ordering::SeqCst);
 
-        let expected_body =
-            format!("`{expected_tag}[{lora_freq}][{expected_preset_slot}][TEST]` Ping");
-        let expected_formatted =
-            format!("<code>{expected_tag}[{lora_freq}][{expected_preset_slot}][TEST]</code> Ping");
+        let expected_body = format!("`{expected_prefix}` {expected_text}");
+        let expected_formatted = format!("<code>{expected_prefix}</code> {expected_text}");
 
         let mock_send = server
             .mock(
@@ -849,12 +1617,7 @@ mod tests {
 
         let potato_client = PotatoClient::new(http_client.clone(), potatomesh_cfg);
         let mut state = BridgeState::default();
-        let msg = PotatoMessage {
-            protocol: protocol.map(str::to_string),
-            modem_preset: modem_preset.to_string(),
-            lora_freq,
-            ..sample_msg(100)
-        };
+        let msg_id = msg.id;
 
         let result = handle_message(&potato_client, &matrix_client, &mut state, &msg).await;
 
@@ -865,7 +1628,60 @@ mod tests {
         mock_display_name.assert();
         mock_send.assert();
 
-        assert_eq!(state.last_message_id, Some(100));
+        assert_eq!(state.last_message_id, Some(msg_id));
+    }
+
+    /// Tag-focused wrapper over [`assert_handle_message_emits_body`].
+    /// `lora_freq` is plumbed through both the input message and the expected
+    /// body so the missing-freq path (`lora_freq = 0`) can be exercised
+    /// alongside the populated cases.
+    async fn assert_handle_message_emits_tag(
+        protocol: Option<&str>,
+        expected_tag: &str,
+        modem_preset: &str,
+        lora_freq: u32,
+        expected_preset_slot: &str,
+    ) {
+        let msg = PotatoMessage {
+            protocol: protocol.map(str::to_string),
+            modem_preset: Some(modem_preset.to_string()),
+            lora_freq: Some(lora_freq),
+            ..sample_msg(100)
+        };
+        assert_handle_message_emits_body(
+            msg,
+            &format!("{expected_tag}[{lora_freq}][{expected_preset_slot}][TEST]"),
+            "Ping",
+        )
+        .await;
+    }
+
+    /// A forwardable row with ALL conditional metadata compacted away
+    /// (ACCEPTANCE MB-A1) renders every established fallback at once: `[MT]`
+    /// (absent protocol defaults to Meshtastic), the `0` frequency sentinel,
+    /// the `??` preset slot, and empty channel brackets `[]`.
+    #[tokio::test]
+    async fn handle_message_renders_fallbacks_for_compacted_metadata() {
+        let msg = PotatoMessage {
+            id: 4242,
+            rx_time: 0,
+            rx_iso: "2026-07-26T18:30:51Z".to_string(),
+            from_id: None,
+            to_id: None,
+            channel: None,
+            portnum: Some("TEXT_MESSAGE_APP".to_string()),
+            text: Some("Hi".to_string()),
+            rssi: None,
+            hop_limit: None,
+            lora_freq: None,
+            modem_preset: None,
+            channel_name: None,
+            snr: None,
+            reply_id: None,
+            node_id: Some("!abcd1234".to_string()),
+            protocol: None,
+        };
+        assert_handle_message_emits_body(msg, "[MT][0][??][]", "Hi").await;
     }
 
     #[tokio::test]

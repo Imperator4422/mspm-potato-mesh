@@ -35,6 +35,15 @@ deferred until contacts have been fetched so that the daemon's first
 (issue #788).
 """
 
+_ANNOUNCE_SEND_TIMEOUT_SECS: float = 15.0
+"""Seconds to wait for an activity announcement (``send_chan_msg``) to complete.
+
+The announcement is scheduled from the daemon's synchronous thread onto the
+MeshCore asyncio loop via ``run_coroutine_threadsafe``; this bounds the blocking
+wait on that cross-thread future so a wedged radio cannot stall the daemon loop
+(SPEC MA6/MA9).
+"""
+
 _DEFAULT_BAUDRATE: int = 115200
 """Default baud rate for MeshCore serial connections."""
 
@@ -61,6 +70,24 @@ _MESHCORE_ID_MASK = (1 << _MESHCORE_ID_BITS) - 1
 # Fallback upper bound for channel index probing when the device query fails
 # or returns an older firmware version that omits ``max_channels``.
 _CHANNEL_PROBE_FALLBACK_MAX = 32
+
+_AUTO_ADD_OVERWRITE_OLDEST = 0x01
+"""Firmware ``autoadd_config`` bit 0: evict the oldest non-favourite contact
+when the roster is full (``MyMesh::shouldOverwriteWhenFull``).
+
+Bits 1–4 of the same byte are per-type auto-add filters (chat / repeater /
+room-server / sensor) that only apply in manual-add mode; the startup
+assertion (SPEC RF4) must preserve them via read-modify-write.
+"""
+
+_DIRECT_PATH_LEN = 255
+"""Sentinel ``path_len`` value meaning the packet was received directly.
+
+The companion protocol encodes a direct (zero-hop) reception as ``0xFF``
+instead of ``0``; any other value is the masked 6-bit hop count (the
+``meshcore`` library strips the 2-bit ``path_hash_mode`` prefix before
+dispatching, so handlers only ever see ``0``–``63`` or this sentinel).
+"""
 
 # Matches @[Name] mention patterns in MeshCore message bodies.
 _MENTION_RE = re.compile(r"@\[([^\]]+)\]")

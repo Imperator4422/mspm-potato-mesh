@@ -14,7 +14,15 @@
 # limitations under the License.
 
 ARG TARGETOS=linux
-ARG PYTHON_VERSION=3.12.6
+# This pin is bounded on both sides (DK-A2 Rust-drift caveat):
+#   lower — the resolved Alpine base must ship Rust >= cryptography's MSRV,
+#           because armv7 publishes no wheel and compiles the Rust core from
+#           source: 3.12.10-alpine -> Alpine 3.22 -> Rust 1.87 >= crypto 49's 1.83.
+#   upper — Docker Hub published no `windowsservercore-ltsc2022` base past
+#           3.12.10, and production-windows below reuses this same ARG.
+# Raise the floor by bumping here; if crypto's MSRV ever outruns the Alpine that
+# 3.12.10 resolves to, split this ARG per stage rather than 404 the Windows base.
+ARG PYTHON_VERSION=3.12.10
 
 # Linux production image
 FROM python:${PYTHON_VERSION}-alpine AS production-linux
@@ -35,7 +43,17 @@ RUN set -eux; \
         gcc \
         musl-dev \
         linux-headers \
-        build-base; \
+        build-base \
+        # cryptography and cffi publish no 32-bit ARM wheels, so armv7
+        # compiles both from source: cffi needs the libffi headers, and
+        # cryptography's Rust extension needs rust/cargo plus the OpenSSL
+        # headers found via pkgconfig (DK-A2). All of it is removed again
+        # by the trailing `apk del`, so the final image size is unchanged.
+        libffi-dev \
+        openssl-dev \
+        pkgconfig \
+        rust \
+        cargo; \
     python -m pip install --no-cache-dir -r requirements.txt; \
     apk del .build-deps
 
@@ -51,6 +69,12 @@ ENV CONNECTION=/dev/ttyACM0 \
     CHANNEL_INDEX=0 \
     DEBUG=0 \
     PROTOCOL=meshtastic \
+    TRANSPORT=api \
+    PRIMARY_CHANNEL_ONLY=0 \
+    PRIMARY_CHANNEL_KEY=AQ== \
+    PRIMARY_CHANNEL_NAME="" \
+    MESH_UDP_GROUP=224.0.0.69 \
+    MESH_UDP_PORT=4403 \
     ALLOWED_CHANNELS="" \
     HIDDEN_CHANNELS="" \
     INSTANCE_DOMAIN="" \
@@ -79,6 +103,12 @@ ENV CONNECTION=/dev/ttyACM0 \
     CHANNEL_INDEX=0 \
     DEBUG=0 \
     PROTOCOL=meshtastic \
+    TRANSPORT=api \
+    PRIMARY_CHANNEL_ONLY=0 \
+    PRIMARY_CHANNEL_KEY=AQ== \
+    PRIMARY_CHANNEL_NAME="" \
+    MESH_UDP_GROUP=224.0.0.69 \
+    MESH_UDP_PORT=4403 \
     ALLOWED_CHANNELS="" \
     HIDDEN_CHANNELS="" \
     INSTANCE_DOMAIN="" \

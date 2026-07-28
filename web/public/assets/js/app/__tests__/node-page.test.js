@@ -17,7 +17,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { initializeNodeDetailPage, fetchNodeDetailHtml, __testUtils } from '../node-page.js';
+import {
+  initializeNodeDetailPage,
+  fetchNodeDetailHtml,
+  getNodeDetailRelativeTimeTicker,
+  __testUtils,
+} from '../node-page.js';
 import { getRoleColor, getRoleKey, translateRoleId } from '../role-helpers.js';
 
 const {
@@ -363,14 +368,67 @@ test('renderSingleNodeTable renders a condensed table for the node', () => {
     (short, role) => `<span class="short-name" data-role="${role}">${short}</span>`,
     10_000,
   );
-  assert.equal(html.includes('<table'), true);
-  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in long name link');
-  assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">.*Example Node<\/a>/s);
+  // A single record is a spec sheet, not a table (SPEC PD1): no `<table>`, no
+  // responsive-hide column classes, grouped dt/dd instead.
+  assert.ok(!html.includes('<table'), 'renders a spec sheet, not a table');
+  assert.ok(!/nodes-col--/.test(html), 'no responsive-hide column classes');
+  assert.ok(html.includes('node-detail-sheet'), 'renders the spec-sheet container');
+  for (const group of ['Activity', 'Health', 'Utilization', 'Environment', 'Position']) {
+    assert.ok(html.includes(`>${group}</h3>`), `group ${group} present`);
+  }
+  assert.ok(html.includes('<dt>Battery</dt>'), 'fields render as dt/dd rows');
   assert.equal(html.includes('66.0%'), true);
   assert.equal(html.includes('1.230%'), true);
   assert.equal(html.includes('52.52000'), true);
   assert.equal(html.includes('1m 40s'), true);
   assert.equal(html.includes('2m 30s'), true);
+});
+
+test('renderSingleNodeTable timestamp fields opt into the live tick (SPEC RT1/RT2)', () => {
+  const html = renderSingleNodeTable(
+    { nodeId: '!abcd', lastHeard: 9_900, positionTime: 9_850 },
+    short => `<span>${short}</span>`,
+    10_000,
+  );
+  assert.ok(
+    html.includes('<dd data-ts-ago="9900" data-ts-format="relative">1m 40s</dd>'),
+    'the Last Seen dd carries the tick hook',
+  );
+  assert.ok(
+    html.includes('<dd data-ts-ago="9850" data-ts-format="relative">2m 30s</dd>'),
+    'the Last Position dd carries the tick hook',
+  );
+});
+
+test('renderSingleNodeTable without timestamps renders the dash, no tick hooks (SPEC RT4/PD1)', () => {
+  const html = renderSingleNodeTable({ nodeId: '!abcd' }, short => `<span>${short}</span>`, 10_000);
+  assert.equal(html.includes('data-ts-ago'), false, 'no tick hook without a timestamp');
+  assert.ok(
+    html.includes('<dd><span class="cell-empty">—</span></dd>'),
+    'absent Last Seen / Last Position render the muted dash, not a blank',
+  );
+});
+
+// --- Post-Deploy review 01: the /nodes/:id detail view must not reuse the
+// `#nodes` responsive-hide column classes (they `display:none` columns on
+// smaller viewports with no disclosure row to recover them — data loss on the
+// page whose only job is that node), and absent telemetry must read as the
+// muted dash, not a blank. Both fail against the pre-fix one-row table. ---
+test('the node detail view carries no responsive-hide column classes (no data loss)', () => {
+  const node = { nodeId: '!abcd', shortName: 'NODE', battery: 66, temperature: 22.5 };
+  const html = renderSingleNodeTable(node, short => `<span>${short}</span>`, 10_000);
+  assert.ok(
+    !/nodes-col--/.test(html),
+    'the detail view must not carry the #nodes responsive-hide classes — nothing may be display:none on a single-record page',
+  );
+});
+
+test('the node detail view renders the muted dash for absent telemetry, not a blank', () => {
+  const html = renderSingleNodeTable({ nodeId: '!abcd' }, short => `<span>${short}</span>`, 10_000);
+  assert.ok(
+    html.includes('—'),
+    'absent fields must read as the muted em-dash, not an indistinguishable blank cell',
+  );
 });
 
 test('renderTelemetryCharts renders condensed scatter charts when telemetry exists', () => {
@@ -412,6 +470,28 @@ test('renderTelemetryCharts renders condensed scatter charts when telemetry exis
   assert.equal(html.includes('Temperature (\u00b0C)'), true);
   assert.equal(html.includes(expectedDate), true);
   assert.equal(html.includes('node-detail__chart-point'), true);
+});
+
+test('renderTelemetryCharts injects insertBefore figures before their target spec', () => {
+  const nowMs = CHART_NOW_MS;
+  const nowSeconds = CHART_NOW_SECONDS;
+  const node = makeAggregatedNode([
+    { rx_time: nowSeconds - 60, telemetry_type: 'device', battery_level: 80, voltage: 4.1 },
+    { rx_time: nowSeconds - 3_600, telemetry_type: 'environment', temperature: 18.4, relative_humidity: 52 },
+  ]);
+  const html = renderTelemetryCharts(node, {
+    nowMs,
+    insertBefore: {
+      environment: '<figure class="injected-activity"></figure>',
+      'no-such-spec': '<figure class="leftover-figure"></figure>',
+    },
+  });
+  const injectedIdx = html.indexOf('injected-activity');
+  const envIdx = html.indexOf('Environmental telemetry');
+  assert.ok(injectedIdx > -1 && envIdx > -1);
+  assert.ok(injectedIdx < envIdx, 'injected figure precedes the environmental figure');
+  // A figure whose target spec did not render is appended, never dropped.
+  assert.ok(html.includes('leftover-figure'));
 });
 
 test('renderTelemetryCharts expands upper bounds when overflow metrics exceed defaults', () => {
@@ -609,7 +689,10 @@ test('renderNodeDetailHtml composes the table, neighbors, and messages', () => {
   assert.equal(html.includes('We hear'), true);
   assert.equal(html.includes('Messages'), true);
   assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in heading and table');
-  assert.match(html, /<a class="node-long-link" href="\/nodes\/!abcd" data-node-detail-link="true" data-node-id="!abcd">.*Example Node<\/a>/s);
+  // The long name shows as text in the header; the spec sheet no longer repeats
+  // it, and a self-link to the node's own page is gone (SPEC PD1).
+  assert.ok(html.includes('Example Node'), 'the long name renders in the detail header');
+  assert.ok(!html.includes('node-long-link'), 'no pointless self-link on the node detail page');
   assert.equal(html.includes('PEER'), true);
   assert.equal(html.includes('ALLY'), true);
   assert.equal(html.includes('Traceroutes'), true);
@@ -654,46 +737,10 @@ test('renderNodeDetailHtml embeds telemetry charts when snapshots are present', 
   assert.equal(html.includes('Air quality'), true);
 });
 
-// --- Protocol icon in renderSingleNodeTable ---
-
-test('renderSingleNodeTable shows meshtastic icon for meshtastic protocol in long name link', () => {
-  const node = {
-    shortName: 'A',
-    longName: 'Alice',
-    nodeId: '!aa',
-    role: 'CLIENT',
-    protocol: 'meshtastic',
-    rawSources: { node: { node_id: '!aa', role: 'CLIENT' } },
-  };
-  const html = renderSingleNodeTable(node, (short, role) => `<span data-role="${role}">${short}</span>`, 0);
-  assert.ok(html.includes('meshtastic.svg'), 'meshtastic protocol should show icon in long name link');
-});
-
-test('renderSingleNodeTable shows no protocol icon when protocol is absent in long name link', () => {
-  const node = {
-    shortName: 'A',
-    longName: 'Alice',
-    nodeId: '!aa',
-    role: 'CLIENT',
-    rawSources: { node: { node_id: '!aa', role: 'CLIENT' } },
-  };
-  const html = renderSingleNodeTable(node, (short, role) => `<span data-role="${role}">${short}</span>`, 0);
-  assert.ok(!html.includes('meshtastic.svg'), 'absent protocol should show no meshtastic icon in long name link');
-  assert.ok(!html.includes('meshcore.svg'), 'absent protocol should show no meshcore icon in long name link');
-});
-
-test('renderSingleNodeTable omits meshtastic icon for meshcore protocol in long name link', () => {
-  const node = {
-    shortName: 'M',
-    longName: 'MeshCore Node',
-    nodeId: '!mc',
-    role: 'REPEATER',
-    protocol: 'meshcore',
-    rawSources: { node: { node_id: '!mc', role: 'REPEATER' } },
-  };
-  const html = renderSingleNodeTable(node, (short, role) => `<span data-role="${role}">${short}</span>`, 0);
-  assert.ok(!html.includes('meshtastic.svg'), 'meshcore protocol should not show meshtastic icon in long name link');
-});
+// The long name (with its protocol icon) now lives only in the detail-page
+// header (renderNodeDetailHtml) — the spec sheet no longer repeats it, so the
+// per-protocol icon in the long-name link is exercised by the heading tests
+// below and by node-rendering.test.js / node-link-helpers.test.js.
 
 // --- Protocol icon in renderNodeDetailHtml heading ---
 
@@ -1095,6 +1142,8 @@ test('initializeNodeDetailPage hydrates the container with node data', async () 
   };
   const documentStub = {
     querySelector: selector => (selector === '#nodeDetail' ? element : null),
+    // Lets the page arm its relative-time ticker against this stub (RT1/RT2).
+    querySelectorAll: () => [],
   };
   const refreshImpl = async reference => {
     assert.equal(reference.nodeId, '!node');
@@ -1145,6 +1194,11 @@ test('initializeNodeDetailPage hydrates the container with node data', async () 
   assert.equal(element.innerHTML.includes('Neighbors'), true);
   assert.equal(element.innerHTML.includes('Messages'), true);
   assert.equal(element.innerHTML.includes('ALLY-API'), true);
+  // A successful render arms the page's shared relative-time ticker (RT2).
+  const ticker = getNodeDetailRelativeTimeTicker();
+  assert.ok(ticker, 'ticker handle exposed after init');
+  assert.equal(ticker.running(), true);
+  ticker.stop();
 });
 
 test('initializeNodeDetailPage removes legacy filter controls when supported', async () => {

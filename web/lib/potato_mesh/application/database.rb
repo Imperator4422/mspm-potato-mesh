@@ -110,7 +110,7 @@ module PotatoMesh
       def init_db
         FileUtils.mkdir_p(File.dirname(PotatoMesh::Config.db_path))
         db = open_database
-        %w[nodes messages positions telemetry neighbors instances traces ingestors].each do |schema|
+        %w[nodes messages positions telemetry neighbors instances traces ingestors ingestor_activity].each do |schema|
           sql_file = File.expand_path("../../../../data/#{schema}.sql", __dir__)
           db.execute_batch(File.read(sql_file))
         end
@@ -152,6 +152,21 @@ module PotatoMesh
             db.execute("ALTER TABLE nodes ADD COLUMN synthetic BOOLEAN NOT NULL DEFAULT 0")
           end
 
+          # RF metrics (SPEC RF3/RF6): per-advert reception RSSI. NULL for
+          # Meshtastic nodes, which report no per-node RSSI.
+          unless node_columns.include?("rssi")
+            db.execute("ALTER TABLE nodes ADD COLUMN rssi INTEGER")
+          end
+
+          # Keyed-evidence tracking (SPEC MR1): newest time the node was heard
+          # via a key-authenticated record.  Deliberately not backfilled — NULL
+          # means "no keyed evidence recorded since the column shipped", so a
+          # live device re-arms its evidence on its next advert / roster
+          # snapshot while a retired identity stays permanently stale.
+          unless node_columns.include?("last_advert_heard")
+            db.execute("ALTER TABLE nodes ADD COLUMN last_advert_heard INTEGER")
+          end
+
           if node_columns.include?("long_name")
             existing_indexes = db.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='nodes'").flatten
             unless existing_indexes.include?("idx_nodes_long_name")
@@ -176,15 +191,29 @@ module PotatoMesh
           # synthetic rows.  Idempotent — the EXISTS guards make repeated runs
           # a no-op.
           if node_columns.include?("protocol") && node_columns.include?("synthetic")
-            # Only collapse synthetics whose long_name resolves to *exactly*
-            # one real meshcore node.  When two real devices share a
-            # long_name, the placeholder is ambiguous — merging would risk
-            # mis-attributing historical chat messages to the wrong radio.
+            # Only collapse synthetics whose long_name resolves to an
+            # unambiguous real meshcore node: either *exactly one* real of
+            # that name exists, or — when several do — exactly one of them is
+            # not positively known to be a retired identity (SPEC MR2).  A
+            # retired keypair that only message touches keep "alive" therefore
+            # no longer deadlocks the collapse, while two genuinely active
+            # same-name devices — and any pair we know nothing about — still
+            # refuse (merging would risk mis-attributing historical chat).
             # Wrapped in a single transaction so that a crash between the
             # UPDATE and DELETE cannot leave messages redirected without the
             # corresponding synthetic row cleared.
+            evidence_cutoff = PotatoMesh::App::DataProcessing.evidence_cutoff
+            # Confine the staleness predicate to evidence columns this schema
+            # actually has.  +last_advert_heard+ was guaranteed present by the
+            # ALTER above (so it is always in the list even though +node_columns+
+            # is the pre-migration snapshot), while +position_time+ belongs to
+            # the base schema and may be absent on the minimal tables the
+            # migration is exercised against.
+            evidence_columns = ["last_advert_heard"]
+            evidence_columns << "position_time" if node_columns.include?("position_time")
+            live_real_sql = "NOT #{PotatoMesh::App::DataProcessing.positively_stale_sql("real", columns: evidence_columns)}"
             db.transaction do
-              db.execute(<<~SQL)
+              db.execute(<<~SQL, [evidence_cutoff, evidence_cutoff])
                 UPDATE messages
                    SET from_id = (
                      SELECT real.node_id FROM nodes real
@@ -192,27 +221,52 @@ module PotatoMesh
                      WHERE synth.node_id = messages.from_id
                        AND synth.synthetic = 1 AND synth.protocol = 'meshcore'
                        AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                       AND (
+                         (
+                           SELECT COUNT(*) FROM nodes r2
+                           WHERE r2.long_name = synth.long_name
+                             AND r2.synthetic = 0 AND r2.protocol = 'meshcore'
+                         ) = 1
+                         OR #{live_real_sql}
+                       )
                      LIMIT 1
                    )
                  WHERE from_id IN (
                    SELECT synth.node_id FROM nodes synth
                    WHERE synth.synthetic = 1 AND synth.protocol = 'meshcore'
                      AND (
-                       SELECT COUNT(*) FROM nodes real
-                       WHERE real.long_name = synth.long_name
-                         AND real.synthetic = 0 AND real.protocol = 'meshcore'
-                     ) = 1
+                       (
+                         SELECT COUNT(*) FROM nodes real
+                         WHERE real.long_name = synth.long_name
+                           AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                       ) = 1
+                       OR (
+                         SELECT COUNT(*) FROM nodes real
+                         WHERE real.long_name = synth.long_name
+                           AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                           AND #{live_real_sql}
+                       ) = 1
+                     )
                  )
               SQL
-              db.execute(<<~SQL)
+              db.execute(<<~SQL, [evidence_cutoff])
                 DELETE FROM nodes
                  WHERE synthetic = 1 AND protocol = 'meshcore'
                    AND (
-                     SELECT COUNT(*) FROM nodes real
-                     WHERE real.long_name = nodes.long_name
-                       AND real.synthetic = 0 AND real.protocol = 'meshcore'
-                       AND real.node_id != nodes.node_id
-                   ) = 1
+                     (
+                       SELECT COUNT(*) FROM nodes real
+                       WHERE real.long_name = nodes.long_name
+                         AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                         AND real.node_id != nodes.node_id
+                     ) = 1
+                     OR (
+                       SELECT COUNT(*) FROM nodes real
+                       WHERE real.long_name = nodes.long_name
+                         AND real.synthetic = 0 AND real.protocol = 'meshcore'
+                         AND real.node_id != nodes.node_id
+                         AND #{live_real_sql}
+                     ) = 1
+                   )
               SQL
             end
           end
@@ -257,6 +311,17 @@ module PotatoMesh
           unless message_columns.include?("protocol")
             db.execute("ALTER TABLE messages ADD COLUMN protocol TEXT NOT NULL DEFAULT 'meshtastic'")
             db.execute("UPDATE messages SET protocol = 'meshtastic' WHERE protocol IS NULL OR TRIM(protocol) = ''")
+          end
+
+          # RF metrics (SPEC RF1/RF2/RF6): hops actually travelled (distinct
+          # from hop_limit's remaining-budget semantic) and the MeshCore
+          # hop-hash route. Both additive, NULL for legacy rows.
+          unless message_columns.include?("hops")
+            db.execute("ALTER TABLE messages ADD COLUMN hops INTEGER")
+          end
+
+          unless message_columns.include?("path")
+            db.execute("ALTER TABLE messages ADD COLUMN path TEXT")
           end
 
           reply_index_exists =
@@ -378,7 +443,11 @@ module PotatoMesh
         end
 
         telemetry_columns = db.execute("PRAGMA table_info(telemetry)").map { |row| row[1] }
-        TELEMETRY_COLUMN_DEFINITIONS.each do |name, type|
+        # The environment expansion plus the extended metric families (TI-A2:
+        # power / air-quality / health / local / host / traffic stats and the
+        # one-wire probe list) share one idempotent backfill loop; the extended
+        # pairs derive from the same definitions insert_telemetry writes with.
+        (TELEMETRY_COLUMN_DEFINITIONS + DataProcessing::EXTENDED_TELEMETRY_COLUMN_TYPES).each do |name, type|
           next if telemetry_columns.include?(name)
 
           db.execute("ALTER TABLE telemetry ADD COLUMN #{name} #{type}")
@@ -467,6 +536,17 @@ module PotatoMesh
             db.execute("ALTER TABLE ingestors ADD COLUMN protocol TEXT NOT NULL DEFAULT 'meshtastic'")
             db.execute("UPDATE ingestors SET protocol = 'meshtastic' WHERE protocol IS NULL OR TRIM(protocol) = ''")
           end
+        end
+
+        # The per-heartbeat activity time-series (SPEC MA3) is a standalone,
+        # append-only table; older installations gain it here without any data
+        # backfill (the moving average simply starts populating from the next
+        # heartbeat that carries a `packets` count).
+        activity_tables =
+          db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ingestor_activity'").flatten
+        if activity_tables.empty?
+          activity_schema = File.expand_path("../../../../data/ingestor_activity.sql", __dir__)
+          db.execute_batch(File.read(activity_schema))
         end
       rescue SQLite3::SQLException, Errno::ENOENT => e
         warn_log(

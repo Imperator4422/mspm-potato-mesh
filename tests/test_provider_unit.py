@@ -52,6 +52,9 @@ from data.mesh_ingestor.mesh_protocol import MeshProtocol  # noqa: E402 - path s
 from data.mesh_ingestor.protocols.meshtastic import (  # noqa: E402 - path setup
     MeshtasticProvider,
 )
+from data.mesh_ingestor.protocols.meshtastic_udp import (  # noqa: E402 - path setup
+    MeshtasticUdpProvider,
+)
 from data.mesh_ingestor.connection import parse_tcp_target  # noqa: E402 - path setup
 from data.mesh_ingestor.protocols.meshcore import (  # noqa: E402 - path setup
     EventType,
@@ -67,6 +70,8 @@ from data.mesh_ingestor.protocols.meshcore import (  # noqa: E402 - path setup
     _make_connection,
     _make_event_handlers,
     _meshcore_adv_type_to_role,
+    _normalize_hops,
+    _normalize_path,
     _meshcore_node_id,
     _meshcore_short_name,
     _parse_sender_name,
@@ -85,6 +90,11 @@ from data.mesh_ingestor.protocols.meshcore import (  # noqa: E402 - path setup
 def test_meshtastic_provider_satisfies_protocol():
     """MeshtasticProvider must structurally satisfy the Provider Protocol."""
     assert isinstance(MeshtasticProvider(), MeshProtocol)
+
+
+def test_meshtastic_udp_provider_satisfies_protocol():
+    """MeshtasticUdpProvider must structurally satisfy the Provider Protocol."""
+    assert isinstance(MeshtasticUdpProvider(), MeshProtocol)
 
 
 def test_daemon_main_uses_provider_connect(monkeypatch):
@@ -1113,6 +1123,36 @@ def test_store_meshcore_position_queues_to_api_positions(monkeypatch):
     assert payload["id"] >= 0
 
 
+def test_store_meshcore_position_includes_radio_metadata(monkeypatch):
+    """MeshCore position POSTs must carry the captured LoRa radio metadata.
+
+    Regression for the ``/api/positions`` radio-metadata gap: the MeshCore
+    position builder posts directly (bypassing the generic position handler),
+    so without an explicit :func:`_apply_radio_metadata` call every position
+    row lands with ``lora_freq``/``modem_preset`` nil even though the ingestor
+    captured them at ``SELF_INFO`` — unlike MeshCore message and node POSTs,
+    which are already enriched.
+    """
+    import data.mesh_ingestor.config as config
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    monkeypatch.setattr(config, "LORA_FREQ", 869.618, raising=False)
+    monkeypatch.setattr(config, "MODEM_PRESET", "SF8/BW62/CR8", raising=False)
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append((route, payload)),
+    )
+
+    _store_meshcore_position("!aabbccdd", 51.5, -0.1, 1700001234, "!ingestor1")
+
+    assert len(posted) == 1
+    _route, payload = posted[0]
+    assert payload.get("lora_freq") == 869.618
+    assert payload.get("modem_preset") == "SF8/BW62/CR8"
+
+
 def test_store_meshcore_position_id_is_stable_for_same_node_and_time(monkeypatch):
     """The pseudo-ID must be identical for repeated calls with the same arguments."""
     import data.mesh_ingestor.protocols.meshcore as _mod
@@ -1228,6 +1268,48 @@ def test_store_meshcore_position_equator_fix_preserved(monkeypatch):
     payload = posted[0]
     assert payload["latitude"] == 0.0
     assert payload["longitude"] == pytest.approx(13.5)
+
+
+def test_store_meshcore_position_defaults_rx_time_to_now(monkeypatch):
+    """With no override, rx_time is the wall clock (unchanged live-path behavior)."""
+    import time as _time
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append(payload),
+    )
+
+    before = int(_time.time())
+    _store_meshcore_position("!aabbccdd", 51.5, -0.1, 1700001234, None)
+    after = int(_time.time())
+
+    assert before <= posted[0]["rx_time"] <= after
+
+
+def test_store_meshcore_position_honours_rx_time_override(monkeypatch):
+    """An explicit rx_time overrides the wall clock so a replayed roster position
+    is stamped with its real reception time, not now (issue #853)."""
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append(payload),
+    )
+
+    _store_meshcore_position(
+        "!aabbccdd", 51.5, -0.1, 1700001234, None, rx_time=1699990000
+    )
+
+    payload = posted[0]
+    assert payload["rx_time"] == 1699990000
+    assert payload["rx_iso"] == "2023-11-14T19:26:40Z"
+    # position_time is independent of the rx override.
+    assert payload["position_time"] == 1700001234
 
 
 # ---------------------------------------------------------------------------
@@ -1434,6 +1516,7 @@ def _make_stub_handlers_module():
         register_host_node_id=lambda *_a, **_k: None,
         host_node_id=lambda: None,
         _mark_packet_seen=lambda: None,
+        _mark_packet_activity=lambda: None,
         store_packet_dict=lambda *_a, **_k: None,
     )
     return mod
@@ -1480,6 +1563,658 @@ def _setup_channel_msg_handlers(monkeypatch, *, contacts=None):
         iface._update_contact(contact)
     hmap = _make_event_handlers(iface, "/dev/ttyUSB0")
     return captured, upserted, iface, hmap
+
+
+def test_event_handlers_cover_telemetry_events(monkeypatch):
+    """Regression guard for TI-A3: the MeshCore event-handler map subscribes
+    the telemetry surfaces (contact telemetry pulls, status responses, and the
+    host radio's battery event) instead of dropping them unhandled."""
+    _, _, _, hmap = _setup_channel_msg_handlers(monkeypatch)
+    missing = {"TELEMETRY_RESPONSE", "STATUS_RESPONSE", "BATTERY"} - set(hmap)
+    assert not missing, f"telemetry events not subscribed: {sorted(missing)}"
+
+
+# ---------------------------------------------------------------------------
+# MeshCore telemetry collection (TI-A3)
+# ---------------------------------------------------------------------------
+
+_TEST_CONTACT_KEY = "aabbccddeeff" + "00" * 26
+"""Full 32-byte public key (hex) for the telemetry test contact."""
+
+
+def _telemetry_module():
+    """Return the MeshCore telemetry module under test."""
+    import data.mesh_ingestor.protocols.meshcore.telemetry as mc_tel
+
+    return mc_tel
+
+
+def _telemetry_env(monkeypatch, *, contacts=None, frozen_time=1_700_000_000):
+    """Build the patched environment for MeshCore telemetry tests.
+
+    Parameters:
+        monkeypatch: pytest monkeypatch fixture.
+        contacts: Optional contact dicts pre-registered on the interface.
+        frozen_time: Wall-clock second ``time.time`` is pinned to.
+
+    Returns:
+        Tuple ``(mc_tel, iface, stub, captured)`` — module under test, the
+        interface, the stubbed handlers module, and the captured packet list.
+    """
+    import time as _time
+
+    mc_tel = _telemetry_module()
+    captured: list = []
+    stub = _make_stub_handlers_module()
+    stub.store_packet_dict = lambda pkt: captured.append(pkt)
+    monkeypatch.setattr(mc_tel.config, "_debug_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(_time, "time", lambda: frozen_time)
+    iface = _MeshcoreInterface(target=None)
+    for contact in contacts or []:
+        iface._update_contact(contact)
+    return mc_tel, iface, stub, captured
+
+
+def test_lpp_entry_parts_accepts_names_codes_and_rejects_junk():
+    """LPP entries resolve by name string or numeric code; junk is rejected."""
+    mc_tel = _telemetry_module()
+    assert mc_tel._lpp_entry_parts({"type": "Temperature", "value": 21.5}) == (
+        "temperature",
+        21.5,
+    )
+    assert mc_tel._lpp_entry_parts({"type": 116, "value": 3.9}) == ("voltage", 3.9)
+    assert mc_tel._lpp_entry_parts({"type": 999, "value": 1.0}) == (None, 1.0)
+    assert mc_tel._lpp_entry_parts({"type": "  ", "value": 1.0}) == (None, 1.0)
+    assert mc_tel._lpp_entry_parts({"type": None, "value": 1.0}) == (None, 1.0)
+    assert mc_tel._lpp_entry_parts({"type": "voltage", "value": True}) == (
+        "voltage",
+        None,
+    )
+    assert mc_tel._lpp_entry_parts({"type": "voltage", "value": "n/a"}) == (
+        "voltage",
+        None,
+    )
+
+
+def test_lpp_to_telemetry_section_maps_device_and_environment(monkeypatch):
+    """Battery-style readings map to deviceMetrics, sensors to environmentMetrics."""
+    mc_tel = _telemetry_module()
+    monkeypatch.setattr(mc_tel.config, "_debug_log", lambda *_a, **_k: None)
+    section = mc_tel._lpp_to_telemetry_section(
+        [
+            {"channel": 1, "type": "voltage", "value": 4.05},
+            {"channel": 1, "type": "percentage", "value": 87},
+            {"channel": 2, "type": "temperature", "value": 21.5},
+            {"channel": 2, "type": "humidity", "value": 40.2},
+            {"channel": 2, "type": "barometer", "value": 1013.2},
+            {"channel": 3, "type": "illuminance", "value": 120.0},
+            {"channel": 3, "type": "current", "value": 0.12},
+            {"channel": 9, "type": "gps", "value": {"lat": 1}},
+            "not-a-mapping",
+        ]
+    )
+    assert section == {
+        "deviceMetrics": {"voltage": 4.05, "batteryLevel": 87.0},
+        "environmentMetrics": {
+            "temperature": 21.5,
+            "relativeHumidity": 40.2,
+            "barometricPressure": 1013.2,
+            "lux": 120.0,
+            # LPP current arrives in amps and is scaled to the column's
+            # milliamp convention (Meshtastic EnvironmentMetrics unit).
+            "current": 120.0,
+        },
+    }
+
+
+def test_lpp_to_telemetry_section_rejects_empty_and_non_lists(monkeypatch):
+    """Unusable LPP inputs yield None (nothing queued downstream)."""
+    mc_tel = _telemetry_module()
+    monkeypatch.setattr(mc_tel.config, "_debug_log", lambda *_a, **_k: None)
+    assert mc_tel._lpp_to_telemetry_section(None) is None
+    assert mc_tel._lpp_to_telemetry_section({"type": "temperature"}) is None
+    assert mc_tel._lpp_to_telemetry_section([]) is None
+    assert mc_tel._lpp_to_telemetry_section([{"type": "gps", "value": 1.0}]) is None
+
+
+def test_lpp_duplicate_types_keep_first_reading(monkeypatch):
+    """setdefault semantics: the first reading of a type wins within a packet."""
+    mc_tel = _telemetry_module()
+    monkeypatch.setattr(mc_tel.config, "_debug_log", lambda *_a, **_k: None)
+    section = mc_tel._lpp_to_telemetry_section(
+        [
+            {"type": "temperature", "value": 21.5},
+            {"type": "temperature", "value": 99.0},
+        ]
+    )
+    assert section == {"environmentMetrics": {"temperature": 21.5}}
+
+
+def test_millivolts_to_volts_bounds():
+    """mV gauges convert to volts; non-positive and junk values are rejected."""
+    mc_tel = _telemetry_module()
+    assert mc_tel._millivolts_to_volts(4056) == 4.056
+    assert mc_tel._millivolts_to_volts(0) is None
+    assert mc_tel._millivolts_to_volts(-5) is None
+    assert mc_tel._millivolts_to_volts(True) is None
+    assert mc_tel._millivolts_to_volts("4056") is None
+
+
+def test_status_to_telemetry_section_maps_battery_and_uptime():
+    """STATUS_RESPONSE bat/uptime map to deviceMetrics voltage/uptimeSeconds."""
+    mc_tel = _telemetry_module()
+    assert mc_tel._status_to_telemetry_section({"bat": 4056, "uptime": 3600}) == {
+        "deviceMetrics": {"voltage": 4.056, "uptimeSeconds": 3600}
+    }
+    assert mc_tel._status_to_telemetry_section({"bat": 4056}) == {
+        "deviceMetrics": {"voltage": 4.056}
+    }
+    assert mc_tel._status_to_telemetry_section({"uptime": 0, "bat": 0}) is None
+    assert mc_tel._status_to_telemetry_section({"uptime": True}) is None
+    assert mc_tel._status_to_telemetry_section("junk") is None
+
+
+def test_resolve_event_node_id_roster_host_and_unknown(monkeypatch):
+    """pubkey_pre resolves via roster, then host prefix, else None."""
+    mc_tel, iface, _stub, _captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    roster_id = iface.lookup_node_id(_TEST_CONTACT_KEY[:12])
+    assert mc_tel._resolve_event_node_id(iface, _TEST_CONTACT_KEY[:12]) == roster_id
+
+    iface.host_node_id = "!deadbeef"
+    iface._self_info_payload = {"public_key": "FFEE" + "11" * 30}
+    assert mc_tel._resolve_event_node_id(iface, "ffee1111") == "!deadbeef"
+
+    assert mc_tel._resolve_event_node_id(iface, "0123456789ab") is None
+    assert mc_tel._resolve_event_node_id(iface, "") is None
+    assert mc_tel._resolve_event_node_id(iface, None) is None
+
+
+def test_queue_meshcore_telemetry_packet_shape(monkeypatch):
+    """Queued packets carry the canonical shape, protocol stamp, and stable id."""
+    mc_tel, iface, stub, captured = _telemetry_env(monkeypatch)
+    seen = []
+    counted = []
+    stub._mark_packet_activity = lambda: seen.append(True)
+    stub._mark_packet_seen = lambda: counted.append(True)
+
+    queued = mc_tel._queue_meshcore_telemetry(
+        stub, "!11223344", {"deviceMetrics": {"voltage": 4.05}}, "battery"
+    )
+    assert queued is True
+    # Model A: telemetry advances the clock only — the on-air response is
+    # counted at its RX_LOG_DATA seam, so the counter is untouched here.
+    assert seen == [True]
+    assert counted == []
+    packet = captured[0]
+    assert packet["protocol"] == "meshcore"
+    assert packet["from_id"] == "!11223344"
+    assert packet["decoded"]["portnum"] == "TELEMETRY_APP"
+    assert packet["decoded"]["telemetry"]["deviceMetrics"] == {"voltage": 4.05}
+    assert packet["decoded"]["telemetry"]["time"] == 1_700_000_000
+    assert isinstance(packet["id"], int) and 0 <= packet["id"] < (1 << 53)
+
+    # Same node/kind/second → identical id (web-side PRIMARY KEY collapse).
+    mc_tel._queue_meshcore_telemetry(
+        stub, "!11223344", {"deviceMetrics": {"voltage": 4.06}}, "battery"
+    )
+    assert captured[1]["id"] == packet["id"]
+    # A different kind in the same second must not collide.
+    mc_tel._queue_meshcore_telemetry(
+        stub, "!11223344", {"deviceMetrics": {"voltage": 4.06}}, "status"
+    )
+    assert captured[2]["id"] != packet["id"]
+
+
+def test_queue_meshcore_telemetry_skips_incomplete(monkeypatch):
+    """Missing node id or empty section queues nothing."""
+    mc_tel, _iface, stub, captured = _telemetry_env(monkeypatch)
+    assert (
+        mc_tel._queue_meshcore_telemetry(stub, None, {"deviceMetrics": {}}, "x")
+        is False
+    )
+    assert mc_tel._queue_meshcore_telemetry(stub, "!11223344", None, "x") is False
+    assert captured == []
+
+
+def test_telemetry_event_callbacks_ingest(monkeypatch):
+    """The three event callbacks resolve the node and queue telemetry."""
+    mc_tel, iface, stub, captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    iface.host_node_id = "!deadbeef"
+    handlers_map = mc_tel._make_telemetry_handlers(iface, stub)
+
+    asyncio.run(
+        handlers_map["TELEMETRY_RESPONSE"](
+            _FakeEvt(
+                {
+                    "pubkey_pre": _TEST_CONTACT_KEY[:12],
+                    "lpp": [{"type": "temperature", "value": 21.5}],
+                }
+            )
+        )
+    )
+    asyncio.run(
+        handlers_map["STATUS_RESPONSE"](
+            _FakeEvt({"pubkey_pre": _TEST_CONTACT_KEY[:12], "bat": 4056})
+        )
+    )
+    asyncio.run(handlers_map["BATTERY"](_FakeEvt({"level": 3900})))
+    asyncio.run(handlers_map["BATTERY"](_FakeEvt({})))  # no gauge → skipped
+
+    assert len(captured) == 3
+    assert captured[0]["decoded"]["telemetry"]["environmentMetrics"] == {
+        "temperature": 21.5
+    }
+    assert captured[1]["decoded"]["telemetry"]["deviceMetrics"] == {"voltage": 4.056}
+    assert captured[2]["from_id"] == "!deadbeef"
+    assert captured[2]["decoded"]["telemetry"]["deviceMetrics"] == {"voltage": 3.9}
+
+
+def test_next_poll_contact_round_robin_with_cooldown(monkeypatch):
+    """Contact polling walks the roster in stable order, then idles until a
+    contact's 24 h cooldown expires instead of wrapping immediately."""
+    second_key = "bbccddeeff00" + "11" * 26
+    mc_tel, iface, _stub, _captured = _telemetry_env(
+        monkeypatch,
+        contacts=[
+            {"public_key": _TEST_CONTACT_KEY, "adv_name": "A"},
+            {"public_key": second_key, "adv_name": "B"},
+        ],
+    )
+    state: dict = {}
+    first = mc_tel._next_poll_contact(iface, state)
+    second = mc_tel._next_poll_contact(iface, state)
+    assert [first["public_key"], second["public_key"]] == [
+        _TEST_CONTACT_KEY,
+        second_key,
+    ]
+    # Both contacts were just stamped — the roster is fully fresh, so the
+    # tick has nothing to send.
+    assert mc_tel._next_poll_contact(iface, state) is None
+
+    # Aging one contact past the cooldown makes it eligible again.
+    state["last_polled"][second_key] -= mc_tel._TELEMETRY_NODE_COOLDOWN_SECONDS + 1
+    assert mc_tel._next_poll_contact(iface, state)["public_key"] == second_key
+
+    empty = _MeshcoreInterface(target=None)
+    assert mc_tel._next_poll_contact(empty, {}) is None
+
+
+def test_next_poll_contact_prunes_departed_roster_entries(monkeypatch):
+    """Cooldown stamps for contacts no longer in the roster are dropped."""
+    mc_tel, iface, _stub, _captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "A"}]
+    )
+    state = {"last_polled": {"departed" + "00" * 26: 123.0}}
+    picked = mc_tel._next_poll_contact(iface, state)
+    assert picked["public_key"] == _TEST_CONTACT_KEY
+    assert set(state["last_polled"]) == {_TEST_CONTACT_KEY}
+
+
+def test_poll_contact_telemetry_honours_cooldown_across_ticks(monkeypatch):
+    """With shared state, a second tick inside the cooldown sends nothing."""
+    import types
+
+    mc_tel, iface, stub, captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    requests = {"count": 0}
+
+    class _Commands:
+        async def req_telemetry_sync(self, contact):
+            requests["count"] += 1
+            return [{"type": "temperature", "value": 21.5}]
+
+        async def req_status_sync(self, contact):
+            return None
+
+    mc = types.SimpleNamespace(commands=_Commands())
+    state: dict = {}
+    asyncio.run(mc_tel._poll_contact_telemetry(mc, iface, stub, state))
+    asyncio.run(mc_tel._poll_contact_telemetry(mc, iface, stub, state))
+    assert requests["count"] == 1
+    assert len(captured) == 1
+
+
+def test_poll_self_telemetry_ingests_and_swallows_errors(monkeypatch):
+    """Self polling queues battery + sensor packets; command errors are logged."""
+    import types
+
+    mc_tel, iface, stub, captured = _telemetry_env(monkeypatch)
+    iface.host_node_id = "!deadbeef"
+
+    class _Commands:
+        async def get_bat(self):
+            return types.SimpleNamespace(payload={"level": 4100})
+
+        async def get_self_telemetry(self):
+            return types.SimpleNamespace(
+                payload={"lpp": [{"type": "temperature", "value": 22.0}]}
+            )
+
+    mc = types.SimpleNamespace(commands=_Commands())
+    asyncio.run(mc_tel._poll_self_telemetry(mc, iface, stub))
+    assert len(captured) == 2
+
+    class _BrokenCommands:
+        async def get_bat(self):
+            raise RuntimeError("no battery command")
+
+        async def get_self_telemetry(self):
+            raise RuntimeError("no telemetry command")
+
+    captured.clear()
+    asyncio.run(
+        mc_tel._poll_self_telemetry(
+            types.SimpleNamespace(commands=_BrokenCommands()), iface, stub
+        )
+    )
+    assert captured == []
+
+
+def test_poll_contact_telemetry_paths(monkeypatch):
+    """Contact polling ingests LPP, falls back to status, and survives errors."""
+    import types
+
+    mc_tel, iface, stub, captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+
+    def _mc(
+        telemetry_result=None,
+        telemetry_error=None,
+        status_result=None,
+        status_error=None,
+    ):
+        class _Commands:
+            async def req_telemetry_sync(self, contact):
+                if telemetry_error:
+                    raise telemetry_error
+                return telemetry_result
+
+            async def req_status_sync(self, contact):
+                if status_error:
+                    raise status_error
+                return status_result
+
+        return types.SimpleNamespace(commands=_Commands())
+
+    # LPP success → one packet, no status fallback needed.
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            _mc(telemetry_result=[{"type": "temperature", "value": 21.5}]),
+            iface,
+            stub,
+            {},
+        )
+    )
+    assert len(captured) == 1
+
+    # Empty LPP → status fallback ingests battery.
+    captured.clear()
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            _mc(telemetry_result=None, status_result={"bat": 4056}), iface, stub, {}
+        )
+    )
+    assert len(captured) == 1
+    assert captured[0]["decoded"]["telemetry"]["deviceMetrics"]["voltage"] == 4.056
+
+    # Telemetry request error → logged, no status attempt, nothing queued.
+    captured.clear()
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            _mc(telemetry_error=RuntimeError("timeout")), iface, stub, {}
+        )
+    )
+    assert captured == []
+
+    # Status fallback error → logged, nothing queued.
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            _mc(status_error=RuntimeError("timeout")), iface, stub, {}
+        )
+    )
+    assert captured == []
+
+    # Empty roster → no-op.
+    empty = _MeshcoreInterface(target=None)
+    asyncio.run(mc_tel._poll_contact_telemetry(_mc(), empty, stub, {}))
+    assert captured == []
+
+    # A roster entry whose public key is too short to derive a node id is
+    # skipped before any on-air request.
+    unresolvable = _MeshcoreInterface(target=None)
+    unresolvable._update_contact({"public_key": "abcd", "adv_name": "Ghost"})
+    asyncio.run(mc_tel._poll_contact_telemetry(_mc(), unresolvable, stub, {}))
+    assert captured == []
+
+
+def test_poll_contact_telemetry_counts_tx(monkeypatch):
+    """Each on-air poll request counts as a transmission (SPEC MA1).
+
+    The stubbed handlers' ``_mark_packet_seen`` is a no-op, so the merged
+    activity counter moves only via the ``activity.record_tx()`` calls inside
+    ``_poll_contact_telemetry`` — one per on-air request. This pins the exact
+    TX count for the telemetry pull, the status fallback, an error path, and
+    the no-contact short-circuit.
+    """
+    import types
+
+    import data.mesh_ingestor.activity as activity
+
+    mc_tel, iface, stub, _captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+
+    def _mc(
+        telemetry_result=None,
+        telemetry_error=None,
+        status_result=None,
+        status_error=None,
+    ):
+        class _Commands:
+            async def req_telemetry_sync(self, contact):
+                if telemetry_error:
+                    raise telemetry_error
+                return telemetry_result
+
+            async def req_status_sync(self, contact):
+                if status_error:
+                    raise status_error
+                return status_result
+
+        return types.SimpleNamespace(commands=_Commands())
+
+    # LPP success → exactly one on-air request (telemetry pull), no fallback.
+    activity.take_packet_count()  # drain any activity from earlier tests
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            _mc(telemetry_result=[{"type": "temperature", "value": 21.5}]),
+            iface,
+            stub,
+            {},
+        )
+    )
+    assert activity.take_packet_count() == 1
+
+    # Empty telemetry → status fallback: two on-air requests counted.
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            _mc(telemetry_result=None, status_result={"bat": 4056}), iface, stub, {}
+        )
+    )
+    assert activity.take_packet_count() == 2
+
+    # Telemetry request raises → the attempt is still counted (one TX), no fallback.
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            _mc(telemetry_error=RuntimeError("timeout")), iface, stub, {}
+        )
+    )
+    assert activity.take_packet_count() == 1
+
+    # No resolvable contact → returns before any request → nothing counted.
+    empty = _MeshcoreInterface(target=None)
+    asyncio.run(mc_tel._poll_contact_telemetry(_mc(), empty, stub, {}))
+    assert activity.take_packet_count() == 0
+
+
+def test_poll_contact_telemetry_logs_initiation_and_empty_result(monkeypatch):
+    """Each poll logs initiation; an all-empty poll also logs 'returned no data'.
+
+    ``req_telemetry_sync``/``req_status_sync`` return ``None`` on timeout without
+    raising, so these two ``meshcore.telemetry.poll`` debug lines are the only
+    signal separating an unanswered on-air poll from a disabled poll loop.
+    """
+    import types
+
+    mc_tel, iface, stub, captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    logs: list = []
+    monkeypatch.setattr(
+        mc_tel.config,
+        "_debug_log",
+        lambda message, **meta: logs.append((message, meta)),
+    )
+
+    class _Silent:
+        async def req_telemetry_sync(self, contact):
+            return None
+
+        async def req_status_sync(self, contact):
+            return None
+
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            types.SimpleNamespace(commands=_Silent()), iface, stub, {}
+        )
+    )
+
+    assert captured == []
+    node_id = iface.lookup_node_id(_TEST_CONTACT_KEY[:12])
+    assert [message for message, _meta in logs] == [
+        "MeshCore contact telemetry poll initiated",
+        "MeshCore contact telemetry poll returned no data",
+    ]
+    assert all(meta["context"] == "meshcore.telemetry.poll" for _msg, meta in logs)
+    assert all(meta["node_id"] == node_id for _msg, meta in logs)
+
+
+def test_telemetry_poll_loop_disabled_and_ticking(monkeypatch):
+    """The poll loop exits when disabled and fires both poll kinds when enabled."""
+    import types
+
+    mc_tel, iface, stub, captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    iface.host_node_id = "!deadbeef"
+    import data.mesh_ingestor as _mesh_pkg
+
+    monkeypatch.setattr(_mesh_pkg, "handlers", stub)
+
+    # Both cadences disabled → the loop returns immediately.
+    monkeypatch.setattr(mc_tel.config, "MESHCORE_SELF_TELEMETRY_SECONDS", 0)
+    monkeypatch.setattr(mc_tel.config, "MESHCORE_TELEMETRY_POLL_SECONDS", 0)
+    asyncio.run(mc_tel._telemetry_poll_loop(types.SimpleNamespace(), iface))
+
+    # Enabled: run the loop as a task, let the immediate self tick and the
+    # (shortened) contact tick fire, then cancel.
+    calls = {"self": 0, "contact": 0}
+
+    class _Commands:
+        async def get_bat(self):
+            calls["self"] += 1
+            return types.SimpleNamespace(payload={"level": 4100})
+
+        async def get_self_telemetry(self):
+            return types.SimpleNamespace(payload={"lpp": []})
+
+        async def req_telemetry_sync(self, contact):
+            calls["contact"] += 1
+            return [{"type": "temperature", "value": 21.5}]
+
+        async def req_status_sync(self, contact):
+            return None
+
+    monkeypatch.setattr(mc_tel.config, "MESHCORE_SELF_TELEMETRY_SECONDS", 3600)
+    monkeypatch.setattr(mc_tel.config, "MESHCORE_TELEMETRY_POLL_SECONDS", 1)
+
+    async def _drive():
+        task = asyncio.create_task(
+            mc_tel._telemetry_poll_loop(
+                types.SimpleNamespace(commands=_Commands()), iface
+            )
+        )
+        await asyncio.sleep(1.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_drive())
+    assert calls["self"] == 1  # immediate first self tick
+    assert calls["contact"] >= 1  # first on-air poll after one interval
+
+
+def test_telemetry_poll_loop_rx_only_disables_on_air_polls(monkeypatch):
+    """RX_ONLY forbids ingestor TX: contact polls stop, local self reads stay."""
+    import types
+
+    mc_tel, iface, stub, _captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    iface.host_node_id = "!deadbeef"
+    import data.mesh_ingestor as _mesh_pkg
+
+    monkeypatch.setattr(_mesh_pkg, "handlers", stub)
+    monkeypatch.setattr(mc_tel.config, "RX_ONLY", True)
+
+    calls = {"self": 0, "contact": 0}
+
+    class _Commands:
+        async def get_bat(self):
+            calls["self"] += 1
+            return types.SimpleNamespace(payload={"level": 4100})
+
+        async def get_self_telemetry(self):
+            return types.SimpleNamespace(payload={"lpp": []})
+
+        async def req_telemetry_sync(self, contact):
+            calls["contact"] += 1
+            return None
+
+        async def req_status_sync(self, contact):
+            return None
+
+    monkeypatch.setattr(mc_tel.config, "MESHCORE_SELF_TELEMETRY_SECONDS", 3600)
+    monkeypatch.setattr(mc_tel.config, "MESHCORE_TELEMETRY_POLL_SECONDS", 1)
+
+    async def _drive():
+        task = asyncio.create_task(
+            mc_tel._telemetry_poll_loop(
+                types.SimpleNamespace(commands=_Commands()), iface
+            )
+        )
+        await asyncio.sleep(1.3)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_drive())
+    assert calls["self"] == 1  # companion-link reads are not transmissions
+    assert calls["contact"] == 0  # no on-air request under RX_ONLY
+
+    # RX_ONLY with self polling also disabled → the loop exits immediately.
+    monkeypatch.setattr(mc_tel.config, "MESHCORE_SELF_TELEMETRY_SECONDS", 0)
+    asyncio.run(mc_tel._telemetry_poll_loop(types.SimpleNamespace(), iface))
 
 
 def test_on_channel_msg_queues_packet(monkeypatch):
@@ -1716,6 +2451,563 @@ def test_on_contact_msg_queues_packet_with_from_id(monkeypatch):
     assert pkt["id"] == _derive_message_id(
         "aabbccddee11", 1_758_000_001, "dm", "direct message"
     )
+
+
+def test_normalize_hops_maps_path_len_to_hops_travelled():
+    """_normalize_hops passes counts through, maps the 255 sentinel to 0, and
+    rejects absent/unparseable/negative values (SPEC RF1)."""
+    assert _normalize_hops(None) is None
+    assert _normalize_hops(0) == 0
+    assert _normalize_hops(3) == 3
+    assert _normalize_hops("2") == 2
+    assert _normalize_hops(255) == 0
+    assert _normalize_hops("bogus") is None
+    assert _normalize_hops(-1) is None
+
+
+def test_on_channel_msg_includes_hops_from_path_len(monkeypatch):
+    """A channel message with path_len carries the hop count on the packet."""
+    import asyncio
+
+    captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    asyncio.run(
+        hmap["CHANNEL_MSG_RECV"](
+            _FakeEvt(
+                {
+                    "sender_timestamp": 1_758_000_010,
+                    "text": "routed message",
+                    "channel_idx": 1,
+                    "path_len": 3,
+                }
+            )
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["hops"] == 3
+
+
+def test_on_channel_msg_direct_sentinel_yields_zero_hops(monkeypatch):
+    """The 255 'direct' path_len sentinel normalizes to hops == 0."""
+    import asyncio
+
+    captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    asyncio.run(
+        hmap["CHANNEL_MSG_RECV"](
+            _FakeEvt(
+                {
+                    "sender_timestamp": 1_758_000_011,
+                    "text": "direct channel message",
+                    "channel_idx": 0,
+                    "path_len": 255,
+                }
+            )
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["hops"] == 0
+
+
+def test_on_channel_msg_hops_none_when_path_len_absent(monkeypatch):
+    """A payload without path_len (older firmware) leaves hops unset."""
+    import asyncio
+
+    captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    asyncio.run(
+        hmap["CHANNEL_MSG_RECV"](
+            _FakeEvt(
+                {
+                    "sender_timestamp": 1_758_000_012,
+                    "text": "legacy message",
+                    "channel_idx": 0,
+                }
+            )
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["hops"] is None
+
+
+def test_on_contact_msg_includes_hops_from_path_len(monkeypatch):
+    """Direct messages carry the normalized hop count too (native field, RF1)."""
+    import asyncio
+    import data.mesh_ingestor as _mesh_pkg
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    captured: list = []
+    stub = _make_stub_handlers_module()
+    stub.store_packet_dict = lambda pkt: captured.append(pkt)
+    monkeypatch.setattr(_mod.config, "_debug_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(_mesh_pkg, "handlers", stub)
+
+    iface = _MeshcoreInterface(target=None)
+    iface.host_node_id = "!deadbeef"
+
+    hmap = _make_event_handlers(iface, "/dev/ttyUSB0")
+    asyncio.run(
+        hmap["CONTACT_MSG_RECV"](
+            _FakeEvt(
+                {
+                    "sender_timestamp": 1_758_000_013,
+                    "text": "routed dm",
+                    "pubkey_prefix": "aabbccddee11",
+                    "path_len": 2,
+                }
+            )
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["hops"] == 2
+
+
+def test_normalize_path_values():
+    """_normalize_path lowercases hex strings and rejects non-string/empty."""
+    assert _normalize_path("F0BF44B53377") == "f0bf44b53377"
+    assert _normalize_path("aabb") == "aabb"
+    assert _normalize_path("") is None
+    assert _normalize_path(None) is None
+    assert _normalize_path(123) is None
+
+
+def test_on_channel_msg_includes_path_from_rx_log_join(monkeypatch):
+    """A channel message with a joined RX-log path stores it lowercased."""
+    import asyncio
+
+    captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    asyncio.run(
+        hmap["CHANNEL_MSG_RECV"](
+            _FakeEvt(
+                {
+                    "sender_timestamp": 1_758_000_014,
+                    "text": "joined message",
+                    "channel_idx": 0,
+                    "path": "F0BF44B53377",
+                    "path_len": 3,
+                }
+            )
+        )
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["path"] == "f0bf44b53377"
+    assert captured[0]["hops"] == 3
+
+
+def test_on_channel_msg_path_none_on_join_miss_or_invalid(monkeypatch):
+    """A join miss (absent path) or malformed path leaves the field None."""
+    import asyncio
+
+    captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    asyncio.run(
+        hmap["CHANNEL_MSG_RECV"](
+            _FakeEvt(
+                {
+                    "sender_timestamp": 1_758_000_015,
+                    "text": "no join",
+                    "channel_idx": 0,
+                }
+            )
+        )
+    )
+    asyncio.run(
+        hmap["CHANNEL_MSG_RECV"](
+            _FakeEvt(
+                {
+                    "sender_timestamp": 1_758_000_016,
+                    "text": "bad join",
+                    "channel_idx": 0,
+                    "path": 4711,
+                }
+            )
+        )
+    )
+
+    assert len(captured) == 2
+    assert captured[0]["path"] is None
+    assert captured[1]["path"] is None
+
+
+def test_on_contact_deleted_is_debug_logged_no_op(monkeypatch):
+    """CONTACT_DELETED must log the evicted node and touch nothing else (RF5)."""
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    logs: list = []
+    monkeypatch.setattr(
+        _mod.config, "_debug_log", lambda msg, **kw: logs.append((msg, kw))
+    )
+
+    assert "CONTACT_DELETED" in hmap
+    asyncio.run(hmap["CONTACT_DELETED"](_FakeEvt({"pubkey": "aabbccdd" + "00" * 28})))
+
+    # No packet stored, no node upserted, no exception — just the debug line.
+    assert captured == []
+    assert upserted == []
+    assert any(
+        kw.get("context") == "meshcore.contact_deleted"
+        and kw.get("node_id") == "!aabbccdd"
+        for _msg, kw in logs
+    )
+
+
+def test_on_contact_deleted_tolerates_empty_payload(monkeypatch):
+    """A CONTACT_DELETED push with no payload must not raise."""
+    import asyncio
+
+    captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    asyncio.run(hmap["CONTACT_DELETED"](_FakeEvt(None)))
+
+    assert captured == []
+    assert upserted == []
+
+
+def test_rx_advert_to_node_dict_full_frame():
+    """A fully-populated RX-log ADVERT frame maps every field (RF3)."""
+    from data.mesh_ingestor.protocols.meshcore import _rx_advert_to_node_dict
+
+    pub_key = "511617e3" + "00" * 28
+    node = _rx_advert_to_node_dict(
+        {
+            "adv_key": pub_key,
+            "adv_name": "BER Drachentoeter",
+            "adv_type": 2,
+            "adv_lat": 52.516274,
+            "adv_lon": 13.405612,
+            "recv_time": 1_758_000_020,
+            "snr": 12.0,
+            "rssi": -69,
+            "path_len": 2,
+        }
+    )
+
+    assert node["lastHeard"] == 1_758_000_020
+    assert node["protocol"] == "meshcore"
+    assert node["user"]["longName"] == "BER Drachentoeter"
+    assert node["user"]["publicKey"] == pub_key
+    assert node["user"]["role"] == "REPEATER"
+    assert node["snr"] == 12.0
+    assert node["rssi"] == -69
+    assert node["hopsAway"] == 2
+    assert node["position"] == {
+        "latitude": 52.516274,
+        "longitude": 13.405612,
+        "time": 1_758_000_020,
+    }
+
+
+def test_rx_advert_to_node_dict_minimal_frame():
+    """A name-less, position-less advert omits those keys instead of churning."""
+    from data.mesh_ingestor.protocols.meshcore import _rx_advert_to_node_dict
+
+    pub_key = "aabbccdd" + "00" * 28
+    node = _rx_advert_to_node_dict({"adv_key": pub_key, "path_len": 0})
+
+    assert node["user"]["publicKey"] == pub_key
+    assert "longName" not in node["user"]
+    assert "role" not in node["user"]
+    assert "position" not in node
+    assert "snr" not in node and "rssi" not in node
+    # A zero-hop (directly heard) advert still records hopsAway == 0.
+    assert node["hopsAway"] == 0
+    assert isinstance(node["lastHeard"], int)
+
+
+def test_on_rx_log_data_advert_upserts_node_and_position(monkeypatch):
+    """An RX-log ADVERT frame upserts the full node and stores its position."""
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore.handlers as _handlers_mod
+
+    captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    positions: list = []
+    monkeypatch.setattr(
+        _handlers_mod,
+        "_store_meshcore_position",
+        lambda *args: positions.append(args),
+    )
+
+    pub_key = "511617e3" + "00" * 28
+    asyncio.run(
+        hmap["RX_LOG_DATA"](
+            _FakeEvt(
+                {
+                    "payload_typename": "ADVERT",
+                    "adv_key": pub_key,
+                    "adv_name": "BER Drachentoeter",
+                    "adv_type": 2,
+                    "adv_lat": 52.516274,
+                    "adv_lon": 13.405612,
+                    "recv_time": 1_758_000_021,
+                    "snr": 11.5,
+                    "rssi": -70,
+                    "path_len": 3,
+                }
+            )
+        )
+    )
+
+    assert captured == []  # adverts never produce message packets
+    assert len(upserted) == 1
+    node_id, node = upserted[0]
+    assert node_id == "!511617e3"
+    assert node["user"]["longName"] == "BER Drachentoeter"
+    assert node["snr"] == 11.5 and node["rssi"] == -70 and node["hopsAway"] == 3
+    assert len(positions) == 1
+    assert positions[0][0] == "!511617e3"
+    assert positions[0][1] == 52.516274 and positions[0][2] == 13.405612
+
+
+def test_on_rx_log_data_advert_position_rx_time_is_now(monkeypatch):
+    """An on-air RX-log ADVERT is a live reception: its position POST keeps
+    rx_time = now (so last_heard advances), while position_time stays the
+    sender-side adv_timestamp (MR5).  The #853 roster fix must not touch it."""
+    import asyncio
+    import time as _time
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    _captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append((route, payload)),
+    )
+
+    before = int(_time.time())
+    asyncio.run(
+        hmap["RX_LOG_DATA"](
+            _FakeEvt(
+                {
+                    "payload_typename": "ADVERT",
+                    "adv_key": "511617e3" + "00" * 28,
+                    "adv_name": "BER Drachentoeter",
+                    "adv_type": 2,
+                    "adv_lat": 52.516274,
+                    "adv_lon": 13.405612,
+                    "adv_timestamp": 1_758_000_000,
+                    "recv_time": 1_758_000_021,
+                }
+            )
+        )
+    )
+    after = int(_time.time())
+
+    pos = [p for r, p in posted if r == "/api/positions"][0]
+    assert before <= pos["rx_time"] <= after  # live reception → now
+    assert pos["position_time"] == 1_758_000_000  # sender-side anchor (MR5)
+
+
+def test_on_rx_log_data_advert_without_position_skips_position_store(monkeypatch):
+    """No adv_lat/adv_lon on the advert -> node upsert only, no position POST."""
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore.handlers as _handlers_mod
+
+    _captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    positions: list = []
+    monkeypatch.setattr(
+        _handlers_mod,
+        "_store_meshcore_position",
+        lambda *args: positions.append(args),
+    )
+
+    asyncio.run(
+        hmap["RX_LOG_DATA"](
+            _FakeEvt(
+                {
+                    "payload_typename": "ADVERT",
+                    "adv_key": "aabbccdd" + "00" * 28,
+                    "snr": 4.0,
+                }
+            )
+        )
+    )
+
+    assert len(upserted) == 1
+    assert positions == []
+
+
+def test_on_rx_log_data_non_advert_routes_to_debug_capture(monkeypatch):
+    """Non-ADVERT RF frames go to the DEBUG-only capture, never upsert (RF3)."""
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    recorded: list = []
+    monkeypatch.setattr(
+        _mod,
+        "_record_meshcore_message",
+        lambda message, *, source: recorded.append((message, source)),
+    )
+
+    asyncio.run(
+        hmap["RX_LOG_DATA"](
+            _FakeEvt({"payload_typename": "GRP_TXT", "snr": 1.0, "rssi": -90})
+        )
+    )
+
+    assert captured == [] and upserted == []
+    assert len(recorded) == 1
+    message, source = recorded[0]
+    assert message["payload_typename"] == "GRP_TXT"
+    assert source.endswith(":RX_LOG_DATA")
+
+
+def test_on_rx_log_data_non_advert_counts_frame(monkeypatch):
+    """Every non-ADVERT RX-log frame counts toward the merged activity total.
+
+    SPEC MA1 / Model A: the RX-log stream is MeshCore's complete per-frame
+    ground truth of received RF traffic, so a frame type that is only
+    DEBUG-captured and never stored (e.g. ``GRP_TXT``, ``REQ``, ``ACK``) must
+    still increment the packet counter — counting precedes the DEBUG-capture
+    drop.  This exercises the *real* handlers module (not the stub) so the
+    genuine :mod:`data.mesh_ingestor.activity` counter moves.
+    """
+    import asyncio
+
+    import data.mesh_ingestor.activity as activity
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    monkeypatch.setattr(_mod.config, "_debug_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(_mod, "_record_meshcore_message", lambda *_a, **_k: None)
+
+    hmap = _make_event_handlers(_MeshcoreInterface(target=None), "/dev/ttyUSB0")
+    activity.take_packet_count()  # drain any activity from earlier tests
+    asyncio.run(hmap["RX_LOG_DATA"](_FakeEvt({"payload_typename": "GRP_TXT"})))
+    assert activity.take_packet_count() == 1
+
+
+def test_on_rx_log_data_malformed_advert_tolerated(monkeypatch):
+    """A short/absent adv_key is skipped without raising (RF3)."""
+    import asyncio
+
+    captured, upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+
+    asyncio.run(
+        hmap["RX_LOG_DATA"](_FakeEvt({"payload_typename": "ADVERT", "adv_key": "ab"}))
+    )
+    asyncio.run(hmap["RX_LOG_DATA"](_FakeEvt({"payload_typename": "ADVERT"})))
+
+    assert captured == [] and upserted == []
+
+
+# ---------------------------------------------------------------------------
+# RX-log advert position dedup — MeshCore duplicate reconciliation (MR-A3)
+# ---------------------------------------------------------------------------
+
+
+def _rx_advert_frame(**overrides):
+    """Build a full RX-log ADVERT frame with sender-side ``adv_timestamp``."""
+    frame = {
+        "payload_typename": "ADVERT",
+        "adv_key": "ae46e493" + "00" * 28,
+        "adv_name": "Flood Node",
+        "adv_type": 1,
+        "adv_lat": 52.498481,
+        "adv_lon": 13.475442,
+        "adv_timestamp": 1_784_803_284,
+        "recv_time": 1_784_803_284,
+        "snr": -11.5,
+        "rssi": -124,
+        "path_len": 5,
+    }
+    frame.update(overrides)
+    return frame
+
+
+def test_on_rx_log_data_advert_position_time_uses_sender_adv_timestamp(monkeypatch):
+    """The position store must be keyed on the advert's sender-side timestamp.
+
+    Every flood copy of one advert carries the same ``adv_timestamp`` but its
+    own receiver-side ``recv_time``; keying the position on ``recv_time`` mints
+    one row per copy (and per ingestor) instead of deduplicating (MR-A3).
+    """
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore.handlers as _handlers_mod
+
+    _captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    positions: list = []
+    monkeypatch.setattr(
+        _handlers_mod,
+        "_store_meshcore_position",
+        lambda *args: positions.append(args),
+    )
+
+    for offset in (0, 3, 5, 17):
+        asyncio.run(
+            hmap["RX_LOG_DATA"](
+                _FakeEvt(_rx_advert_frame(recv_time=1_784_803_284 + offset))
+            )
+        )
+
+    assert len(positions) == 4
+    # Third positional argument is position_time: identical sender-side
+    # adv_timestamp for every copy, never the per-copy recv_time.
+    assert [args[3] for args in positions] == [1_784_803_284] * 4
+
+
+def test_on_rx_log_data_advert_flood_copies_collapse_to_one_position_id(monkeypatch):
+    """Four flood copies of one advert must queue a single position identity."""
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    _captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append((route, payload)),
+    )
+
+    for offset in (0, 3, 5, 17):
+        asyncio.run(
+            hmap["RX_LOG_DATA"](
+                _FakeEvt(_rx_advert_frame(recv_time=1_784_803_284 + offset))
+            )
+        )
+
+    position_ids = {p["id"] for route, p in posted if route == "/api/positions"}
+    assert len(position_ids) == 1
+
+
+def test_on_rx_log_data_advert_position_falls_back_to_recv_time(monkeypatch):
+    """Absent or zero ``adv_timestamp`` degrades to the receiver-side time."""
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore.handlers as _handlers_mod
+
+    _captured, _upserted, _iface, hmap = _setup_channel_msg_handlers(monkeypatch)
+    positions: list = []
+    monkeypatch.setattr(
+        _handlers_mod,
+        "_store_meshcore_position",
+        lambda *args: positions.append(args),
+    )
+
+    frame = _rx_advert_frame(recv_time=1_784_803_300)
+    del frame["adv_timestamp"]
+    asyncio.run(hmap["RX_LOG_DATA"](_FakeEvt(frame)))
+    asyncio.run(
+        hmap["RX_LOG_DATA"](
+            _FakeEvt(_rx_advert_frame(adv_timestamp=0, recv_time=1_784_803_301))
+        )
+    )
+
+    assert [args[3] for args in positions] == [1_784_803_300, 1_784_803_301]
+
+
+def test_rx_advert_to_node_dict_position_time_uses_adv_timestamp():
+    """The node-row position anchor is the advert's own timestamp, while
+    ``lastHeard`` stays the receiver-side reception time."""
+    from data.mesh_ingestor.protocols.meshcore import _rx_advert_to_node_dict
+
+    node = _rx_advert_to_node_dict(
+        _rx_advert_frame(adv_timestamp=1_784_803_284, recv_time=1_784_803_301)
+    )
+
+    assert node["lastHeard"] == 1_784_803_301
+    assert node["position"]["time"] == 1_784_803_284
 
 
 def test_on_channel_msg_id_identical_across_ingestors_with_different_rosters(
@@ -2231,6 +3523,43 @@ def test_process_self_info_queues_position_when_advertised(monkeypatch):
     assert position_posts[0]["ingestor"] == "!ingestor1"
 
 
+def test_process_self_info_position_rx_time_is_now(monkeypatch):
+    """The host's own SELF_INFO position is a live reading, so its rx_time stays
+    the wall clock — the #853 roster fix is scoped to peer contacts, not self."""
+    import time as _time
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    monkeypatch.setattr(_mod.config, "_debug_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        _mod._ingestors, "queue_ingestor_heartbeat", lambda *_a, **_k: True
+    )
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append((route, payload)),
+    )
+
+    stub = _make_stub_handlers_module()
+    stub.host_node_id = lambda: "!ingestor1"
+
+    before = int(_time.time())
+    _process_self_info(
+        {
+            "public_key": "aabbccdd" + "00" * 28,
+            "name": "Host",
+            "adv_lat": 51.5,
+            "adv_lon": -0.1,
+        },
+        _MeshcoreInterface(target=None),
+        stub,
+    )
+    after = int(_time.time())
+
+    pos = [p for r, p in posted if r == "/api/positions"][0]
+    assert before <= pos["rx_time"] <= after
+
+
 def test_process_self_info_skips_position_when_latlon_absent(monkeypatch):
     """_process_self_info must not POST to /api/positions when lat/lon are absent."""
     import data.mesh_ingestor.protocols.meshcore as _mod
@@ -2508,15 +3837,23 @@ def test_process_contacts_skips_short_keys():
     assert upserted == []
 
 
-def test_process_contacts_marks_packet_seen():
-    """_process_contacts must always call _mark_packet_seen."""
-    seen: list = []
+def test_process_contacts_marks_packet_activity():
+    """_process_contacts advances the reconnect clock but does not count.
+
+    A bulk ``CONTACTS`` roster fetch is a companion-link read, not over-air
+    traffic, so under Model A it calls :func:`_mark_packet_activity` (clock
+    only) and never :func:`_mark_packet_seen` (which would count it).
+    """
+    activity_seen: list = []
+    counted: list = []
     stub = _make_stub_handlers_module()
-    stub._mark_packet_seen = lambda: seen.append(True)
+    stub._mark_packet_activity = lambda: activity_seen.append(True)
+    stub._mark_packet_seen = lambda: counted.append(True)
 
     _process_contacts({}, _MeshcoreInterface(target=None), stub)
 
-    assert seen == [True]
+    assert activity_seen == [True]
+    assert counted == []
 
 
 def test_process_contacts_queues_position_for_contacts_with_latlon(monkeypatch):
@@ -2611,6 +3948,44 @@ def test_process_contacts_only_posts_positions_for_located_contacts(monkeypatch)
     assert position_posts[0]["node_id"] == "!aabbccdd"
 
 
+def test_process_contacts_position_rx_time_uses_last_advert(monkeypatch):
+    """Bulk roster sync must stamp the position rx_time from the contact's real
+    last_advert, not the wall clock, so a long-dead contact is not warmed to
+    "now" (issue #853).  On the web side last_heard = MAX(rx_time, position_time),
+    so a now-valued rx_time silently resurrects the node."""
+    import time as _time
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append((route, payload)),
+    )
+
+    stub = _make_stub_handlers_module()
+    iface = _MeshcoreInterface(target=None)
+    old_advert = int(_time.time()) - 90 * 86_400  # 90 days dead
+    pub_key = "25ee3330" + "00" * 28
+    _process_contacts(
+        {
+            pub_key: {
+                "public_key": pub_key,
+                "adv_name": "Afri",
+                "adv_lat": 52.498207,
+                "adv_lon": 13.47964,
+                "last_advert": old_advert,
+            }
+        },
+        iface,
+        stub,
+    )
+
+    pos = [p for r, p in posted if r == "/api/positions"][0]
+    assert pos["position_time"] == old_advert
+    assert pos["rx_time"] == old_advert
+
+
 # ---------------------------------------------------------------------------
 # _process_contact_update
 # ---------------------------------------------------------------------------
@@ -2683,6 +4058,42 @@ def test_process_contact_update_queues_position_when_latlon_present(monkeypatch)
     assert position_posts[0]["node_id"] == "!aabbccdd"
     assert position_posts[0]["latitude"] == pytest.approx(52.0)
     assert position_posts[0]["position_time"] == 1700005678
+
+
+def test_process_contact_update_position_rx_time_uses_last_advert(monkeypatch):
+    """A single NEW_CONTACT / NEXT_CONTACT roster entry must stamp the position
+    rx_time from last_advert, not now (issue #853) — the per-contact roster path
+    warms last_heard the same way the bulk path does."""
+    import time as _time
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    monkeypatch.setattr(_mod.config, "_debug_log", lambda *_a, **_k: None)
+    posted: list = []
+    monkeypatch.setattr(
+        _mod._queue,
+        "_queue_post_json",
+        lambda route, payload, **_k: posted.append((route, payload)),
+    )
+
+    stub = _make_stub_handlers_module()
+    iface = _MeshcoreInterface(target=None)
+    old_advert = int(_time.time()) - 120 * 86_400
+    pub_key = "25ee3330" + "00" * 28
+    _process_contact_update(
+        {
+            "public_key": pub_key,
+            "adv_name": "Afri",
+            "adv_lat": 52.498207,
+            "adv_lon": 13.47964,
+            "last_advert": old_advert,
+        },
+        iface,
+        stub,
+    )
+
+    pos = [p for r, p in posted if r == "/api/positions"][0]
+    assert pos["position_time"] == old_advert
+    assert pos["rx_time"] == old_advert
 
 
 def test_process_contact_update_skips_position_when_no_latlon(monkeypatch):
@@ -2909,6 +4320,9 @@ def _make_fake_meshcore_mod(
     disconnect_raises: bool = False,
     connect_stall_event=None,
     on_ensure_contacts=None,
+    autoadd_config: int | None = 0x1F,
+    autoadd_get_raises: bool = False,
+    autoadd_set_error: bool = False,
 ):
     """Build a minimal fake ``meshcore`` module for testing :func:`_run_meshcore`.
 
@@ -2939,7 +4353,13 @@ def _make_fake_meshcore_mod(
             "CHANNEL_MSG_RECV",
             "CONTACT_MSG_RECV",
             "ADVERTISEMENT",
+            "CONTACT_DELETED",
+            "RX_LOG_DATA",
             "DISCONNECTED",
+            # Telemetry surfaces subscribed since TI-A3.
+            "TELEMETRY_RESPONSE",
+            "STATUS_RESPONSE",
+            "BATTERY",
             "CONNECTED",
             "ACK",
             "OK",
@@ -2953,6 +4373,11 @@ def _make_fake_meshcore_mod(
     )
 
     class _FakeCommands:
+        def __init__(self):
+            # Records every set_autoadd_config write so RF4 tests can assert
+            # the read-modify-write / skip-when-set behavior.
+            self.autoadd_set_calls: list[int] = []
+
         async def send_device_query(self):
             # Return minimal DEVICE_INFO — channel probing is not under test here.
             return types.SimpleNamespace(
@@ -2963,6 +4388,24 @@ def _make_fake_meshcore_mod(
             # Return ERROR for all channels — channel probing is not under test here.
             return types.SimpleNamespace(type=EventType.ERROR, payload={})
 
+        async def get_autoadd_config(self):
+            # ``autoadd_config=None`` simulates pre-1.16 firmware: an ERROR
+            # reply whose payload carries no ``config`` key.
+            if autoadd_get_raises:
+                raise TimeoutError("autoadd query timed out")
+            if autoadd_config is None:
+                return types.SimpleNamespace(type=EventType.ERROR, payload={})
+            return types.SimpleNamespace(
+                type=EventType.CHANNEL_INFO,  # any non-ERROR type
+                payload={"config": autoadd_config},
+            )
+
+        async def set_autoadd_config(self, flag):
+            self.autoadd_set_calls.append(flag)
+            if autoadd_set_error:
+                return types.SimpleNamespace(type=EventType.ERROR, payload={})
+            return types.SimpleNamespace(type=EventType.OK, payload={})
+
     class _FakeMeshCore:
         def __init__(self, cx):
             self._catch_all = None
@@ -2970,6 +4413,9 @@ def _make_fake_meshcore_mod(
             # Mirrors the upstream property the runner flips on to keep the
             # contact roster live across re-adverts (meshcore adverts gap).
             self.auto_update_contacts = False
+            # Mirrors the upstream property enabling the RX-log⇆message join
+            # (SPEC RF2); the runner must flip it on before connecting.
+            self.decrypt_channels = False
             # Records every non-catch-all subscription so tests can assert the
             # runner wires the ADVERTISEMENT handler.
             self.subscribed_events = []
@@ -3503,7 +4949,9 @@ def test_on_advertisement_ignores_unmappable_pubkey(monkeypatch):
 
 
 def test_run_meshcore_enables_auto_update_and_subscribes_advert(monkeypatch):
-    """_run_meshcore must enable contact auto-update and subscribe the advert handler."""
+    """_run_meshcore must enable contact auto-update, enable the RX-log join
+    (decrypt_channels, RF2), and subscribe the advert + contact-deleted
+    handlers."""
     import asyncio
     import data.mesh_ingestor.protocols.meshcore as _mod
 
@@ -3518,4 +4966,217 @@ def test_run_meshcore_enables_auto_update_and_subscribes_advert(monkeypatch):
 
     assert error_holder[0] is None
     assert iface._mc.auto_update_contacts is True
+    assert iface._mc.decrypt_channels is True
     assert fake_mod.EventType.ADVERTISEMENT in iface._mc.subscribed_events
+    assert fake_mod.EventType.CONTACT_DELETED in iface._mc.subscribed_events
+    assert fake_mod.EventType.RX_LOG_DATA in iface._mc.subscribed_events
+
+
+def _run_meshcore_with_autoadd(monkeypatch, **factory_kwargs):
+    """Drive ``_run_meshcore`` with a fake lib and return ``(iface, error_holder, logs)``.
+
+    Shared harness for the RF4 roster-eviction assertion tests: captures
+    ``config._debug_log`` calls so tests can assert the warning/info paths.
+    """
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    logs: list = []
+    monkeypatch.setattr(
+        _mod.config, "_debug_log", lambda msg, **kw: logs.append((msg, kw))
+    )
+    fake_mod = _make_fake_meshcore_mod(**factory_kwargs)
+    _patch_meshcore_mod(monkeypatch, _mod, fake_mod)
+
+    iface = _MeshcoreInterface(target=None)
+    connected, error_holder = asyncio.run(
+        _run_until_connected(iface, "/dev/ttyUSB0", fake_mod, _mod)
+    )
+    assert connected.is_set()
+    return iface, error_holder, logs
+
+
+def test_run_meshcore_asserts_eviction_bit_when_unset(monkeypatch):
+    """Bit 0x01 unset -> exactly one read-modify-write set preserving bits 1-4."""
+    iface, error_holder, logs = _run_meshcore_with_autoadd(
+        monkeypatch, autoadd_config=0x1E
+    )
+
+    assert error_holder[0] is None
+    assert iface._mc.commands.autoadd_set_calls == [0x1F]
+    assert any(
+        kw.get("context") == "meshcore.autoadd" and kw.get("autoadd_config") == 0x1F
+        for _msg, kw in logs
+    )
+
+
+def test_run_meshcore_skips_autoadd_write_when_bit_already_set(monkeypatch):
+    """Bit 0x01 already set -> no set call (no savePrefs flash write)."""
+    iface, error_holder, _logs = _run_meshcore_with_autoadd(
+        monkeypatch, autoadd_config=0x1F
+    )
+
+    assert error_holder[0] is None
+    assert iface._mc.commands.autoadd_set_calls == []
+
+
+def test_run_meshcore_autoadd_unsupported_firmware_continues(monkeypatch):
+    """Pre-1.16 firmware (ERROR reply, no config) -> warning, startup continues."""
+    iface, error_holder, logs = _run_meshcore_with_autoadd(
+        monkeypatch, autoadd_config=None
+    )
+
+    assert error_holder[0] is None
+    assert iface._mc.commands.autoadd_set_calls == []
+    assert any(
+        kw.get("context") == "meshcore.autoadd" and kw.get("severity") == "warning"
+        for _msg, kw in logs
+    )
+
+
+def test_run_meshcore_autoadd_query_timeout_continues(monkeypatch):
+    """A raising/timing-out query is swallowed with a warning; startup continues."""
+    iface, error_holder, logs = _run_meshcore_with_autoadd(
+        monkeypatch, autoadd_get_raises=True
+    )
+
+    assert error_holder[0] is None
+    assert iface._mc.commands.autoadd_set_calls == []
+    assert any(
+        kw.get("context") == "meshcore.autoadd"
+        and kw.get("severity") == "warning"
+        and "timed out" in str(kw.get("error", ""))
+        for _msg, kw in logs
+    )
+
+
+def test_run_meshcore_autoadd_set_rejected_logs_warning(monkeypatch):
+    """An ERROR reply to the set is logged as a warning; startup continues."""
+    iface, error_holder, logs = _run_meshcore_with_autoadd(
+        monkeypatch, autoadd_config=0x00, autoadd_set_error=True
+    )
+
+    assert error_holder[0] is None
+    assert iface._mc.commands.autoadd_set_calls == [0x01]
+    assert any(
+        kw.get("context") == "meshcore.autoadd"
+        and kw.get("severity") == "warning"
+        and kw.get("autoadd_config") == 0x01
+        for _msg, kw in logs
+    )
+
+
+# ---------------------------------------------------------------------------
+# send_channel_announcement (SPEC MA6/MA9): optional duck-typed provider TX
+# ---------------------------------------------------------------------------
+
+
+def test_send_channel_announcement_meshtastic_sends_and_counts():
+    """Meshtastic sends on CHANNEL_INDEX and counts the transmission (MA1)."""
+    import data.mesh_ingestor.activity as activity
+    import data.mesh_ingestor.config as config
+
+    calls = []
+
+    class _Iface:
+        def sendText(self, text, channelIndex=0):
+            calls.append((text, channelIndex))
+
+    activity.take_packet_count()  # drain
+    MeshtasticProvider().send_channel_announcement(_Iface(), "hello mesh")
+    assert calls == [("hello mesh", config.CHANNEL_INDEX)]
+    assert activity.take_packet_count() == 1
+
+
+def test_send_channel_announcement_meshtastic_noop_without_sendtext():
+    """An interface lacking sendText is a no-op that counts no TX."""
+    import data.mesh_ingestor.activity as activity
+
+    activity.take_packet_count()
+    MeshtasticProvider().send_channel_announcement(object(), "hi")
+    assert activity.take_packet_count() == 0
+
+
+def test_send_channel_announcement_meshcore_sends_and_counts():
+    """MeshCore schedules send_chan_msg on its loop and counts the TX (MA1)."""
+    import asyncio as _asyncio
+    import threading as _threading
+    import types as _types
+    import data.mesh_ingestor.activity as activity
+    import data.mesh_ingestor.config as config
+
+    iface = _MeshcoreInterface(target=None)
+    sent = []
+
+    class _Commands:
+        async def send_chan_msg(self, chan, msg, timestamp=None):
+            sent.append((chan, msg))
+            return _types.SimpleNamespace()
+
+    iface._mc = _types.SimpleNamespace(commands=_Commands())
+
+    loop = _asyncio.new_event_loop()
+    thread = _threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    iface._loop = loop
+    try:
+        activity.take_packet_count()  # drain
+        MeshcoreProvider().send_channel_announcement(iface, "hello mesh")
+        assert sent == [(config.CHANNEL_INDEX, "hello mesh")]
+        assert activity.take_packet_count() == 1
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+        loop.close()
+
+
+def test_send_channel_announcement_meshcore_noop_guards():
+    """No-op (no TX) for a wrong iface type or a missing/closed loop or handle."""
+    import asyncio as _asyncio
+    import types as _types
+    import data.mesh_ingestor.activity as activity
+
+    provider = MeshcoreProvider()
+    activity.take_packet_count()  # drain
+
+    # Wrong interface type.
+    provider.send_channel_announcement(object(), "x")
+    # Missing mc / loop (fresh interface).
+    provider.send_channel_announcement(_MeshcoreInterface(target=None), "x")
+    # Closed loop.
+    closed = _MeshcoreInterface(target=None)
+    loop = _asyncio.new_event_loop()
+    loop.close()
+    closed._mc = _types.SimpleNamespace(commands=_types.SimpleNamespace())
+    closed._loop = loop
+    provider.send_channel_announcement(closed, "x")
+
+    assert activity.take_packet_count() == 0
+
+
+def test_send_channel_announcement_is_optional_MeshProtocol_member():
+    """The send method is an optional duck-typed extension: both providers expose
+    it and still satisfy MeshProtocol, but it is NOT a required member — a minimal
+    conforming provider without it still passes isinstance (MA9 / A4b)."""
+    assert hasattr(MeshtasticProvider(), "send_channel_announcement")
+    assert hasattr(MeshcoreProvider(), "send_channel_announcement")
+    assert isinstance(MeshtasticProvider(), MeshProtocol)
+    assert isinstance(MeshcoreProvider(), MeshProtocol)
+
+    class _Minimal:
+        name = "minimal"
+
+        def subscribe(self):
+            return []
+
+        def connect(self, *, active_candidate):
+            return (None, None, None)
+
+        def extract_host_node_id(self, iface):
+            return None
+
+        def node_snapshot_items(self, iface):
+            return []
+
+    assert isinstance(_Minimal(), MeshProtocol)
+    assert not hasattr(_Minimal(), "send_channel_announcement")

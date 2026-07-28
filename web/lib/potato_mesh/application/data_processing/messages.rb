@@ -181,6 +181,10 @@ module PotatoMesh
         emoji = string_or_nil(message["emoji"])
         ingestor = string_or_nil(message["ingestor"])
         protocol = resolve_record_protocol(db, message, ingestor, cache: protocol_cache)
+        # RF metrics (SPEC RF1/RF2): hops actually travelled and the MeshCore
+        # hop-hash route; both additive and absent for legacy senders.
+        hops = coerce_integer(message["hops"])
+        path = string_or_nil(message["path"])
 
         row = [
           msg_id,
@@ -195,6 +199,8 @@ module PotatoMesh
           message["snr"],
           message["rssi"],
           message["hop_limit"],
+          hops,
+          path,
           lora_freq,
           modem_preset,
           channel_name,
@@ -203,6 +209,11 @@ module PotatoMesh
           ingestor,
           protocol,
         ]
+
+        # Sender id that survives collapse with any copy already stored (SPEC
+        # MR3).  Starts as this copy's own sender and is narrowed below when an
+        # existing row turns out to carry a better-evidenced identity.
+        resolved_from_id = from_id
 
         with_busy_retry do
           # Meshcore-only content-level dedup (issue #756).  The deterministic
@@ -281,8 +292,24 @@ module PotatoMesh
 
             if from_id
               should_update = existing_from_str.nil? || existing_from_str.strip.empty?
-              should_update ||= existing_from != from_id
+              if !should_update && existing_from != from_id
+                # A second copy of the same physical message disagrees about the
+                # sender.  For MeshCore that disagreement is expected (each
+                # ingestor resolves the sender against its own roster), so the
+                # better-evidenced id wins rather than the last writer (SPEC
+                # MR3).  Other protocols carry a firmware-assigned sender and
+                # keep the historical overwrite.
+                should_update = if protocol == "meshcore"
+                    meshcore_sender_supersedes?(db, existing_from, from_id)
+                  else
+                    true
+                  end
+              end
               updates["from_id"] = from_id if should_update
+              # Everything downstream (placeholder synthesis, last-heard touch)
+              # must follow the id that actually survived, so a losing copy
+              # never grants liveness to the identity it names.
+              resolved_from_id = should_update ? from_id : (string_or_nil(existing_from) || from_id)
             end
 
             if to_id
@@ -312,6 +339,8 @@ module PotatoMesh
               updates["snr"] = message["snr"] if message.key?("snr")
               updates["rssi"] = message["rssi"] if message.key?("rssi")
               updates["hop_limit"] = message["hop_limit"] if message.key?("hop_limit")
+              updates["hops"] = hops unless hops.nil?
+              updates["path"] = path if path
               updates["lora_freq"] = lora_freq unless lora_freq.nil?
               updates["modem_preset"] = modem_preset if modem_preset
               updates["channel_name"] = channel_name if channel_name
@@ -381,12 +410,12 @@ module PotatoMesh
 
             begin
               db.execute <<~SQL, row
-                           INSERT INTO messages(id,rx_time,rx_iso,from_id,to_id,channel,portnum,text,encrypted,snr,rssi,hop_limit,lora_freq,modem_preset,channel_name,reply_id,emoji,ingestor,protocol)
-                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           INSERT INTO messages(id,rx_time,rx_iso,from_id,to_id,channel,portnum,text,encrypted,snr,rssi,hop_limit,hops,path,lora_freq,modem_preset,channel_name,reply_id,emoji,ingestor,protocol)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                          SQL
             rescue SQLite3::ConstraintException
               existing_row = db.get_first_row(
-                "SELECT text, encrypted, ingestor, protocol FROM messages WHERE id = ?",
+                "SELECT text, encrypted, ingestor, protocol, from_id FROM messages WHERE id = ?",
                 [msg_id],
               )
               existing_text = existing_row.is_a?(Hash) ? existing_row["text"] : existing_row&.[](0)
@@ -403,7 +432,21 @@ module PotatoMesh
               decrypted_precedence = text && existing_encrypted_str && !existing_encrypted_str.strip.empty?
 
               fallback_updates = {}
-              fallback_updates["from_id"] = from_id if from_id
+              if from_id
+                # Same sender-resolution rule as the primary update path (SPEC
+                # MR3); this branch is the INSERT race between two ingestors
+                # posting the same message, exactly where competing sender ids
+                # meet.
+                existing_fallback_from = existing_row.is_a?(Hash) ? existing_row["from_id"] : existing_row&.[](4)
+                existing_fallback_from_str = string_or_nil(existing_fallback_from)
+                supersedes =
+                  existing_fallback_from_str.nil? ||
+                  existing_fallback_from_str == from_id ||
+                  protocol != "meshcore" ||
+                  meshcore_sender_supersedes?(db, existing_fallback_from_str, from_id)
+                fallback_updates["from_id"] = from_id if supersedes
+                resolved_from_id = supersedes ? from_id : existing_fallback_from_str
+              end
               fallback_updates["to_id"] = to_id if to_id
               fallback_updates["text"] = text if text
               fallback_updates["encrypted"] = encrypted if encrypted && allow_encrypted_update
@@ -413,6 +456,8 @@ module PotatoMesh
                 fallback_updates["snr"] = message["snr"] if message.key?("snr")
                 fallback_updates["rssi"] = message["rssi"] if message.key?("rssi")
                 fallback_updates["hop_limit"] = message["hop_limit"] if message.key?("hop_limit")
+                fallback_updates["hops"] = hops unless hops.nil?
+                fallback_updates["path"] = path if path
                 fallback_updates["portnum"] = portnum if portnum
                 fallback_updates["lora_freq"] = lora_freq unless lora_freq.nil?
                 fallback_updates["modem_preset"] = modem_preset if modem_preset
@@ -477,13 +522,13 @@ module PotatoMesh
           # for non-MeshCore messages or when no sender prefix is present.
           meshcore_sender_named =
             protocol == "meshcore" &&
-            process_meshcore_chat_nodes(db, from_id || raw_from_id, to_id || raw_to_id, text, rx_time)
+            process_meshcore_chat_nodes(db, resolved_from_id || raw_from_id, to_id || raw_to_id, text, rx_time)
           unless meshcore_sender_named
-            ensure_unknown_node(db, from_id || raw_from_id, message["from_num"], heard_time: rx_time, protocol: protocol)
+            ensure_unknown_node(db, resolved_from_id || raw_from_id, message["from_num"], heard_time: rx_time, protocol: protocol)
           end
           touch_node_last_seen(
             db,
-            from_id || raw_from_id || message["from_num"],
+            resolved_from_id || raw_from_id || message["from_num"],
             message["from_num"],
             rx_time: rx_time,
             source: :message,

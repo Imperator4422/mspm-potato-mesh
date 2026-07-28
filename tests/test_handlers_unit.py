@@ -811,6 +811,193 @@ class TestStoreTelemetryPacket:
         assert "telemetry_type" not in payload
 
 
+class TestExtendedTelemetryExtraction:
+    """Regression guards for TI-A1: every Meshtastic telemetry family is
+    extracted at ingest instead of being dropped (power, air-quality, health,
+    local/host/traffic stats, and the repeated one-wire probe list)."""
+
+    def _queued_payload(self, telemetry, pkt_id=3001):
+        """Run ``store_telemetry_packet`` for *telemetry* and return the queued
+        POST payload dict.
+
+        Parameters:
+            telemetry: The decoded ``telemetry`` section for the packet.
+            pkt_id: Packet id to stamp on the synthetic packet.
+
+        Returns:
+            The payload queued to ``/api/telemetry``.
+        """
+        import data.mesh_ingestor.queue as q
+
+        sent = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(
+            (path, payload)
+        )
+        try:
+            pkt = {
+                "id": pkt_id,
+                "rxTime": 1_700_000_000,
+                "fromId": "!aabbccdd",
+                "decoded": {"portnum": "TELEMETRY_APP", "telemetry": telemetry},
+            }
+            handlers.store_telemetry_packet(pkt, pkt["decoded"])
+        finally:
+            q._queue_post_json = original
+        assert sent, "telemetry packet was not queued at all"
+        return sent[0][1]
+
+    def test_power_metrics_extracted(self):
+        """PowerMetrics channel readings survive into the queued payload."""
+        payload = self._queued_payload(
+            {
+                "time": 1_700_000_000,
+                "powerMetrics": {
+                    "ch1Voltage": 3.94,
+                    "ch1Current": 121.5,
+                    "ch3Voltage": 11.9,
+                    "ch8Current": 0.25,
+                },
+            }
+        )
+        assert payload.get("telemetry_type") == "power"
+        assert payload.get("ch1_voltage") == 3.94
+        assert payload.get("ch1_current") == 121.5
+        assert payload.get("ch3_voltage") == 11.9
+        assert payload.get("ch8_current") == 0.25
+
+    def test_air_quality_metrics_extracted(self):
+        """AirQualityMetrics PM / particle / CO2 / VOC readings are extracted."""
+        payload = self._queued_payload(
+            {
+                "time": 1_700_000_000,
+                "airQualityMetrics": {
+                    "pm25Standard": 8,
+                    "pm10Environmental": 5,
+                    "pm40Standard": 3,
+                    "particles03um": 1200,
+                    "particles40um": 40,
+                    "co2": 700,
+                    "co2Temperature": 24.5,
+                    "formFormaldehyde": 0.03,
+                    "pmVocIdx": 110.0,
+                    "particlesTps": 1.5,
+                },
+            }
+        )
+        assert payload.get("telemetry_type") == "air_quality"
+        assert payload.get("pm25_standard") == 8
+        assert payload.get("pm10_environmental") == 5
+        assert payload.get("pm40_standard") == 3
+        assert payload.get("particles_03um") == 1200
+        assert payload.get("particles_40um") == 40
+        assert payload.get("co2") == 700
+        assert payload.get("co2_temperature") == 24.5
+        assert payload.get("form_formaldehyde") == 0.03
+        assert payload.get("pm_voc_idx") == 110.0
+        assert payload.get("particles_tps") == 1.5
+
+    def test_health_metrics_extracted(self):
+        """HealthMetrics values map to dedicated columns; body temperature
+        never masquerades as the ambient ``temperature`` metric."""
+        payload = self._queued_payload(
+            {
+                "time": 1_700_000_000,
+                "healthMetrics": {"heartBpm": 72, "spO2": 97, "temperature": 36.6},
+            }
+        )
+        assert payload.get("telemetry_type") == "health"
+        assert payload.get("heart_bpm") == 72
+        assert payload.get("spo2") == 97
+        assert payload.get("health_temperature") == 36.6
+        assert "temperature" not in payload
+
+    def test_local_stats_extracted(self):
+        """LocalStats counters are extracted; the shared uptime / utilisation
+        fields reuse the existing columns."""
+        payload = self._queued_payload(
+            {
+                "time": 1_700_000_000,
+                "localStats": {
+                    "uptimeSeconds": 3600,
+                    "channelUtilization": 12.5,
+                    "airUtilTx": 3.2,
+                    "numPacketsTx": 10,
+                    "numPacketsRx": 42,
+                    "numRxDupe": 2,
+                    "heapTotalBytes": 200_000,
+                    "heapFreeBytes": 80_000,
+                    "noiseFloor": -95,
+                },
+            }
+        )
+        assert payload.get("telemetry_type") == "local_stats"
+        assert payload.get("uptime_seconds") == 3600
+        assert payload.get("channel_utilization") == 12.5
+        assert payload.get("air_util_tx") == 3.2
+        assert payload.get("num_packets_tx") == 10
+        assert payload.get("num_packets_rx") == 42
+        assert payload.get("num_rx_dupe") == 2
+        assert payload.get("heap_total_bytes") == 200_000
+        assert payload.get("heap_free_bytes") == 80_000
+        assert payload.get("noise_floor") == -95
+
+    def test_host_metrics_extracted(self):
+        """HostMetrics gauges (including the free-text user string) survive."""
+        payload = self._queued_payload(
+            {
+                "time": 1_700_000_000,
+                "hostMetrics": {
+                    "uptimeSeconds": 86_400,
+                    "freememBytes": 1_048_576,
+                    "diskfree1Bytes": 2**33,
+                    "load1": 35,
+                    "load15": 12,
+                    "userString": "potato",
+                },
+            }
+        )
+        assert payload.get("telemetry_type") == "host"
+        assert payload.get("uptime_seconds") == 86_400
+        assert payload.get("freemem_bytes") == 1_048_576
+        assert payload.get("diskfree1_bytes") == 2**33
+        assert payload.get("load1") == 35
+        assert payload.get("load15") == 12
+        assert payload.get("user_string") == "potato"
+
+    def test_traffic_stats_extracted(self):
+        """TrafficManagementStats counters are extracted."""
+        payload = self._queued_payload(
+            {
+                "time": 1_700_000_000,
+                "trafficManagementStats": {
+                    "packetsInspected": 100,
+                    "rateLimitDrops": 3,
+                    "routerHopsPreserved": 7,
+                },
+            }
+        )
+        assert payload.get("telemetry_type") == "traffic"
+        assert payload.get("packets_inspected") == 100
+        assert payload.get("rate_limit_drops") == 3
+        assert payload.get("router_hops_preserved") == 7
+
+    def test_one_wire_temperature_extracted(self):
+        """The repeated one-wire probe list is preserved as a float list."""
+        payload = self._queued_payload(
+            {
+                "time": 1_700_000_000,
+                "environmentMetrics": {
+                    "temperature": 21.5,
+                    "oneWireTemperature": [20.0, 21.25],
+                },
+            }
+        )
+        assert payload.get("telemetry_type") == "environment"
+        assert payload.get("temperature") == 21.5
+        assert payload.get("one_wire_temperature") == [20.0, 21.25]
+
+
 # ---------------------------------------------------------------------------
 # store_nodeinfo_packet
 # ---------------------------------------------------------------------------
@@ -1331,3 +1518,278 @@ class TestCoerceEmojiStringFailure:
                 raise RuntimeError("boom")
 
         assert generic_mod._coerce_emoji_codepoint(Boom()) is None
+
+
+# ---------------------------------------------------------------------------
+# store_packet_dict — PRIMARY_CHANNEL_ONLY guard
+# ---------------------------------------------------------------------------
+
+
+class TestStorePacketDictPrimaryChannelGuard:
+    """Tests for the ``PRIMARY_CHANNEL_ONLY`` guard in
+    :func:`handlers.store_packet_dict`.
+
+    Mirrors the existing disallowed-channel / hidden-channel guard tests:
+    build a message packet on a non-primary channel and confirm it is
+    dropped (no queue POST, ``_record_ignored_packet`` called with
+    ``reason="non-primary-channel"``) only when
+    ``config.PRIMARY_CHANNEL_ONLY`` is enabled.
+    """
+
+    def _make_packet(self, *, channel: int, pkt_id: int = 4242) -> dict:
+        return {
+            "id": pkt_id,
+            "rxTime": 1_700_000_000,
+            "from": "!sender",
+            "to": "^all",
+            "channel": channel,
+            "decoded": {"text": "secondary channel msg", "portnum": 1},
+        }
+
+    def test_drops_secondary_channel_when_flag_enabled(self, monkeypatch):
+        """Non-primary channel packet is dropped when the flag is on."""
+        import data.mesh_ingestor.queue as q
+
+        monkeypatch.setattr(config, "PRIMARY_CHANNEL_ONLY", True)
+        monkeypatch.setattr(config, "ALLOWED_CHANNELS", ())
+        monkeypatch.setattr(config, "HIDDEN_CHANNELS", ())
+        monkeypatch.setattr(config, "DEBUG", False)
+
+        sent = []
+        ignored = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(
+            (path, payload)
+        )
+        monkeypatch.setattr(
+            ignored_mod,
+            "_record_ignored_packet",
+            lambda packet, *, reason: ignored.append(reason),
+        )
+        try:
+            handlers.store_packet_dict(self._make_packet(channel=3))
+        finally:
+            q._queue_post_json = original
+
+        assert sent == []
+        assert ignored == ["non-primary-channel"]
+
+    def test_drops_secondary_channel_logs_when_debug_enabled(self, monkeypatch, capsys):
+        """The debug log branch fires (and is skipped when DEBUG is off, per
+        the sibling test above) so both sides of the ``if config.DEBUG``
+        branch are covered."""
+        import data.mesh_ingestor.queue as q
+
+        monkeypatch.setattr(config, "PRIMARY_CHANNEL_ONLY", True)
+        monkeypatch.setattr(config, "ALLOWED_CHANNELS", ())
+        monkeypatch.setattr(config, "HIDDEN_CHANNELS", ())
+        monkeypatch.setattr(config, "DEBUG", True)
+
+        sent = []
+        ignored = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(
+            (path, payload)
+        )
+        monkeypatch.setattr(
+            ignored_mod,
+            "_record_ignored_packet",
+            lambda packet, *, reason: ignored.append(reason),
+        )
+        capsys.readouterr()
+        try:
+            handlers.store_packet_dict(self._make_packet(channel=3))
+        finally:
+            q._queue_post_json = original
+
+        assert sent == []
+        assert ignored == ["non-primary-channel"]
+        assert "Ignored packet on non-primary channel" in capsys.readouterr().out
+
+    def test_allows_primary_channel_when_flag_enabled(self, monkeypatch):
+        """Channel 0 (PRIMARY) is never dropped by this guard, flag on or
+        off."""
+        import data.mesh_ingestor.queue as q
+
+        monkeypatch.setattr(config, "PRIMARY_CHANNEL_ONLY", True)
+        monkeypatch.setattr(config, "ALLOWED_CHANNELS", ())
+        monkeypatch.setattr(config, "HIDDEN_CHANNELS", ())
+        monkeypatch.setattr(config, "DEBUG", False)
+
+        sent = []
+        ignored = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(
+            (path, payload)
+        )
+        monkeypatch.setattr(
+            ignored_mod,
+            "_record_ignored_packet",
+            lambda packet, *, reason: ignored.append(reason),
+        )
+        try:
+            handlers.store_packet_dict(self._make_packet(channel=0))
+        finally:
+            q._queue_post_json = original
+
+        assert any(path == "/api/messages" for path, _ in sent)
+        assert "non-primary-channel" not in ignored
+
+    def test_does_not_drop_secondary_channel_when_flag_disabled(self, monkeypatch):
+        """With the flag off, a secondary-channel packet is NOT dropped by
+        this guard (it proceeds to be queued)."""
+        import data.mesh_ingestor.queue as q
+
+        monkeypatch.setattr(config, "PRIMARY_CHANNEL_ONLY", False)
+        monkeypatch.setattr(config, "ALLOWED_CHANNELS", ())
+        monkeypatch.setattr(config, "HIDDEN_CHANNELS", ())
+        monkeypatch.setattr(config, "DEBUG", False)
+
+        sent = []
+        ignored = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(
+            (path, payload)
+        )
+        monkeypatch.setattr(
+            ignored_mod,
+            "_record_ignored_packet",
+            lambda packet, *, reason: ignored.append(reason),
+        )
+        try:
+            handlers.store_packet_dict(self._make_packet(channel=3))
+        finally:
+            q._queue_post_json = original
+
+        assert any(path == "/api/messages" for path, _ in sent)
+        assert "non-primary-channel" not in ignored
+
+
+# ---------------------------------------------------------------------------
+# _hops_travelled — hops-travelled derivation (SPEC RF1)
+# ---------------------------------------------------------------------------
+
+
+class TestHopsTravelled:
+    """Unit tests for :func:`generic._hops_travelled`.
+
+    The helper prefers an explicit handler-stamped ``hops`` value (MeshCore's
+    normalized ``path_len``) and falls back to the Meshtastic derivation
+    ``hopStart - hopLimit``; anything unparseable yields ``None``.
+    """
+
+    def test_explicit_hops_wins_over_derivation(self):
+        """A handler-stamped hops value beats the hopStart/hopLimit fallback."""
+        assert generic_mod._hops_travelled({"hops": 4, "hopStart": 7}, 2) == 4
+
+    def test_explicit_zero_hops_is_preserved(self):
+        """hops == 0 (MeshCore direct sentinel already normalized) survives."""
+        assert generic_mod._hops_travelled({"hops": 0, "hopStart": 7}, 2) == 0
+
+    def test_explicit_hops_uncoercible_returns_none(self):
+        """A non-integer explicit hops yields None, never a crash."""
+        assert generic_mod._hops_travelled({"hops": "bogus"}, 2) is None
+
+    def test_meshtastic_derivation_camel_case(self):
+        """hopStart 7 with hopLimit 2 remaining means 5 relays travelled."""
+        assert generic_mod._hops_travelled({"hopStart": 7}, 2) == 5
+
+    def test_meshtastic_derivation_snake_case(self):
+        """The snake_case hop_start alias is accepted too."""
+        assert generic_mod._hops_travelled({"hop_start": 5}, 1) == 4
+
+    def test_missing_hop_start_returns_none(self):
+        """Without hopStart the derivation cannot run."""
+        assert generic_mod._hops_travelled({}, 2) is None
+
+    def test_missing_hop_limit_returns_none(self):
+        """Without hopLimit the derivation cannot run."""
+        assert generic_mod._hops_travelled({"hopStart": 3}, None) is None
+
+    def test_uncoercible_fallback_values_return_none(self):
+        """Unparseable hopStart/hopLimit values yield None, never a crash."""
+        assert generic_mod._hops_travelled({"hopStart": "x"}, 2) is None
+        assert generic_mod._hops_travelled({"hopStart": 7}, "y") is None
+
+
+class TestStorePacketDictHops:
+    """``store_packet_dict`` stamps the message payload with ``hops`` (RF1).
+
+    Mirrors the primary-channel-guard harness: capture the queued POST payload
+    and assert the ``hops`` field alongside the untouched ``hop_limit``.
+    """
+
+    def _store(self, monkeypatch, packet: dict) -> dict:
+        """Run ``store_packet_dict`` and return the queued message payload."""
+        import data.mesh_ingestor.queue as q
+
+        monkeypatch.setattr(config, "PRIMARY_CHANNEL_ONLY", False)
+        monkeypatch.setattr(config, "ALLOWED_CHANNELS", ())
+        monkeypatch.setattr(config, "HIDDEN_CHANNELS", ())
+        monkeypatch.setattr(config, "DEBUG", False)
+
+        sent = []
+        original = q._queue_post_json
+        q._queue_post_json = lambda path, payload, *, priority, **kw: sent.append(
+            (path, payload)
+        )
+        try:
+            handlers.store_packet_dict(packet)
+        finally:
+            q._queue_post_json = original
+
+        assert len(sent) == 1 and sent[0][0] == "/api/messages"
+        return sent[0][1]
+
+    def _make_packet(self, **extra) -> dict:
+        packet = {
+            "id": 555,
+            "rxTime": 1_700_000_100,
+            "from": "!sender",
+            "to": "^all",
+            "channel": 0,
+            "decoded": {"text": "hops probe", "portnum": 1},
+        }
+        packet.update(extra)
+        return packet
+
+    def test_meshtastic_hops_derived_from_hop_start_and_limit(self, monkeypatch):
+        """hopStart 7 / hopLimit 2 stores hops 5 with hop_limit untouched."""
+        payload = self._store(monkeypatch, self._make_packet(hopStart=7, hopLimit=2))
+        assert payload["hops"] == 5
+        assert payload["hop_limit"] == 2
+
+    def test_explicit_hops_field_is_stored_verbatim(self, monkeypatch):
+        """A protocol-handler-stamped hops value (MeshCore) is stored as-is."""
+        payload = self._store(monkeypatch, self._make_packet(hops=0))
+        assert payload["hops"] == 0
+
+    def test_hops_none_when_no_source_present(self, monkeypatch):
+        """Neither hops nor hopStart present -> hops is None (legacy shape)."""
+        payload = self._store(monkeypatch, self._make_packet(hopLimit=3))
+        assert payload["hops"] is None
+        assert payload["hop_limit"] == 3
+
+
+class TestStorePacketDictPath:
+    """``store_packet_dict`` forwards the MeshCore hop-hash route (RF2)."""
+
+    def test_meshcore_path_is_forwarded(self, monkeypatch):
+        """A handler-stamped path string reaches the queued payload."""
+        harness = TestStorePacketDictHops()
+        payload = harness._store(monkeypatch, harness._make_packet(path="f0bf44b53377"))
+        assert payload["path"] == "f0bf44b53377"
+
+    def test_non_string_path_is_dropped(self, monkeypatch):
+        """A malformed (non-string) path value is dropped, not serialized."""
+        harness = TestStorePacketDictHops()
+        payload = harness._store(
+            monkeypatch, harness._make_packet(path=["f0bf", "4453"])
+        )
+        assert payload["path"] is None
+
+    def test_path_none_when_absent(self, monkeypatch):
+        """Meshtastic packets carry no path -> payload path is None."""
+        harness = TestStorePacketDictHops()
+        payload = harness._store(monkeypatch, harness._make_packet())
+        assert payload["path"] is None

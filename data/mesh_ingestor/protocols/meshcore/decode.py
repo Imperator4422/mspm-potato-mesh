@@ -94,6 +94,94 @@ def _advert_to_node_dict(pub_key: str) -> dict:
     }
 
 
+def _rx_advert_to_node_dict(frame: dict) -> dict:
+    """Convert a parsed RX-log ``ADVERT`` frame into a ``POST /api/nodes`` dict.
+
+    Unlike the bare ``ADVERTISEMENT`` push (:func:`_advert_to_node_dict`), an
+    on-air advert heard via ``RX_LOG_DATA`` is fully self-describing: the
+    library's packet parser extracts the advertiser's full public key
+    (``adv_key``), display name, node type, optional position, and the
+    reception-side signal metrics.  This restores full node identity — and
+    per-advert SNR / RSSI / hop metrics — independently of the radio's contact
+    roster (SPEC RF3).
+
+    Parameters:
+        frame: Parsed RX-log frame from the ``meshcore`` library.  Relevant
+            keys: ``adv_key`` (64-hex public key), ``adv_name``, ``adv_type``
+            (``ADV_TYPE_*``), ``adv_lat``/``adv_lon``, ``adv_timestamp``,
+            ``recv_time``, ``snr``, ``rssi``, and ``path_len`` (hops travelled;
+            RX-log frames carry a plain count, never the 255 message-sync
+            sentinel).
+
+    Returns:
+        Node dict compatible with the ``POST /api/nodes`` payload format,
+        carrying top-level ``snr`` / ``rssi`` / ``hopsAway`` signal fields.
+        ``longName`` is included only when the advert carried a name, so a
+        name-less advert never churns an existing richer record.  ``lastHeard``
+        is the receiver-side reception time, while the position anchor is the
+        advert's own sender-side ``adv_timestamp`` (SPEC MR5) so every flood
+        copy of one advert resolves to a single position.
+    """
+    pub_key = frame.get("adv_key", "")
+    node_id = _meshcore_node_id(pub_key)
+    name = (frame.get("adv_name") or "").strip()
+    role = _meshcore_adv_type_to_role(frame.get("adv_type"))
+    heard = frame.get("recv_time") or int(time.time())
+    node: dict = {
+        "lastHeard": heard,
+        "protocol": "meshcore",
+        "user": {
+            **({"longName": name} if name else {}),
+            "shortName": _meshcore_short_name(node_id),
+            "publicKey": pub_key,
+            **({"role": role} if role is not None else {}),
+        },
+    }
+    # Reception-side signal metrics: top-level node fields, matching the keys
+    # the web app already accepts (``snr``, ``hopsAway``) plus the additive
+    # ``rssi`` column (RF3).
+    if frame.get("snr") is not None:
+        node["snr"] = frame["snr"]
+    if frame.get("rssi") is not None:
+        node["rssi"] = frame["rssi"]
+    if frame.get("path_len") is not None:
+        node["hopsAway"] = frame["path_len"]
+    lat = frame.get("adv_lat")
+    lon = frame.get("adv_lon")
+    if lat is not None and lon is not None and (lat or lon):
+        node["position"] = {
+            "latitude": lat,
+            "longitude": lon,
+            "time": _rx_advert_position_time(frame),
+        }
+    return node
+
+
+def _rx_advert_position_time(frame: dict) -> int:
+    """Return the position timestamp for an RX-log ``ADVERT`` frame.
+
+    One advert reaches the radio several times over different flood paths (and
+    again through every co-operating ingestor), each copy carrying its own
+    receiver-side ``recv_time``.  Keying the position on that receiver clock
+    mints a distinct row per copy, defeating the ``(node, position_time)``
+    de-duplication the web app performs.  The advert's own ``adv_timestamp`` is
+    sender-side and therefore identical across every copy, so it is the correct
+    anchor (SPEC MR5).
+
+    Parameters:
+        frame: Parsed RX-log ``ADVERT`` frame.
+
+    Returns:
+        The sender-side ``adv_timestamp`` when the parser reported a usable
+        one, else the receiver-side ``recv_time``, else the current time.
+    """
+    adv_timestamp = frame.get("adv_timestamp")
+    if isinstance(adv_timestamp, int) and not isinstance(adv_timestamp, bool):
+        if adv_timestamp > 0:
+            return adv_timestamp
+    return frame.get("recv_time") or int(time.time())
+
+
 def _derive_modem_preset(sf: object, bw: object, cr: object) -> str | None:
     """Return a compact radio-parameter string from spreading factor, bandwidth, and coding rate.
 

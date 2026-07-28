@@ -17,6 +17,54 @@
 module PotatoMesh
   module App
     module DataProcessing
+      # Oldest +last_advert_heard+ that still counts as keyed evidence of a
+      # live identity (SPEC MR1/MR2).  Bounded by the same four-week window the
+      # per-id node API uses, so "still ambiguous" never outlives the horizon a
+      # caller can even observe.  A node with no keyed evidence at all
+      # (+NULL+ → 0) is always stale by this measure.
+      #
+      # Single definition shared by the merge helpers here and the #755 startup
+      # backfill in +application/database.rb+.
+      #
+      # @param now [Integer] reference timestamp (injectable for tests).
+      # @return [Integer] unix cutoff; evidence at or after it is fresh.
+      def self.evidence_cutoff(now: Time.now.to_i)
+        now - PotatoMesh::Config.four_weeks_seconds
+      end
+
+      # SQL predicate: is this node row *positively known* to be a retired
+      # identity (SPEC MR2)?
+      #
+      # Absence of evidence is not evidence of absence — a +NULL+ here means
+      # "nothing observed yet" (a row predating the column, or a node that has
+      # not re-advertised since), never "dead". Only a timestamp that exists
+      # *and* is older than the evidence window demotes a row. Treating unknown
+      # as stale would let the merge fire on a genuinely ambiguous pair, which
+      # is exactly the mis-attribution the ambiguity guard exists to prevent.
+      #
+      # +position_time+ is the fallback signal for rows written before
+      # +last_advert_heard+ existed: a MeshCore position is only ever stored
+      # from a key-authenticated record (roster contact, advert, self-info) and
+      # never from chat text, so it is historical keyed evidence. A node with
+      # neither signal stays "unknown" and keeps blocking.
+      #
+      # +columns+ names the evidence columns actually present on the table under
+      # test.  The runtime +nodes+ table always carries both; the one-shot #755
+      # startup backfill runs against schemas that may predate +position_time+,
+      # so it narrows the list to what the migration has confirmed exists —
+      # dropping a column can only make a row *more* likely to stay "unknown"
+      # (block), never spuriously stale, so the safe direction is preserved.
+      #
+      # @param table_alias [String] alias of the +nodes+ row being tested.
+      # @param columns [Array<String>] evidence columns to coalesce, newest
+      #   authority first; must be non-empty.
+      # @return [String] SQL fragment with one +?+ placeholder (the cutoff).
+      def self.positively_stale_sql(table_alias, columns: %w[last_advert_heard position_time])
+        qualified = columns.map { |column| "#{table_alias}.#{column}" }
+        evidence = qualified.length == 1 ? qualified.first : "COALESCE(#{qualified.join(", ")})"
+        "(#{evidence} IS NOT NULL AND #{evidence} < ?)"
+      end
+
       # Insert a hidden placeholder node when an unknown reference is encountered.
       #
       # @param db [SQLite3::Database] open database handle.
@@ -148,13 +196,6 @@ module PotatoMesh
         updated
       end
 
-      # Insert or update a node row from an inbound NodeInfo-style payload.
-      #
-      # @param db [SQLite3::Database] open database handle.
-      # @param node_id [String] canonical node identifier.
-      # @param n [Hash] node payload extracted from the ingestor.
-      # @param protocol [String] protocol identifier (default +meshtastic+).
-      # @return [void]
       # Read +hash[primary]+, falling back to the first present alias key. Lets the
       # node ingest contract accept snake_case fields in addition to the Meshtastic
       # camelCase the collector emits today; nil-aware so a boolean +false+ from the
@@ -171,6 +212,26 @@ module PotatoMesh
         nil
       end
 
+      # Insert or update a node row from an inbound NodeInfo-style payload.
+      #
+      # Two-phase write. Phase one is the freshness-guarded upsert: a record
+      # whose +lastHeard+ is older than the stored row cannot change
+      # timestamps, telemetry, or position. Phase two fills identity columns
+      # (+num+, +short_name+, +long_name+, +macaddr+, +hw_model+, +role+,
+      # +public_key+, +is_unmessagable+) that are still NULL, regardless of the
+      # record's staleness — a stale-but-richer record (e.g. a MeshCore roster
+      # contact stamped with the sender-side +last_advert+, which is always
+      # older than the wall-clock +lastHeard+ of the bare-advert placeholder
+      # that created the row) still names the node instead of being discarded
+      # wholesale, which produced permanently unnamed "ghost" nodes
+      # (ACCEPTANCE GH-A1). Synthetic chat placeholders never touch real rows
+      # in either phase.
+      #
+      # @param db [SQLite3::Database] open database handle.
+      # @param node_id [String] canonical node identifier.
+      # @param n [Hash] node payload extracted from the ingestor.
+      # @param protocol [String] protocol identifier (default +meshtastic+).
+      # @return [void]
       def upsert_node(db, node_id, n, protocol: "meshtastic")
         user = n["user"] || {}
         met = pick_alias(n, "deviceMetrics", "device_metrics") || {}
@@ -219,6 +280,17 @@ module PotatoMesh
         # sender names before the real contact advertisement is received.
         synthetic = user["synthetic"] ? 1 : 0
         long_name = pick_alias(user, "longName", "long_name")
+        short_name = pick_alias(user, "shortName", "short_name")
+        macaddr = user["macaddr"]
+        hw_model = pick_alias(user, "hwModel", "hw_model") || pick_alias(n, "hwModel", "hw_model")
+        public_key = pick_alias(user, "publicKey", "public_key")
+        is_unmessagable = coerce_bool(pick_alias(user, "isUnmessagable", "is_unmessagable"))
+        # Keyed evidence (SPEC MR1): this record proves the node was heard via
+        # its public key, as opposed to being inferred from a chat display
+        # name.  Only such records may stamp +last_advert_heard+, which is what
+        # lets the merge guards tell a live node from a retired identity that
+        # name-inferred message touches keep superficially "fresh".
+        keyed_evidence_time = (synthetic.zero? && string_or_nil(public_key)) ? lh : nil
 
         # If the incoming long name is a generic placeholder, prefer any real
         # name already on record so we never stomp known data with fallback
@@ -240,16 +312,17 @@ module PotatoMesh
         row = [
           node_id,
           node_num,
-          pick_alias(user, "shortName", "short_name"),
+          short_name,
           long_name,
-          user["macaddr"],
-          pick_alias(user, "hwModel", "hw_model") || pick_alias(n, "hwModel", "hw_model"),
+          macaddr,
+          hw_model,
           role,
-          pick_alias(user, "publicKey", "public_key"),
-          coerce_bool(pick_alias(user, "isUnmessagable", "is_unmessagable")),
+          public_key,
+          is_unmessagable,
           coerce_bool(pick_alias(n, "isFavorite", "is_favorite")),
           pick_alias(n, "hopsAway", "hops_away"),
           n["snr"],
+          n["rssi"],
           lh,
           lh,
           pick_alias(met, "batteryLevel", "battery_level"),
@@ -276,9 +349,9 @@ module PotatoMesh
           db.transaction do
             db.execute(<<~SQL, row)
               INSERT INTO nodes(node_id,num,short_name,long_name,macaddr,hw_model,role,public_key,is_unmessagable,is_favorite,
-                                hops_away,snr,last_heard,first_heard,battery_level,voltage,channel_utilization,air_util_tx,uptime_seconds,
+                                hops_away,snr,rssi,last_heard,first_heard,battery_level,voltage,channel_utilization,air_util_tx,uptime_seconds,
                                 position_time,location_source,precision_bits,latitude,longitude,altitude,lora_freq,modem_preset,protocol,synthetic)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
               ON CONFLICT(node_id) DO UPDATE SET
                 num=COALESCE(excluded.num, nodes.num),
                 short_name=COALESCE(excluded.short_name, nodes.short_name),
@@ -289,6 +362,7 @@ module PotatoMesh
                 public_key=COALESCE(excluded.public_key, nodes.public_key),
                 is_unmessagable=COALESCE(excluded.is_unmessagable, nodes.is_unmessagable),
                 is_favorite=excluded.is_favorite, hops_away=excluded.hops_away, snr=excluded.snr, last_heard=excluded.last_heard,
+                rssi=COALESCE(excluded.rssi, nodes.rssi),
                 first_heard=COALESCE(nodes.first_heard, excluded.first_heard, excluded.last_heard),
                 battery_level=excluded.battery_level, voltage=excluded.voltage, channel_utilization=excluded.channel_utilization,
                 air_util_tx=excluded.air_util_tx, uptime_seconds=excluded.uptime_seconds,
@@ -304,6 +378,49 @@ module PotatoMesh
               WHERE COALESCE(excluded.last_heard,0) >= COALESCE(nodes.last_heard,0)
                 AND NOT (COALESCE(nodes.synthetic,0) = 0 AND excluded.synthetic = 1)
             SQL
+
+            # Ghost-node repair (GH-A1): the guard above skips records whose
+            # last_heard is older than the stored row — correct for timestamps,
+            # telemetry, and position, but it also starved identity data. A
+            # MeshCore roster contact is stamped with the sender-side
+            # last_advert, which is always older than the wall-clock lastHeard
+            # of the bare-advert placeholder that created the row, so the
+            # name/role/public key never landed and the node stayed a
+            # permanently unnamed ghost. Fill identity columns that are still
+            # NULL from any non-synthetic record regardless of staleness: gaps
+            # get filled, fresher values are never regressed, and synthetic
+            # chat placeholders remain barred from real rows. NULLIF keeps
+            # empty strings — a MeshCore contact may carry an empty adv_name,
+            # and shortName is guarded the same way — from filling
+            # long_name/short_name with blank text.
+            if synthetic.zero?
+              db.execute(<<~SQL, [node_num, short_name, long_name, macaddr, hw_model, role, public_key, is_unmessagable, node_id])
+                UPDATE nodes SET
+                  num=COALESCE(num, ?),
+                  short_name=COALESCE(short_name, NULLIF(?, '')),
+                  long_name=COALESCE(long_name, NULLIF(?, '')),
+                  macaddr=COALESCE(macaddr, ?),
+                  hw_model=COALESCE(hw_model, ?),
+                  role=COALESCE(role, ?),
+                  public_key=COALESCE(public_key, ?),
+                  is_unmessagable=COALESCE(is_unmessagable, ?)
+                WHERE node_id = ?
+              SQL
+            end
+
+            # Keyed-evidence stamp (SPEC MR1).  Deliberately a separate,
+            # forward-only statement rather than a column in the upsert above:
+            # that statement's freshness guard skips any record older than the
+            # stored +last_heard+, and a node whose +last_heard+ was pushed to
+            # "now" by message touches would therefore never record evidence
+            # from its own (sender-side-stamped, hence older) adverts — the
+            # very situation the evidence column exists to resolve.
+            if keyed_evidence_time
+              db.execute(
+                "UPDATE nodes SET last_advert_heard = ? WHERE node_id = ? AND COALESCE(last_advert_heard, 0) < ?",
+                [keyed_evidence_time, node_id, keyed_evidence_time],
+              )
+            end
 
             # Reconcile synthetic placeholder rows with their real counterparts
             # whenever a MeshCore node is upserted.  Both directions must fire —
@@ -342,9 +459,16 @@ module PotatoMesh
         # that happens we cannot tell which real node a given chat-derived
         # synthetic was acting as placeholder for, so any merge would risk
         # mis-attributing messages.  Bail out and leave the synthetic intact.
+        #
+        # The ambiguity is bounded by keyed evidence (SPEC MR2): a rival stops
+        # blocking only once it is *positively known* to be retired — an old
+        # keypair some roster still name-resolves, kept superficially "fresh"
+        # by message touches, which is what left one physical node showing up
+        # as three rows.  A rival with no evidence either way still blocks.
         other_real = db.execute(
-          "SELECT 1 FROM nodes WHERE long_name = ? AND synthetic = 0 AND protocol = 'meshcore' AND node_id != ? LIMIT 1",
-          [long_name, real_node_id],
+          "SELECT 1 FROM nodes WHERE long_name = ? AND synthetic = 0 AND protocol = 'meshcore' AND node_id != ? " \
+          "AND NOT #{DataProcessing.positively_stale_sql("nodes")} LIMIT 1",
+          [long_name, real_node_id, DataProcessing.evidence_cutoff],
         ).first
         return if other_real
 
@@ -389,10 +513,23 @@ module PotatoMesh
         )
         # Ambiguous name: two distinct real meshcore devices share this
         # long_name.  The synthetic placeholder could legitimately represent
-        # either, so we cannot pick one without risking mis-attribution.  Leave
-        # the synthetic in place; an operator can resolve the duplicate
-        # manually.
-        return if real_rows.length > 1
+        # either, so we cannot pick one without risking mis-attribution.
+        #
+        # Keyed evidence disambiguates the common case (SPEC MR2): when every
+        # rival but one is *positively known* to be retired, the survivor is
+        # the merge target.  Anything else — two live candidates, or candidates
+        # we simply know nothing about — stays genuinely ambiguous, so the
+        # synthetic is left in place for an operator to resolve.
+        if real_rows.length > 1
+          live_rows = db.execute(
+            "SELECT node_id FROM nodes WHERE long_name = ? AND synthetic = 0 AND protocol = 'meshcore' AND node_id != ? " \
+            "AND NOT #{DataProcessing.positively_stale_sql("nodes")} LIMIT 2",
+            [long_name, synthetic_node_id, DataProcessing.evidence_cutoff],
+          )
+          return unless live_rows.length == 1
+
+          real_rows = live_rows
+        end
 
         row = real_rows.first
         return unless row

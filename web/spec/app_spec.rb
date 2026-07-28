@@ -108,6 +108,7 @@ RSpec.describe "Potato Mesh Sinatra app" do
       db.execute("DELETE FROM positions")
       db.execute("DELETE FROM telemetry")
       db.execute("DELETE FROM ingestors")
+      db.execute("DELETE FROM ingestor_activity")
     end
     ensure_self_instance_record!
   end
@@ -1406,8 +1407,11 @@ RSpec.describe "Potato Mesh Sinatra app" do
     it "renders the federation instance selector when federation is enabled" do
       get "/"
 
+      # SPEC UX11 (audit D-029/D-038): the selector sits behind a compact
+      # toggle and the placeholder names the action.
       expect(last_response.body).to include('id="instanceSelect"')
-      expect(last_response.body).to include("Select region ...")
+      expect(last_response.body).to include('id="instanceSelectToggle"')
+      expect(last_response.body).to include("Other regions…")
     end
 
     it "omits the instance selector when private mode is active" do
@@ -1504,13 +1508,16 @@ RSpec.describe "Potato Mesh Sinatra app" do
       expect(last_response.body).not_to include('id="metaRow"')
     end
 
-    it "renders the slim footer on the federation page" do
+    it "renders the opaque footer chrome on the federation page" do
       allow(PotatoMesh::Config).to receive(:federation_enabled?).and_return(true)
 
       get "/federation"
 
       expect(last_response).to be_ok
-      expect(last_response.body).to include('class="app-footer app-footer--slim"')
+      # Audit follow-up 08: the transparent slim variant is retired; every route
+      # uses the one opaque footer chrome so it never floats over body copy.
+      expect(last_response.body).to include('class="app-footer"')
+      expect(last_response.body).not_to include("app-footer--slim")
     end
   end
 
@@ -1555,14 +1562,16 @@ RSpec.describe "Potato Mesh Sinatra app" do
   end
 
   describe "GET /charts" do
-    it "renders the charts page with the slim footer but without meta-controls" do
+    it "renders the charts page with the opaque footer but without meta-controls" do
       get "/charts"
 
       expect(last_response).to be_ok
       expect(last_response.body).to include("initializeChartsPage")
       expect(last_response.body).not_to include('id="metaRow"')
       expect(last_response.body).not_to include('id="filterInput"')
-      expect(last_response.body).to include('class="app-footer app-footer--slim"')
+      # Audit follow-up 08: no more slim footer variant.
+      expect(last_response.body).to include('class="app-footer"')
+      expect(last_response.body).not_to include("app-footer--slim")
     end
   end
 
@@ -2767,6 +2776,55 @@ RSpec.describe "Potato Mesh Sinatra app" do
           ),
         ],
       )
+    end
+
+    context "when federation is disabled" do
+      around do |example|
+        original = ENV["FEDERATION"]
+        begin
+          ENV["FEDERATION"] = "0"
+          example.run
+        ensure
+          if original.nil?
+            ENV.delete("FEDERATION")
+          else
+            ENV["FEDERATION"] = original
+          end
+        end
+      end
+
+      it "returns 404 and never attempts to process the registration" do
+        # A disabled instance must reject the announcement before touching the
+        # network or the database — otherwise an attacker could still force
+        # outbound federation fetches and DB writes against a PRIVATE=1 /
+        # FEDERATION=0 deployment simply by POSTing a signed announcement.
+        expect_any_instance_of(Sinatra::Application).not_to receive(:fetch_instance_json)
+
+        post "/api/instances", instance_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+        expect(last_response.status).to eq(404)
+
+        with_db(readonly: true) do |db|
+          count = db.get_first_value("SELECT COUNT(*) FROM instances WHERE id = ?", [instance_attributes[:id]])
+          expect(count).to eq(0)
+        end
+      end
+    end
+
+    context "when private mode is enabled" do
+      it "returns 404 regardless of the FEDERATION setting" do
+        # federation_enabled? returns false whenever private mode is on,
+        # independent of FEDERATION; the route guard must honour that too. Stub
+        # Config.private_mode_enabled? (the suite's convention, e.g. the node
+        # visibility specs) rather than toggling ENV["PRIVATE"] — the top-level
+        # `before` hook deletes ENV["PRIVATE"] before each example, and stubbing
+        # also avoids any cross-spec ENV leak.
+        allow(PotatoMesh::Config).to receive(:private_mode_enabled?).and_return(true)
+
+        post "/api/instances", instance_payload.to_json, { "CONTENT_TYPE" => "application/json" }
+
+        expect(last_response.status).to eq(404)
+      end
     end
   end
 
@@ -6154,6 +6212,97 @@ RSpec.describe "Potato Mesh Sinatra app" do
     end
   end
 
+  describe "GET /api/nodes synthetic flag (SPEC MR4)" do
+    # A caller must be able to distinguish a name-derived placeholder from a
+    # key-backed node.  The flag is emitted compact-style: `synthetic: true`
+    # on placeholder rows, absent on real rows (matching the API's existing
+    # nil/blank compaction; no `synthetic: false` noise on every node).
+    it "marks synthetic placeholder rows and omits the key on real rows" do
+      clear_database
+      now = Time.now.to_i
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, role, last_heard, first_heard, protocol, synthetic) VALUES(?,?,?,?,?,?,?,?)",
+          ["!f0b61f1e", "", "Synth Node", "COMPANION", now - 60, now - 60, "meshcore", 1],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, role, last_heard, first_heard, protocol, synthetic) VALUES(?,?,?,?,?,?,?,?)",
+          ["!ae46e493", "ae46", "Real Node", "COMPANION", now - 30, now - 30, "meshcore", 0],
+        )
+      end
+
+      get "/api/nodes/!f0b61f1e"
+      expect(last_response).to be_ok
+      synth_row = JSON.parse(last_response.body)
+      expect(synth_row["synthetic"]).to eq(true)
+
+      get "/api/nodes/!ae46e493"
+      expect(last_response).to be_ok
+      real_row = JSON.parse(last_response.body)
+      expect(real_row).not_to have_key("synthetic")
+
+      get "/api/nodes"
+      expect(last_response).to be_ok
+      listed = JSON.parse(last_response.body)
+      flags = listed.to_h { |row| [row["node_id"], row["synthetic"]] }
+      expect(flags["!f0b61f1e"]).to eq(true)
+      expect(flags["!ae46e493"]).to be_nil
+    end
+  end
+
+  describe "GET /api/nodes/:id digit-only hex ids (ACCEPTANCE NL-A2)" do
+    # Live regression (2026-07-27): the matrix bridge requested
+    # /api/nodes/27336717 for the MeshCore node !27336717 — an 8-hex id made
+    # entirely of decimal digits — and the digits-mean-num precedence
+    # (identity.rb) resolved it as Meshtastic num 27336717, matched nothing,
+    # and 404'd a node the list endpoint was serving.  A bang-less digit-only
+    # ref that is also a canonical 8-hex id must fall back to the hex-id
+    # interpretation when the num interpretation matches nothing, while a
+    # genuine num match keeps its precedence.
+    it "falls back to the hex-id interpretation when the num lookup misses" do
+      clear_database
+      now = Time.now.to_i
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, role, last_heard, first_heard, protocol) VALUES(?,?,?,?,?,?,?)",
+          ["!27336717", "🦅", "Birdperson", "COMPANION", now - 60, now - 60, "meshcore"],
+        )
+      end
+
+      get "/api/nodes/27336717"
+      expect(last_response).to be_ok
+      row = JSON.parse(last_response.body)
+      expect(row["node_id"]).to eq("!27336717")
+    end
+
+    it "keeps num precedence when the digits match a real node num" do
+      clear_database
+      now = Time.now.to_i
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, num, short_name, long_name, role, last_heard, first_heard, protocol) VALUES(?,?,?,?,?,?,?,?)",
+          ["!01a11c8d", 27_336_717, "MT", "Meshtastic num match", "CLIENT", now - 30, now - 30, "meshtastic"],
+        )
+        db.execute(
+          "INSERT INTO nodes(node_id, short_name, long_name, role, last_heard, first_heard, protocol) VALUES(?,?,?,?,?,?,?)",
+          ["!27336717", "🦅", "Birdperson", "COMPANION", now - 60, now - 60, "meshcore"],
+        )
+      end
+
+      get "/api/nodes/27336717"
+      expect(last_response).to be_ok
+      row = JSON.parse(last_response.body)
+      expect(row["node_id"]).to eq("!01a11c8d")
+    end
+
+    it "does not reinterpret digit refs that are not canonical 8-hex ids" do
+      clear_database
+
+      get "/api/nodes/123"
+      expect(last_response.status).to eq(404)
+    end
+  end
+
   describe "GET /api/nodes" do
     # Regression-style coverage for SPEC BP1-BP6: more than MAX_QUERY_LIMIT
     # nodes inside the seven-day window must all remain reachable by paging
@@ -6613,7 +6762,110 @@ RSpec.describe "Potato Mesh Sinatra app" do
     end
   end
 
+  describe "GET /api/stats/activity" do
+    it "serves a snake_case-param packets/hour time-series" do
+      clear_database
+      now = reference_time.to_i
+      allow(Time).to receive(:now).and_return(reference_time)
+      with_db do |db|
+        db.execute(
+          "INSERT INTO ingestor_activity(ingestor_id, at, packets, protocol) VALUES (?,?,?,?)",
+          ["!core0001", now - 100, 3600, "meshcore"],
+        )
+        db.execute(
+          "INSERT INTO ingestor_activity(ingestor_id, at, packets, protocol) VALUES (?,?,?,?)",
+          ["!tast0001", now - 100, 1800, "meshtastic"],
+        )
+      end
+
+      get "/api/stats/activity?window_seconds=86400&bucket_seconds=3600"
+
+      expect(last_response).to be_ok
+      series = JSON.parse(last_response.body)
+      expect(series).to be_an(Array)
+      expect(series.length).to eq(1)
+      bucket = series.first
+      expect(bucket).to have_key("bucket_start")
+      expect(bucket).to have_key("bucket_end")
+      expect(bucket["meshcore"]).to eq(3600)
+      expect(bucket["meshtastic"]).to eq(1800)
+      expect(bucket["total"]).to eq(5400) # SUM across protocols
+    end
+
+    it "bypasses the cache when since is provided" do
+      clear_database
+      get "/api/stats/activity?window_seconds=86400&bucket_seconds=3600&since=#{Time.now.to_i - 3600}"
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body)).to be_an(Array)
+    end
+
+    it "defaults to a 24h/1h window when no params are given" do
+      clear_database
+      get "/api/stats/activity"
+      expect(last_response).to be_ok
+      expect(JSON.parse(last_response.body)).to be_an(Array)
+    end
+
+    it "rejects a non-positive window_seconds" do
+      get "/api/stats/activity?window_seconds=0&bucket_seconds=3600"
+      expect(last_response.status).to eq(400)
+      expect(JSON.parse(last_response.body)).to eq("error" => "window_seconds must be positive")
+    end
+
+    it "rejects a non-positive bucket_seconds" do
+      get "/api/stats/activity?window_seconds=86400&bucket_seconds=0"
+      expect(last_response.status).to eq(400)
+      expect(JSON.parse(last_response.body)).to eq("error" => "bucket_seconds must be positive")
+    end
+
+    it "rejects a bucket too small for the requested window" do
+      get "/api/stats/activity?window_seconds=86400&bucket_seconds=1"
+      expect(last_response.status).to eq(400)
+      expect(JSON.parse(last_response.body)).to eq("error" => "bucket_seconds too small for requested window")
+    end
+  end
+
   describe "GET /api/stats" do
+    it "exposes the MA4 packets/hour rate as an additive <scope>.packets.hour metric" do
+      clear_database
+      now = reference_time.to_i
+      allow(Time).to receive(:now).and_return(reference_time)
+
+      with_db do |db|
+        # meshcore: busiest ingestor 1200 pkts/24h ⇒ 50/h; a quieter second
+        # ingestor of the same protocol must not inflate the MAX.
+        db.execute(
+          "INSERT INTO ingestor_activity(ingestor_id, at, packets, protocol) VALUES (?,?,?,?)",
+          ["!core0001", now - 100, 1200, "meshcore"],
+        )
+        db.execute(
+          "INSERT INTO ingestor_activity(ingestor_id, at, packets, protocol) VALUES (?,?,?,?)",
+          ["!core0002", now - 100, 720, "meshcore"],
+        )
+        # meshtastic: 720 pkts/24h ⇒ 30/h.
+        db.execute(
+          "INSERT INTO ingestor_activity(ingestor_id, at, packets, protocol) VALUES (?,?,?,?)",
+          ["!tast0001", now - 100, 720, "meshtastic"],
+        )
+      end
+
+      get "/api/stats"
+
+      expect(last_response).to be_ok
+      payload = JSON.parse(last_response.body)
+      # Opt 3 shape: the MA4 rate is folded into each scope as packets.hour;
+      # no top-level packets_per_hour map remains.
+      expect(payload).not_to have_key("packets_per_hour")
+      expect(payload["meshcore"]["packets"]).to eq("hour" => 50)
+      expect(payload["meshtastic"]["packets"]).to eq("hour" => 30)
+      expect(payload["total"]["packets"]).to eq("hour" => 80) # SUM of per-protocol MAX = (1200+720)/24
+      expect(payload["reticulum"]["packets"]).to eq("hour" => 0)
+      # The additive field leaves the S1 scope × metric × window tree intact.
+      expect(payload["sampled"]).to eq(false)
+      expect(payload["total"]).to have_key("nodes")
+      expect(payload).not_to have_key("active_nodes")
+    end
+
     it "returns exact SQL-backed activity counts with per-protocol breakdowns" do
       clear_database
       now = reference_time.to_i

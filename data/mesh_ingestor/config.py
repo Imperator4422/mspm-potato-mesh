@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import base64
 import math
 import os
 from datetime import datetime, timezone
@@ -80,6 +81,97 @@ PROTOCOL = _raw_protocol
 
 Accepted values are ``meshtastic`` (default) and ``meshcore``.
 """
+
+_raw_transport = os.environ.get("TRANSPORT", "api").strip().lower()
+if _raw_transport not in ("api", "udp"):
+    raise ValueError(f"Unknown TRANSPORT={_raw_transport!r}. Valid options: api, udp")
+TRANSPORT = _raw_transport
+"""Active ingestor transport: ``api`` (Meshtastic library) or ``udp`` (passive multicast)."""
+
+PRIMARY_CHANNEL_ONLY = os.environ.get("PRIMARY_CHANNEL_ONLY") == "1"
+"""When ``True``, only channel index 0 (PRIMARY) is ingested; all else is dropped."""
+
+_raw_primary_key = os.environ.get("PRIMARY_CHANNEL_KEY", "AQ==").strip() or "AQ=="
+try:
+    # Decode exactly the way meshtastic_udp_decode.expand_default_key later
+    # will, so a malformed key fails HERE with a clear startup error (parity
+    # with the TRANSPORT/PROTOCOL validation above) instead of surfacing as a
+    # lazy binascii.Error out of connect() that the daemon's generic
+    # reconnect handler would swallow and retry forever.
+    # binascii.Error and UnicodeEncodeError both subclass ValueError.
+    base64.b64decode(_raw_primary_key.encode("ascii"), validate=True)
+except ValueError as exc:
+    raise ValueError(
+        f"PRIMARY_CHANNEL_KEY is not valid base64: {_raw_primary_key!r}. "
+        "Provide the channel PSK exactly as printed by `meshtastic --info` "
+        '(e.g. "AQ==" for the default key).'
+    ) from exc
+
+PRIMARY_CHANNEL_KEY = _raw_primary_key
+"""Base64 PSK used to decrypt the primary channel; defaults to the Meshtastic default key.
+
+Validated as base64 at import time: a malformed value raises :class:`ValueError`
+immediately (like an unknown :data:`TRANSPORT`), rather than failing lazily
+inside ``channel_hash``/``decrypt_meshpacket`` during ``connect()``."""
+
+PRIMARY_CHANNEL_NAME = os.environ.get("PRIMARY_CHANNEL_NAME", "").strip()
+"""Name of the primary channel (e.g. ``"MediumFast"``), used to compute the
+channel hash that identifies primary-channel traffic on the UDP multicast.
+
+For a channel whose name is left blank in the radio config, this is the LoRa
+modem-preset name the firmware substitutes when hashing (``"LongFast"``,
+``"MediumFast"``, ``"ShortFast"``, ...) -- i.e. the name shown for channel 0 by
+``meshtastic --info``. Required for UDP primary-channel filtering: two channels
+can share the default ``AQ==`` key (a SECONDARY channel added with the default
+PSK), so decryptability alone cannot distinguish PRIMARY from SECONDARY -- only
+the per-channel hash of *(name, key)* can. When blank, UDP primary-only mode
+fails closed (drops every packet) rather than risk leaking a secondary channel."""
+
+MESH_UDP_GROUP = os.environ.get("MESH_UDP_GROUP", "224.0.0.69").strip() or "224.0.0.69"
+"""IPv4 multicast group joined in UDP transport mode."""
+
+MESH_UDP_PORT = int(os.environ.get("MESH_UDP_PORT", "4403").strip() or "4403")
+"""UDP port for the Mesh-via-UDP multicast group.
+
+The value is stripped and falls back to ``4403`` when blank, matching the other
+UDP env vars, so a whitespace/empty ``MESH_UDP_PORT`` in a ``.env`` file does not
+raise ``ValueError`` at import and prevent the service from starting."""
+
+INGESTOR_NODE_ID = os.environ.get("INGESTOR_NODE_ID", "").strip() or None
+"""Optional ``!xxxxxxxx`` host node id used for the ingestor heartbeat in UDP mode."""
+
+RX_ONLY = os.environ.get("RX_ONLY") == "1"
+"""Receive-only mode: forbid every ingestor-initiated mesh transmission.
+
+Some operators run listening posts where any TX is undesired.  When set, the
+ingestor never transmits on the mesh: this disables the MeshCore contact
+telemetry/status polls and the periodic activity announcement (SPEC MA7), the
+only ingestor-initiated RF traffic.  Local companion-link reads (host
+self-telemetry, contact roster, channel queries) are not transmissions and
+continue to work."""
+
+MESHCORE_TELEMETRY_POLL_SECONDS = int(
+    os.environ.get("MESHCORE_TELEMETRY_POLL_SECONDS", "300").strip() or "300"
+)
+"""Seconds between successive MeshCore contact telemetry polls (TI-A3).
+
+MeshCore exposes other nodes' telemetry only via on-air pull requests, so the
+provider round-robins the contact roster issuing one request per interval —
+airtime is bounded to one request per ``MESHCORE_TELEMETRY_POLL_SECONDS``
+regardless of roster size.  Values ``<= 0`` disable contact polling entirely
+(host self-telemetry is governed separately by
+``MESHCORE_SELF_TELEMETRY_SECONDS``).  Stripped with a default fallback like
+``MESH_UDP_PORT`` so a blank value in a ``.env`` file cannot break startup."""
+
+MESHCORE_SELF_TELEMETRY_SECONDS = int(
+    os.environ.get("MESHCORE_SELF_TELEMETRY_SECONDS", "3600").strip() or "3600"
+)
+"""Seconds between MeshCore host self-telemetry reads (battery + sensors).
+
+Self reads are local companion-link commands (no LoRa airtime).  The default
+matches the host-telemetry suppression window in
+``handlers._state._HOST_TELEMETRY_INTERVAL_SECS`` (one hour) so more frequent
+reads would only be suppressed anyway.  Values ``<= 0`` disable self polling."""
 
 
 def _parse_lora_freq_env(raw: str | None) -> float | int | None:
@@ -322,6 +414,13 @@ __all__ = [
     "ENERGY_SAVING",
     "LORA_FREQ",
     "MODEM_PRESET",
+    "TRANSPORT",
+    "PRIMARY_CHANNEL_ONLY",
+    "PRIMARY_CHANNEL_KEY",
+    "PRIMARY_CHANNEL_NAME",
+    "MESH_UDP_GROUP",
+    "MESH_UDP_PORT",
+    "INGESTOR_NODE_ID",
     "_RECONNECT_INITIAL_DELAY_SECS",
     "_RECONNECT_MAX_DELAY_SECS",
     "_CLOSE_TIMEOUT_SECS",

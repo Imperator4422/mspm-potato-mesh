@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import sys
 import time
 
 from ... import config, ingestors as _ingestors
@@ -23,6 +24,8 @@ from .decode import (
     _advert_to_node_dict,
     _contact_to_node_dict,
     _derive_modem_preset,
+    _rx_advert_position_time,
+    _rx_advert_to_node_dict,
     _self_info_to_node_dict,
 )
 from .identity import _derive_synthetic_node_id, _meshcore_node_id
@@ -30,10 +33,13 @@ from .interface import _MeshcoreInterface
 from .messages import (
     _derive_message_id,
     _extract_mention_names,
+    _normalize_hops,
+    _normalize_path,
     _parse_sender_name,
     _synthetic_node_dict,
 )
 from .position import _store_meshcore_position
+from .telemetry import _make_telemetry_handlers
 
 
 def _process_self_info(
@@ -92,7 +98,9 @@ def _process_self_info(
         modem_preset=modem_preset,
     )
 
-    handlers._mark_packet_seen()
+    # Companion-link read, not an over-air frame: advance the reconnect clock
+    # but do not count it as air traffic (SPEC MA1, Model A).
+    handlers._mark_packet_activity()
     config._debug_log(
         "MeshCore self-info received",
         context="meshcore.self_info",
@@ -120,14 +128,20 @@ def _process_contacts(
         lat = contact.get("adv_lat")
         lon = contact.get("adv_lon")
         if lat is not None and lon is not None and (lat or lon):
+            last_advert = contact.get("last_advert")
+            # Roster replay, not a live reception: stamp rx_time from the
+            # contact's real last_advert so the web app does not warm a
+            # long-dead contact's last_heard to now (issue #853, SPEC RS1).
             _store_meshcore_position(
                 node_id,
                 lat,
                 lon,
-                contact.get("last_advert"),
+                last_advert,
                 handlers.host_node_id(),
+                rx_time=last_advert,
             )
-    handlers._mark_packet_seen()
+    # Companion-link roster fetch, not over-air frames: clock only (Model A).
+    handlers._mark_packet_activity()
 
 
 def _process_contact_update(
@@ -149,14 +163,21 @@ def _process_contact_update(
     lat = contact.get("adv_lat")
     lon = contact.get("adv_lon")
     if lat is not None and lon is not None and (lat or lon):
+        last_advert = contact.get("last_advert")
+        # Roster replay, not a live reception: stamp rx_time from the contact's
+        # real last_advert so the web app does not warm a long-dead contact's
+        # last_heard to now (issue #853, SPEC RS1).
         _store_meshcore_position(
             node_id,
             lat,
             lon,
-            contact.get("last_advert"),
+            last_advert,
             handlers.host_node_id(),
+            rx_time=last_advert,
         )
-    handlers._mark_packet_seen()
+    # Contact update follows an advert already counted at RX_LOG_DATA: clock
+    # only, so the same reception is not counted twice (Model A).
+    handlers._mark_packet_activity()
     config._debug_log(
         "MeshCore contact updated",
         context="meshcore.contact",
@@ -216,7 +237,9 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
         if iface.is_known_contact(pub_key):
             return
         _handlers.upsert_node(node_id, _advert_to_node_dict(pub_key))
-        _handlers._mark_packet_seen()
+        # The advert frame is counted once at its RX_LOG_DATA seam; here we only
+        # advance the reconnect clock so the bare push is not double-counted.
+        _handlers._mark_packet_activity()
         config._debug_log(
             "MeshCore advert from non-roster node",
             context="meshcore.advert",
@@ -281,6 +304,10 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
             "channel": channel_idx,
             "snr": payload.get("SNR"),
             "rssi": payload.get("RSSI"),
+            "hops": _normalize_hops(payload.get("path_len")),
+            # Injected by the decrypt_channels RX-log join (RF2); absent on a
+            # join miss or RX-log-less firmware, never required.
+            "path": _normalize_path(payload.get("path")),
             "protocol": "meshcore",
             "decoded": {
                 "portnum": "TEXT_MESSAGE_APP",
@@ -288,7 +315,9 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
                 "channel": channel_idx,
             },
         }
-        _handlers._mark_packet_seen()
+        # Decoded channel message: its on-air frame is already counted at the
+        # RX_LOG_DATA seam (GRP_TXT), so advance the clock only (Model A).
+        _handlers._mark_packet_activity()
         _handlers.store_packet_dict(packet)
         config._debug_log(
             "MeshCore channel message",
@@ -320,6 +349,7 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
             "to_id": iface.host_node_id,
             "channel": 0,
             "snr": payload.get("SNR"),
+            "hops": _normalize_hops(payload.get("path_len")),
             "protocol": "meshcore",
             "decoded": {
                 "portnum": "TEXT_MESSAGE_APP",
@@ -327,8 +357,80 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
                 "channel": 0,
             },
         }
-        _handlers._mark_packet_seen()
+        # Decoded direct message: its on-air frame is already counted at the
+        # RX_LOG_DATA seam (TEXT_MSG), so advance the clock only (Model A).
+        _handlers._mark_packet_activity()
         _handlers.store_packet_dict(packet)
+
+    async def on_rx_log_data(evt) -> None:
+        payload = evt.payload or {}
+        # Count every RX-log frame here, once, before the ADVERT/non-ADVERT
+        # split (SPEC MA1, Model A). The firmware emits one RX_LOG_DATA frame
+        # per received over-air frame — the complete per-frame ground truth of
+        # "what is in the air" — while the decoded high-level events
+        # (CHANNEL_MSG_RECV, CONTACT_MSG_RECV, ADVERTISEMENT, telemetry
+        # responses) are duplicates of these same frames and only advance the
+        # reconnect clock. Counting precedes the DEBUG-capture drop and the
+        # malformed-advert skip, so no received frame — ignored, errored, or
+        # unimplemented — is under-reported.
+        _handlers._mark_packet_seen()
+        if payload.get("payload_typename") != "ADVERT":
+            # Non-ADVERT RF frames keep their DEBUG-only observability, routed
+            # explicitly now that RX_LOG_DATA is a handled event and no longer
+            # reaches the unhandled catch-all (RF3).  Resolved via the parent
+            # package so test fakes installed with monkeypatch apply.
+            pkg = sys.modules["data.mesh_ingestor.protocols.meshcore"]
+            pkg._record_meshcore_message(
+                payload, source=f"{target or 'auto'}:RX_LOG_DATA"
+            )
+            return
+
+        pub_key = payload.get("adv_key", "")
+        node_id = _meshcore_node_id(pub_key)
+        if node_id is None:
+            # Malformed advert (absent/short key, parse failure upstream) —
+            # tolerated without raising (RF3).
+            config._debug_log(
+                "Malformed RX-log advert skipped",
+                context="meshcore.rx_advert",
+                severity="warning",
+            )
+            return
+
+        _handlers.upsert_node(node_id, _rx_advert_to_node_dict(payload))
+        lat = payload.get("adv_lat")
+        lon = payload.get("adv_lon")
+        if lat is not None and lon is not None and (lat or lon):
+            _store_meshcore_position(
+                node_id,
+                lat,
+                lon,
+                # Sender-side advert timestamp, so every flood copy of one
+                # advert collapses to a single position row (SPEC MR5).
+                _rx_advert_position_time(payload),
+                _handlers.host_node_id(),
+            )
+        config._debug_log(
+            "MeshCore RX-log advert",
+            context="meshcore.rx_advert",
+            node_id=node_id,
+            name=payload.get("adv_name"),
+            snr=payload.get("snr"),
+            rssi=payload.get("rssi"),
+            hops=payload.get("path_len"),
+        )
+
+    async def on_contact_deleted(evt) -> None:
+        # Deliberate no-op (SPEC RF5): the radio evicting a contact from its
+        # roster (AUTO_ADD_OVERWRITE_OLDEST, RF4) must not delete anything
+        # from the dashboard — the web DB intentionally retains evicted nodes
+        # and ``retention.rb`` stays the only data-expiry authority.
+        payload = evt.payload or {}
+        config._debug_log(
+            "MeshCore contact evicted from radio roster",
+            context="meshcore.contact_deleted",
+            node_id=_meshcore_node_id(payload.get("pubkey", "")),
+        )
 
     async def on_disconnected(evt) -> None:
         iface.isConnected = False
@@ -349,5 +451,10 @@ def _make_event_handlers(iface: _MeshcoreInterface, target: str | None) -> dict:
         "ADVERTISEMENT": on_advertisement,
         "CHANNEL_MSG_RECV": on_channel_msg,
         "CONTACT_MSG_RECV": on_contact_msg,
+        "CONTACT_DELETED": on_contact_deleted,
+        "RX_LOG_DATA": on_rx_log_data,
         "DISCONNECTED": on_disconnected,
+        # Telemetry surfaces (TI-A3): contact/self telemetry pulls, status
+        # responses, and the host battery event.
+        **_make_telemetry_handlers(iface, _handlers),
     }

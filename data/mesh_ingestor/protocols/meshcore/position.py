@@ -20,6 +20,7 @@ import hashlib
 import time
 
 from ... import queue as _queue
+from ...handlers.radio import _apply_radio_metadata
 from ...serialization import (
     _iso,
     _node_num_from_id,
@@ -34,6 +35,8 @@ def _store_meshcore_position(
     lon: float,
     position_time: int | None,
     ingestor: str | None,
+    *,
+    rx_time: int | None = None,
 ) -> None:
     """Enqueue a ``POST /api/positions`` for a MeshCore contact's advertised position.
 
@@ -54,8 +57,16 @@ def _store_meshcore_position(
         position_time: Unix timestamp from the contact's ``last_advert`` field,
             or ``None`` to fall back to the current wall-clock time.
         ingestor: Canonical node ID of the host ingestor, or ``None``.
+        rx_time: Reception time to stamp on the position, or ``None`` for the
+            current wall clock.  The web app folds ``rx_time`` into the node's
+            ``last_heard`` via ``MAX(rx_time, position_time)``, so a **roster
+            replay** must pass the contact's real ``last_advert`` here — not
+            ``now`` — or a long-dead contact is warmed back to active on every
+            sync (issue #853, SPEC RS1).  Genuinely-live receptions (host
+            self-info, on-air RX-log adverts) leave this ``None`` so their
+            ``last_heard`` correctly advances to now.
     """
-    rx_time = int(time.time())
+    rx_time = int(time.time()) if rx_time is None else int(rx_time)
     normalized_lat, normalized_lon = _normalize_lat_lon(lat, lon)
     if normalized_lat is None and normalized_lon is None:
         # Both axes collapsed to the sentinel zero; abandon the advertisement
@@ -85,4 +96,10 @@ def _store_meshcore_position(
         # ingestor heartbeat having been registered first.  See CONTRACTS.md.
         "protocol": "meshcore",
     }
-    _queue._queue_post_json("/api/positions", payload)
+    # This builder posts directly instead of routing through the generic
+    # position handler, so enrich it with the captured LoRa radio metadata
+    # (lora_freq / modem_preset) here — otherwise every MeshCore position row
+    # lands with nil radio config, unlike MeshCore messages and node upserts,
+    # which are already enriched.  The fields are added only when the ingestor
+    # has captured them from SELF_INFO (absent ⇒ omitted, never nil-stamped).
+    _queue._queue_post_json("/api/positions", _apply_radio_metadata(payload))
