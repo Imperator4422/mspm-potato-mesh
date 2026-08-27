@@ -19,7 +19,20 @@ This document records the **contracts that future protocols must preserve**. The
   - Ruby normalizes via `web/lib/potato_mesh/application/data_processing.rb:canonical_node_parts`.
 - **Dual addressing**: Ruby routes and queries accept either a canonical `!xxxxxxxx` string or a numeric node id; they normalize to `node_id`.
 
-Note: non-Meshtastic protocols will need a strategy to map their native node identifiers into this `!%08x` space. That mapping is intentionally not standardized in code yet.
+Note: non-Meshtastic protocols need a strategy to map their native node identifiers into this `!%08x` space. MeshCore uses the first 4 bytes of the node public key; Reticulum's mapping is defined below. There is no single standardized mapping in code — each protocol's provider owns its own, subject to the rules these two established: the mapping MUST be deterministic and derived from sender-side identity material, so every ingestor hearing the same node produces the same `node_id`.
+
+#### Reticulum node id mapping
+
+The Reticulum provider (`PROTOCOL=reticulum`, `data/mesh_ingestor/protocols/reticulum.py`) maps announces into the canonical id space as follows:
+
+- **Canonical node id** = `!` + the first 4 bytes (8 lowercase hex chars) of the 16-byte Reticulum **destination hash**, mirroring MeshCore's first-4-bytes-of-pubkey rule. Deterministic and sender-side, so two ingestors hearing the same announce upsert the same row.
+- **Full identity is preserved**: `user.publicKey` carries the complete 32-hex destination hash, so truncation loses no information a reader needs.
+- `user.shortName` = the first 4 hex chars of the node id (MeshCore convention); `user.longName` = the display name decoded from announce `app_data`, falling back to the 8-hex hash prefix.
+- One human peer can surface as two node rows (their `lxmf.delivery` and `nomadnetwork.node` destinations hash differently). That is faithful to Reticulum's destination model.
+
+**Collision trade-off (accepted).** Truncating to 4 bytes means two distinct 16-byte destination hashes sharing a 4-byte prefix collapse onto one `node_id`. Within a protocol this is the same accepted trade-off MeshCore's pubkey-prefix mapping has always carried: the colliding records merge into one row, and the odds are negligible at mesh scale (~1 in 4 billion per pair). **Across protocols** the shared `nodes.node_id` keyspace makes a prefix collision a hijack risk instead of a merge, so the web **nodeinfo upsert** (`upsert_node`) refuses cross-protocol overwrites: when the stored row already carries a known protocol and an incoming record resolves to a different one, the record is skipped entirely (logged at debug level) rather than allowed to flip the row's protocol or overwrite its fields. The one exception is the established `meshtastic` → `meshcore` self-heal (bug #747): `meshtastic` doubles as the schema/classification default, so a `meshcore` record may still reclaim a default-stamped row. The guard covers the nodeinfo upsert only: position, telemetry, and last-seen touch writes key on the bare `node_id` without a protocol check, so a cross-protocol prefix collision can still attach position or telemetry fields to the row or advance its `last_heard` (extending the guard to those paths is a tracked follow-up).
+
+**Deployment ordering.** The web whitelist must accept a protocol before any ingestor posts it: if an ingestor ships a protocol the deployed web tier does not yet know, protocol resolution files those records under the `meshtastic` default and the misclassification persists after the web tier is upgraded. Concretely for reticulum: deploy (or merge) the web change before or together with the ingestor change, never after.
 
 ### Ingest HTTP routes and payload shapes
 
@@ -31,7 +44,7 @@ Payload is a mapping keyed by canonical node id, with optional top-level `”ing
 
 - `{ “!abcdef01”: { ... node fields ... }, “ingestor”: “!ingestornodeid”, “protocol”: “meshcore” }`
 
-Protocol resolution per-row honours, in order: (1) an explicit per-node `”protocol”` field inside the node entry; (2) the wrapper-level top-level `”protocol”` key; (3) the registered ingestor's protocol (see `POST /api/ingestors`); (4) `”meshtastic”` as the final default. Valid values are `”meshtastic”` and `”meshcore”` — values outside this set fall through to the next source. The wrapper stamp is what the Python ingestor emits unconditionally so the web app classifies records correctly even before the ingestor heartbeat is processed (closes the startup race that misclassified MeshCore placeholders as Meshtastic).
+Protocol resolution per-row honours, in order: (1) an explicit per-node `”protocol”` field inside the node entry; (2) the wrapper-level top-level `”protocol”` key; (3) the registered ingestor's protocol (see `POST /api/ingestors`); (4) `”meshtastic”` as the final default. Valid values are `”meshtastic”`, `”meshcore”`, and `”reticulum”` — values outside this set fall through to the next source. The wrapper stamp is what the Python ingestor emits unconditionally so the web app classifies records correctly even before the ingestor heartbeat is processed (closes the startup race that misclassified MeshCore placeholders as Meshtastic).
 
 Node entry fields are “Meshtastic-ish” (camelCase) and may include the following.
 **As of 0.7.0 each field is additionally accepted in snake_case** (e.g.
@@ -89,7 +102,7 @@ Single message payload:
   - `path` (SPEC RF2) — MeshCore hop-hash route from the library's RX-log⇆message join (`decrypt_channels`): lowercase hex, `path_hash_size`-byte repeater hashes concatenated in travel order (last hash = the repeater heard directly). Absent on a join miss, on RX-log-less firmware, and on direct messages (E2E-encrypted, no join). Stored verbatim; no hash→node resolution is attempted. Additive.
   - Both fields are serialised back on `GET /api/messages`; neither participates in the dedup fingerprint below (the id derivation is byte-identical to pre-RF releases).
 - Meta: `channel_name` (string; only when not encrypted and known), `ingestor` (canonical host id), `lora_freq`, `modem_preset`
-- `protocol` (optional string; `"meshtastic"` or `"meshcore"`) — explicit per-record protocol stamp. Takes precedence over the value inherited from the registered ingestor; values outside the whitelist fall back to the ingestor lookup, then to `"meshtastic"`. Ingestors SHOULD stamp this on every message so the web app classifies senders correctly even before the ingestor heartbeat is processed.
+- `protocol` (optional string; `"meshtastic"`, `"meshcore"`, or `"reticulum"`) — explicit per-record protocol stamp. Takes precedence over the value inherited from the registered ingestor; values outside the whitelist fall back to the ingestor lookup, then to `"meshtastic"`. Ingestors SHOULD stamp this on every message so the web app classifies senders correctly even before the ingestor heartbeat is processed.
 
 **Cross-ingestor deduplication.** The `id` field is the sole dedup key — the server collapses repeat POSTs on the `messages.id` PRIMARY KEY. Protocols that lack a firmware-assigned packet ID MUST derive a stable, sender-side fingerprint so that the same physical transmission heard by multiple ingestors produces the same `id`. The id MUST fit in 53 bits (`0 <= id <= (1 << 53) - 1`) to round-trip through the JavaScript frontend without precision loss.
 
@@ -128,7 +141,7 @@ Single position payload:
 - Quality: `location_source` (string|nil), `precision_bits` (int|nil), `sats_in_view` (int|nil), `pdop` (float|nil)
 - Motion: `ground_speed` (float|nil), `ground_track` (float|nil)
 - RF/meta: `snr`, `rssi`, `hop_limit`, `bitfield`, `payload_b64` (string|nil), `raw` (mapping|nil), `ingestor`, `lora_freq`, `modem_preset`
-- `protocol` (optional string; `"meshtastic"` or `"meshcore"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
+- `protocol` (optional string; `"meshtastic"`, `"meshcore"`, or `"reticulum"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
 
 **Sentinel handling (issue #782).** The same rules as `POST /api/nodes` apply here:
 
@@ -182,9 +195,9 @@ Single telemetry payload:
   are simply omitted, never sent as `null`.
 - Subtype: `telemetry_type` (string|nil) — optional discriminator identifying which Meshtastic protobuf oneof was set; one of `"device"`, `"environment"`, `"power"`, `"air_quality"`, `"local_stats"`, `"health"`, `"host"`, or `"traffic"` (the last four added additively for the LocalStats / HealthMetrics / HostMetrics / TrafficManagementStats variants, TI-A1). Ingestors that detect the subtype SHOULD include this field; omit rather than send `null` when unknown. The web app infers the type from metric-field presence when absent, so old ingestors remain compatible.
 - Meta: `ingestor`, `lora_freq`, `modem_preset`
-- `protocol` (optional string; `"meshtastic"` or `"meshcore"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
+- `protocol` (optional string; `"meshtastic"`, `"meshcore"`, or `"reticulum"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
 
-**MeshCore telemetry sourcing (TI-A3).** MeshCore exposes other nodes' telemetry only as on-air *pull* requests (there is no unsolicited telemetry broadcast the companion library surfaces), so the MeshCore provider collects it three ways and normalises every reading into this same payload shape with `protocol="meshcore"`: (1) **host self-telemetry** over the local companion link (`get_bat` → battery millivolts as `voltage`; `get_self_telemetry` → the host's CayenneLPP sensor list), no LoRa airtime, cadence `MESHCORE_SELF_TELEMETRY_SECONDS` (default 3600 s, matching the host-telemetry suppression window; `<= 0` disables); (2) **round-robin contact polling** (`req_telemetry_sync`, falling back to `req_status_sync` when a node reports no sensors) at one on-air request per `MESHCORE_TELEMETRY_POLL_SECONDS` (default 300 s; `<= 0` disables) regardless of roster size, with each contact additionally capped at **one poll per 24 h** (a fixed per-node cooldown, stamped at the poll attempt so unreachable nodes are not hammered; when every contact is fresh the tick transmits nothing) — and `RX_ONLY=1` forbids these on-air polls entirely (receive-only ingestors; the local self reads in (1) are unaffected); (3) **unsolicited/tag-matched events** (`TELEMETRY_RESPONSE`, `STATUS_RESPONSE`, `BATTERY`) whenever the radio surfaces them. CayenneLPP types map to canonical keys (`temperature`, `humidity`→`relative_humidity`, `barometer`→`barometric_pressure`, `voltage`, `current` — scaled A→mA to match the Meshtastic column convention, `illuminance`→`lux`, `percentage`→`battery_level`); status `bat`/`level` millivolt gauges map to `voltage` (V). MeshCore assigns no firmware packet id, so the record `id` is the deterministic 53-bit fingerprint of *(node id, receive second, source kind)* — re-reads of the same source in the same second collapse into one row via the `telemetry.id` upsert.
+**MeshCore telemetry sourcing (TI-A3).** MeshCore exposes other nodes' telemetry only as on-air *pull* requests (there is no unsolicited telemetry broadcast the companion library surfaces), so the MeshCore provider collects it three ways and normalises every reading into this same payload shape with `protocol="meshcore"`: (1) **host self-telemetry** over the local companion link (`get_bat` → battery millivolts as `voltage`; `get_self_telemetry` → the host's CayenneLPP sensor list), no LoRa airtime, cadence `MESHCORE_SELF_TELEMETRY_SECONDS` (default 3600 s, matching the host-telemetry suppression window; `<= 0` disables); (2) **round-robin contact polling** (`req_telemetry_sync`, falling back to `req_status_sync` when a node reports no sensors) at one on-air request per `MESHCORE_TELEMETRY_POLL_SECONDS` (default 300 s; `<= 0` disables) regardless of roster size, with each contact additionally capped at **one poll per 24 h** (a fixed per-node cooldown, stamped at the poll attempt so unreachable nodes are not hammered; when every contact is fresh the tick transmits nothing) — and the transmit policy gates these on-air polls entirely — they require `TX_ENABLED=1` (default `0`, so an ingestor polls no other node unless its operator opts in), and the legacy `RX_ONLY=1` vetoes them regardless; the local self reads in (1) cost no airtime and are unaffected; (3) **unsolicited/tag-matched events** (`TELEMETRY_RESPONSE`, `STATUS_RESPONSE`, `BATTERY`) whenever the radio surfaces them. CayenneLPP types map to canonical keys (`temperature`, `humidity`→`relative_humidity`, `barometer`→`barometric_pressure`, `voltage`, `current` — scaled A→mA to match the Meshtastic column convention, `illuminance`→`lux`, `percentage`→`battery_level`); status `bat`/`level` millivolt gauges map to `voltage` (V). MeshCore assigns no firmware packet id, so the record `id` is the deterministic 53-bit fingerprint of *(node id, receive second, source kind)* — re-reads of the same source in the same second collapse into one row via the `telemetry.id` upsert.
 
 #### `POST /api/neighbors`
 
@@ -195,7 +208,7 @@ Neighbors snapshot payload:
 - Snapshot time: `rx_time`, `rx_iso`
 - Optional: `node_broadcast_interval_secs` (int|nil), `last_sent_by_id` (canonical string|nil)
 - Meta: `ingestor`, `lora_freq`, `modem_preset`
-- `protocol` (optional string; `"meshtastic"` or `"meshcore"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
+- `protocol` (optional string; `"meshtastic"`, `"meshcore"`, or `"reticulum"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
 
 #### `POST /api/traces`
 
@@ -207,7 +220,38 @@ Single trace payload:
 - Time: `rx_time` (int), `rx_iso` (string)
 - Metrics: `rssi` (int|nil), `snr` (float|nil), `elapsed_ms` (int|nil)
 - Meta: `ingestor`, `lora_freq`, `modem_preset`
-- `protocol` (optional string; `"meshtastic"` or `"meshcore"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
+- `protocol` (optional string; `"meshtastic"`, `"meshcore"`, or `"reticulum"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
+
+#### `POST /api/waypoints`
+
+Single waypoint payload (Meshtastic `WAYPOINT_APP` broadcasts — community
+points of interest; SPEC W1/W2). The collection is **protocol-neutral**: any
+protocol may emit waypoints via this shape, Meshtastic is simply today's only
+emitter.
+
+- Required: `id` (int — the sender-assigned waypoint id, **not** a packet id), `rx_time` (int), `rx_iso` (string)
+- Author: `node_id` (canonical string), `node_num` (int|nil), `from_id` (string/int)
+- Content: `name` (string|nil), `description` (string|nil), `icon` (int|nil — unicode codepoint rendered as the marker glyph)
+- Position: `latitude`, `longitude` (floats|nil; the protobuf `latitude_i`/`longitude_i` 1e-7 integer forms are also accepted). The paired `(0, 0)` no-fix sentinel is collapsed to NULL on both axes (issue #782 rules).
+- Lifecycle: `expire` (int unix|nil — `0`/absent means **never expires** and is stored as NULL), `locked_to` (canonical string or int node num|nil — `0` means unlocked; stored as the canonical `!%08x` id)
+- RF/meta: `snr` (float|nil), `rssi` (int|nil), `hop_limit` (int|nil), `payload_b64` (string|nil), `ingestor`
+- `protocol` (optional string; `"meshtastic"`, `"meshcore"`, or `"reticulum"`) — explicit per-record protocol stamp; same semantics as on `POST /api/messages`.
+
+**Upsert semantics (SPEC W5).** Rows are keyed on `(id, protocol)`: a
+re-broadcast of the same waypoint id **replaces the content fields outright**
+(`name`, `description`, `icon`, coordinates, `expire`, `locked_to`) — the
+newest broadcast is the full new state, so a cleared description or moved pin
+propagates — while RF metadata COALESCEs (an update omitting `snr` keeps the
+last reading). An out-of-order re-broadcast whose `rx_time` is older than the
+stored row is ignored entirely, so two ingestors relaying one waypoint can
+never regress a newer edit (the C5 cross-ingestor dedup applied to POIs).
+
+**Privacy (SPEC W3).** Waypoint `name`/`description` are user-authored
+content, so the read surface is gated at **message grade**: under `PRIVATE=1`
+`GET /api/waypoints` returns 404 and no `waypoints` SSE change events are
+emitted. Unlike `/api/messages`, the ingest `POST` stays open in private mode
+(data may be collected, never exposed). Waypoints whose author node carries
+the opt-out marker are excluded from every read surface.
 
 #### `POST /api/ingestors`
 
@@ -217,7 +261,7 @@ Heartbeat payload:
 - `start_time` (int), `last_seen_time` (int)
 - `version` (string)
 - Optional: `lora_freq`, `modem_preset`
-- Optional: `protocol` (string; e.g. `"meshtastic"`, `"meshcore"`) — declares the mesh backend for this ingestor; defaults to `"meshtastic"` when absent
+- Optional: `protocol` (string; e.g. `"meshtastic"`, `"meshcore"`, `"reticulum"`) — declares the mesh backend for this ingestor; defaults to `"meshtastic"` when absent
 - Optional: `packets` (int ≥ 0) — **mesh-activity delta (SPEC MA1/MA2).** The merged count of *every* frame this ingestor handled since its previous heartbeat: all received frames (including ignored / errored / unimplemented) **plus** its own transmissions (announcement + MeshCore telemetry polls), counted at the earliest receive/transmit seam so nothing is under-reported. It is a **per-interval delta** (reset on each send), **not** a since-boot cumulative. Additive and backward-compatible: an absent or negative value records no activity, so pre-feature ingestors are unaffected.
 
 **Mesh-activity time-series (SPEC MA3).** Each heartbeat carrying a non-negative `packets` value appends one **append-only** row to the `ingestor_activity` table (`ingestor_id`, `at`, `packets`, `protocol`; `data/ingestor_activity.sql`); the `ingestors` snapshot row is upserted as before. Each ingestor's contribution is stored separately (never pre-summed) so a packets/hour moving average is computable across time × protocol × multiple ingestors. The row is best-effort — a failed activity insert never sinks the liveness heartbeat (still `201`). Rows are pruned by the retention worker on `at`. The read-side aggregate is served by `GET /api/stats` (`<scope>.packets.hour`, below).
@@ -228,7 +272,7 @@ Heartbeat payload:
 
 ### GET endpoint filtering
 
-All collection GET endpoints (`/api/nodes`, `/api/messages`, `/api/positions`, `/api/telemetry`, `/api/traces`, `/api/neighbors`, `/api/ingestors`) accept an optional `?protocol=<value>` query parameter. When present, only records whose `protocol` column matches the given value are returned. The `protocol` field is included in all GET responses.
+All collection GET endpoints (`/api/nodes`, `/api/messages`, `/api/positions`, `/api/telemetry`, `/api/traces`, `/api/neighbors`, `/api/ingestors`, `/api/waypoints`) accept an optional `?protocol=<value>` query parameter. When present, only records whose `protocol` column matches the given value are returned. The `protocol` field is included in all GET responses.
 
 ### GET endpoint time windows
 
@@ -241,6 +285,7 @@ Every read endpoint enforces a server-side rolling-window floor on the data it r
 | `GET /api/positions` | 7 days | filtered by `COALESCE(rx_time, position_time)` |
 | `GET /api/telemetry` | 7 days | filtered by `COALESCE(rx_time, telemetry_time)` |
 | `GET /api/instances` | 7 days | filtered by `instances.last_update_time` |
+| `GET /api/waypoints` | 7 days | filtered by `waypoints.rx_time`; rows past their `expire` timestamp are additionally excluded from the moment of expiry (SPEC W5). **404 under `PRIVATE=1`** (message-grade privacy, SPEC W3). The per-author `GET /api/waypoints/:id` (SPEC W11 — feeds the node page's Waypoints section) uses the standard per-id **28-day** window and the same expiry/privacy gates. |
 | `GET /api/neighbors` | **28 days** | sparse data; widened to keep slow scrapes visible |
 | `GET /api/traces` | **28 days** | sparse data; same rationale |
 | `GET /api/ingestors` | **28 days** | sparse heartbeats; same rationale |
@@ -254,8 +299,9 @@ The constants live in `web/lib/potato_mesh/config.rb` (`week_seconds`, `four_wee
 
 ### GET endpoint backward pagination (`?before=`)
 
-The six bulk collection endpoints — `GET /api/nodes`, `/api/positions`,
-`/api/telemetry`, `/api/neighbors`, `/api/traces`, and `/api/ingestors` — plus the
+The seven bulk collection endpoints — `GET /api/nodes`, `/api/positions`,
+`/api/telemetry`, `/api/neighbors`, `/api/traces`, `/api/ingestors`, and
+`/api/waypoints` — plus the
 pre-existing `GET /api/messages` cursor accept an optional `?before=<unix_seconds>`
 **inclusive upper-bound cursor** for backward pagination. It is the companion to
 `?since=`: where `since` raises the lower bound of the window, `before` lowers the
@@ -271,6 +317,7 @@ already orders by, newest first:
 | `GET /api/neighbors` | `rx_time` |
 | `GET /api/traces` | `rx_time` |
 | `GET /api/ingestors` | `last_seen_time` |
+| `GET /api/waypoints` | `rx_time` |
 
 To page backward through more than one `limit`-sized response (the per-request cap
 is `MAX_QUERY_LIMIT` = 1000), walk newest → oldest: fetch a page, then re-request
@@ -305,19 +352,21 @@ do **not** accept `before`.
   "total":      { "nodes": {…}, "messages": {…}, "telemetry": {…}, "packets": { "hour": 50 } },
   "meshcore":   { "nodes": {…}, "messages": {…}, "telemetry": {…}, "packets": { "hour": 50 } },
   "meshtastic": { "nodes": {…}, "messages": {…}, "telemetry": {…}, "packets": { "hour": 30 } },
-  "reticulum":  { "nodes": {…}, "messages": {…}, "telemetry": {…}, "packets": { "hour": 0 } },  // stub: always 0
+  "reticulum":  { "nodes": {…}, "messages": {…}, "telemetry": {…}, "packets": { "hour": 10 } },
   "sampled": false
 }
 ```
 
 - **Scopes.** `total` counts every visible row regardless of protocol; `meshcore`,
   `meshtastic`, and `reticulum` are `protocol = ?` subsets, so
-  `total ≥ Σ named protocols`. `reticulum` is a forward-looking stub (no Reticulum
-  ingestor exists yet) and is always all-zero.
+  `total ≥ Σ named protocols`. All three named scopes are live: `reticulum`
+  shipped as an always-zero forward-looking stub and carries real counts since
+  the Reticulum ingestor (`PROTOCOL=reticulum`) landed.
 - **Metrics.** `nodes` counts `nodes` by `last_heard`; `messages` counts `messages`
   by `rx_time`; `telemetry` is the umbrella over `positions` + `telemetry` +
-  `neighbors` + `traces` (every non-message packet record) by `rx_time`; `packets`
-  is the additive MA4/MA5 packets/hour rate (below).
+  `neighbors` + `traces` + `waypoints` (every non-message packet record — the
+  waypoints table joined the umbrella per SPEC W9, amending S3) by `rx_time`;
+  `packets` is the additive MA4/MA5 packets/hour rate (below).
 - **Windows.** The `nodes`/`messages`/`telemetry` metrics map to
   `{ "hour", "day", "week", "month" }` integer counts at the fixed cutoffs
   (1 h / 24 h / `week_seconds` / `four_weeks_seconds`); `month` cannot exceed the
@@ -334,8 +383,12 @@ do **not** accept `before`.
   busiest vantage is the best dedup-free estimate of air traffic and never
   double-counts a frame heard by two radios. `total.packets.hour` is the **SUM**
   of the per-protocol rates (distinct protocols ride distinct frequencies, so they
-  add rather than dedup); `reticulum.packets.hour` is the always-zero
-  forward-looking stub. Unlike `messages`, it is **not** privacy-gated
+  add rather than dedup); `reticulum.packets.hour` shipped as an always-zero
+  stub and reports the real rate since the Reticulum ingestor landed. The rate
+  only moves when the reticulum ingestor's heartbeat registers, which requires
+  the operator-supplied `INGESTOR_NODE_ID` (Reticulum has no handshake revealing
+  "our" node id; the provider warns at startup when it is unset). Unlike
+  `messages`, it is **not** privacy-gated
   (packets are a public aggregate, no message content). Additive to the 0.7.x
   `/api/stats` tree — no version bump; the ingestor dogfeeds it for the activity
   announcement (MA6).
@@ -351,7 +404,7 @@ An optional `since` bypasses the response cache.
 
 ```jsonc
 [
-  { "bucket_start": 1785000000, "bucket_end": 1785003600, "total": 120, "meshcore": 44, "meshtastic": 76 },
+  { "bucket_start": 1785000000, "bucket_end": 1785003600, "total": 130, "meshcore": 44, "meshtastic": 76, "reticulum": 10 },
   …
 ]
 ```
@@ -359,8 +412,11 @@ An optional `since` bypasses the response cache.
 Each bucket's per-protocol value is the **MAX** over that protocol's ingestors of
 their summed `packets` in the bucket, ÷ the bucket's hour-span → a packets/hour
 rate; `total` is the **SUM** across protocols (matching the live
-`<scope>.packets.hour`, SPEC MA4). `reticulum` folds into `total` but has no series
-key. Buckets are ascending by `bucket_start`. Additive, read-side — no version bump.
+`<scope>.packets.hour`, SPEC MA4). Every known protocol (`meshcore`,
+`meshtastic`, `reticulum`) emits its own series key; `reticulum` originally
+folded into `total` without a key and went live with the Reticulum ingestor
+(SPEC F2-2 as amended). Buckets are ascending by `bucket_start`. Additive,
+read-side — no version bump.
 
 ### GET /api/events live-update stream (SSE)
 

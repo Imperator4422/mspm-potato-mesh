@@ -212,6 +212,30 @@ module PotatoMesh
         nil
       end
 
+      # Decide whether an incoming node record collides with a stored row of a
+      # different protocol and must therefore be skipped (the cross-protocol
+      # node-row hijack guard in {#upsert_node}).
+      #
+      # A stored +"meshtastic"+ value doubles as the schema default stamped on
+      # rows ingested before their protocol was known, so a +"meshcore"+
+      # record may still reclaim such a row — the established bug #747
+      # self-heal that the upsert's +NULLIF(nodes.protocol,'meshtastic')+
+      # conflict clause implements.  Every other differing pairing between two
+      # known protocols is a genuine 4-byte id collision across protocols and
+      # is rejected.
+      #
+      # @param stored_protocol [String, nil] protocol currently on the row, or
+      #   nil when no row exists yet.
+      # @param incoming_protocol [String] resolved protocol of the incoming
+      #   record.
+      # @return [Boolean] true when the record must be skipped.
+      def cross_protocol_conflict?(stored_protocol, incoming_protocol)
+        return false unless KNOWN_PROTOCOLS.include?(stored_protocol)
+        return false if stored_protocol == incoming_protocol
+        return false if stored_protocol == "meshtastic" && incoming_protocol == "meshcore"
+        true
+      end
+
       # Insert or update a node row from an inbound NodeInfo-style payload.
       #
       # Two-phase write. Phase one is the freshness-guarded upsert: a record
@@ -267,6 +291,35 @@ module PotatoMesh
           loc_source = pick_alias(pos, "locationSource", "location_source")
         end
         node_num = resolve_node_num(node_id, n)
+
+        # Cross-protocol node-row hijack guard.  +nodes.node_id+ is a global
+        # TEXT primary key shared by every protocol's id mapping, and both the
+        # MeshCore and Reticulum mappings truncate a native identifier to its
+        # first 4 bytes — so two nodes on *different* protocols can collide on
+        # one +node_id+.  Without this guard the colliding record would pass
+        # the freshness guard below (Reticulum announces stamp a wall-clock
+        # +lastHeard+) and overwrite the stored row's fields wholesale, with
+        # the row's protocol either flipped or silently mismatched.  Skip such
+        # records entirely; neither row's data may corrupt the other's.
+        # Same-protocol prefix collisions remain the accepted MeshCore-
+        # inherited merge behaviour (see CONTRACTS.md, "Reticulum node id
+        # mapping"), and a stored default-'meshtastic' row may still be
+        # reclaimed by a meshcore record (the #747 self-heal preserved by
+        # +cross_protocol_conflict?+).
+        stored_protocol = db.get_first_value(
+          "SELECT protocol FROM nodes WHERE node_id = ? LIMIT 1",
+          [node_id],
+        )
+        if cross_protocol_conflict?(stored_protocol, protocol)
+          debug_log(
+            "Skipped cross-protocol node upsert",
+            context: "data_processing.upsert_node",
+            node_id: node_id,
+            stored_protocol: stored_protocol,
+            incoming_protocol: protocol,
+          )
+          return
+        end
 
         # The prometheus helper still receives the raw `pos` so that gauges
         # not affected by sentinel handling (e.g. precision_bits) keep
@@ -475,7 +528,7 @@ module PotatoMesh
         synthetic_ids = db.execute(
           "SELECT node_id FROM nodes WHERE long_name = ? AND synthetic = 1 AND protocol = 'meshcore' AND node_id != ?",
           [long_name, real_node_id],
-        ).map { |row| row[0] }
+        ).map { |row| row.is_a?(Hash) ? row["node_id"] : row[0] }
 
         synthetic_ids.each do |synthetic_id|
           db.execute(
@@ -505,8 +558,10 @@ module PotatoMesh
       # @param long_name [String] long name to match against existing real rows.
       # @return [void]
       def merge_into_real_node(db, synthetic_node_id, long_name)
-        # Index by [0] rather than the hash key so this works whether the db
-        # handle was opened with results_as_hash = true or not.
+        # Read the single node_id column shape-robustly (see the +row.is_a?(Hash)+
+        # guard below): a +results_as_hash = true+ handle yields plain Hash rows
+        # with string keys only under sqlite3 2.x, where integer indexing (+row[0]+)
+        # returns nil — sqlite3 1.x uniquely allowed both integer and string keys.
         real_rows = db.execute(
           "SELECT node_id FROM nodes WHERE long_name = ? AND synthetic = 0 AND protocol = 'meshcore' AND node_id != ? LIMIT 2",
           [long_name, synthetic_node_id],
@@ -534,7 +589,7 @@ module PotatoMesh
         row = real_rows.first
         return unless row
 
-        real_node_id = row[0]
+        real_node_id = row.is_a?(Hash) ? row["node_id"] : row[0]
         return unless real_node_id
 
         db.execute(

@@ -799,6 +799,131 @@ RSpec.describe PotatoMesh::App::Queries do
     end
   end
 
+  describe "#query_waypoints" do
+    before do
+      with_db do |db|
+        rx_iso = Time.at(now).utc.iso8601
+        # w1: fresh, never expires (NULL), meshtastic.
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name, latitude, longitude, icon) VALUES (?,?,?,?,?,?,?,?)",
+          [1, now, rx_iso, "!aabbccdd", "Fresh pin", 52.5, 13.4, 0x2708],
+        )
+        # w2: expires in the future, meshcore.
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name, expire, protocol) VALUES (?,?,?,?,?,?,?)",
+          [2, now - 60, rx_iso, "!aabbccdd", "Core pin", now + 3600, "meshcore"],
+        )
+        # w3: already expired — must never surface (W5).
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name, expire) VALUES (?,?,?,?,?,?)",
+          [3, now - 120, rx_iso, "!aabbccdd", "Dead pin", now - 10],
+        )
+        # w4: outside the 7-day rx_time floor (C4).
+        eight_days_ago = now - (8 * 24 * 60 * 60)
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name) VALUES (?,?,?,?,?)",
+          [4, eight_days_ago, Time.at(eight_days_ago).utc.iso8601, "!aabbccdd", "Old pin"],
+        )
+        # w5: blank rx_iso exercises the ISO backfill branch.
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name) VALUES (?,?,?,?,?)",
+          [5, now - 30, "", "!aabbccdd", "Blank iso pin"],
+        )
+      end
+    end
+
+    it "returns fresh waypoint rows and excludes expired ones (W5)" do
+      ids = queries.query_waypoints(10, now: now).map { |r| r["id"] }
+      expect(ids).to contain_exactly(1, 2, 5)
+    end
+
+    it "keeps never-expiring waypoints and omits their expire key" do
+      row = queries.query_waypoints(10, now: now).find { |r| r["id"] == 1 }
+      expect(row).not_to have_key("expire")
+      expect(row["icon"]).to eq(0x2708)
+    end
+
+    it "enforces the 7-day rx_time floor that since cannot widen (C4)" do
+      ids = queries.query_waypoints(10, since: 1, now: now).map { |r| r["id"] }
+      expect(ids).not_to include(4)
+    end
+
+    it "narrows with the inclusive before cursor for waypoint backward pagination (BP1)" do
+      ids = queries.query_waypoints(10, before: now - 30, now: now).map { |r| r["id"] }
+      expect(ids).to contain_exactly(2, 5)
+
+      # Invalid cursors are ignored as absent, matching the messages route.
+      ids = queries.query_waypoints(10, before: "abc", now: now).map { |r| r["id"] }
+      expect(ids).to contain_exactly(1, 2, 5)
+    end
+
+    it "excludes waypoints authored by an opted-out node (waypoint opt-out, W3)" do
+      marker = PotatoMesh::Config.node_opt_out_marker
+      with_db do |db|
+        db.execute(
+          "INSERT INTO nodes(node_id, num, short_name, long_name, last_heard, first_heard, role) VALUES (?,?,?,?,?,?,?)",
+          ["!0ccaa7ed", 0x0ccaa7ed, "OPT", "Opted #{marker} Out", now, now, "CLIENT"],
+        )
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name) VALUES (?,?,?,?,?)",
+          [6, now, Time.at(now).utc.iso8601, "!0ccaa7ed", "Hidden pin"],
+        )
+      end
+      ids = queries.query_waypoints(10, now: now).map { |r| r["id"] }
+      expect(ids).not_to include(6)
+    end
+
+    it "filters waypoints by protocol (W2)" do
+      ids = queries.query_waypoints(10, protocol: "meshcore", now: now).map { |r| r["id"] }
+      expect(ids).to contain_exactly(2)
+    end
+
+    it "backfills a blank rx_iso from rx_time" do
+      row = queries.query_waypoints(10, now: now).find { |r| r["id"] == 5 }
+      expect(row["rx_iso"]).to eq(Time.at(now - 30).utc.iso8601)
+    end
+
+    it "falls back to the current clock when now is not coercible" do
+      ids = queries.query_waypoints(10, now: "not-a-time").map { |r| r["id"] }
+      expect(ids).to include(1)
+    end
+
+    it "scopes to one author and widens to the 28-day per-id waypoint window (W11)" do
+      # The suite-wide harness stubs four_weeks_seconds down to 7 days; this
+      # example is ABOUT the bulk-vs-per-id floor difference, so restore the
+      # real 28-day value for its duration.
+      allow(PotatoMesh::Config).to receive(:four_weeks_seconds).and_return(28 * 24 * 60 * 60)
+      ten_days_ago = now - (10 * 24 * 60 * 60)
+      with_db do |db|
+        db.execute(
+          "INSERT OR IGNORE INTO nodes(node_id, num, last_heard, first_heard, role) VALUES (?,?,?,?,?)",
+          ["!aabbccdd", 0xaabbccdd, now, now, "CLIENT"],
+        )
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, node_num, name) VALUES (?,?,?,?,?,?)",
+          [7, ten_days_ago, Time.at(ten_days_ago).utc.iso8601, "!aabbccdd", 0xaabbccdd, "Old but in per-id window"],
+        )
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name) VALUES (?,?,?,?,?)",
+          [8, now, Time.at(now).utc.iso8601, "!11223344", "Someone else"],
+        )
+      end
+      # Author scope: only !aabbccdd rows; the 10-day-old row is INSIDE the
+      # widened 28-day per-id window (it is outside the 7-day bulk floor).
+      ids = queries.query_waypoints(10, node_ref: "!aabbccdd", now: now).map { |r| r["id"] }
+      expect(ids).to include(7)
+      expect(ids).not_to include(8)
+      # The same row stays hidden from the bulk feed (7-day floor, C4).
+      bulk_ids = queries.query_waypoints(10, now: now).map { |r| r["id"] }
+      expect(bulk_ids).not_to include(7)
+      # Numeric refs resolve through the node lookup like other per-id queries.
+      num_ids = queries.query_waypoints(10, node_ref: 0xaabbccdd, now: now).map { |r| r["id"] }
+      expect(num_ids).to include(7)
+      # An unresolvable reference yields an empty result, not an error.
+      expect(queries.query_waypoints(10, node_ref: "definitely-not-a-node", now: now)).to eq([])
+    end
+  end
+
   describe "#query_neighbors" do
     before do
       with_db do |db|
@@ -1225,17 +1350,26 @@ RSpec.describe PotatoMesh::App::Queries do
       )
     end
 
-    it "aggregates positions, telemetry, neighbors, and traces into the telemetry umbrella" do
+    it "aggregates positions, telemetry, neighbors, traces, and waypoints into the telemetry umbrella (W9)" do
       with_db do |db|
         rx_iso = Time.at(now).utc.iso8601
         db.execute("INSERT INTO positions(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!feed0001"])
         db.execute("INSERT INTO telemetry(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!feed0001"])
         db.execute("INSERT INTO neighbors(node_id, neighbor_id, rx_time) VALUES (?,?,?)", ["!feed0001", "!feed0002", now])
         db.execute("INSERT INTO traces(id, rx_time, rx_iso, src, dest) VALUES (?,?,?,?,?)", [1, now, rx_iso, 0x11, 0x22])
+        db.execute("INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name) VALUES (?,?,?,?,?)", [1, now, rx_iso, "!feed0001", "Pin"])
+        db.execute(
+          "INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name, protocol) VALUES (?,?,?,?,?,?)",
+          [2, now, rx_iso, "!feed0001", "Core pin", "meshcore"],
+        )
       end
       stats = queries.query_active_node_stats(now: now)
-      # One row in each of the four umbrella tables → 4.
-      expect(stats["total"]["telemetry"]["hour"]).to eq(4)
+      # One row in each of the five umbrella tables plus a meshcore waypoint →
+      # 6 in total (S3 as amended by W9; re-baselines S-A3 per WP-A8).
+      expect(stats["total"]["telemetry"]["hour"]).to eq(6)
+      # Waypoint rows are protocol-stamped, so they land in their matching
+      # protocol scope and the S2 subset property holds.
+      expect(stats["meshcore"]["telemetry"]["hour"]).to eq(1)
     end
 
     it "caps the node month bucket at four_weeks_seconds (28 days)" do
@@ -1263,14 +1397,18 @@ RSpec.describe PotatoMesh::App::Queries do
       expect(stats["total"]["telemetry"]["month"]).to eq(1)
     end
 
-    it "emits reticulum as an all-zero stub" do
+    it "counts reticulum nodes under their own live scope" do
       with_db do |db|
         db.execute("INSERT INTO nodes(node_id, num, last_heard, first_heard, role) VALUES (?,?,?,?,?)", ["!any00001", 1, now, now, "CLIENT"])
+        db.execute(
+          "INSERT INTO nodes(node_id, num, last_heard, first_heard, role, protocol) VALUES (?,?,?,?,?,?)",
+          ["!reti0001", 2, now, now, "CLIENT", "reticulum"],
+        )
       end
       stats = queries.query_active_node_stats(now: now)
-      stats["reticulum"].each_value do |windows|
-        windows.each_value { |count| expect(count).to eq(0) }
-      end
+      expect(stats["reticulum"]["nodes"]["day"]).to eq(1)
+      expect(stats["reticulum"]["messages"]["day"]).to eq(0)
+      expect(stats["total"]["nodes"]["day"]).to eq(2)
     end
 
     it "zeroes message counts in private mode but keeps nodes and telemetry" do
@@ -1291,6 +1429,82 @@ RSpec.describe PotatoMesh::App::Queries do
       # Non-message metrics are unaffected by privacy mode.
       expect(stats["total"]["nodes"]["day"]).to eq(1)
       expect(stats["total"]["telemetry"]["day"]).to eq(1)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Issue #866 regression: the /api/stats windowed counts must let SQLite reach
+  # each source's rx_time / last_heard index instead of materialising an entire
+  # table into the +visible+ CTE and scanning it once per window.  Pushing the
+  # widest ("month") cutoff onto each projection's raw indexed column pre-filters
+  # +visible+ to the 28-day slice -- byte-identical counts (SPEC S4) with an
+  # index-seeked plan.  Before the fix the telemetry umbrella full-scans its four
+  # sources; this guard fails until the pushdown lands and cannot silently
+  # regress afterwards.
+  # ---------------------------------------------------------------------------
+  describe "windowed stats query plan (issue #866)" do
+    # Window cutoffs mirroring query_active_node_stats; "month" is the widest and
+    # is the bound pushed down into every projection.
+    let(:stats_cutoffs) do
+      {
+        "hour" => now - 3600,
+        "day" => now - 86_400,
+        "week" => now - PotatoMesh::Config.week_seconds,
+        "month" => now - PotatoMesh::Config.four_weeks_seconds,
+      }
+    end
+
+    # Seed one row per stats source so EXPLAIN reasons about populated tables.
+    before do
+      with_db do |db|
+        rx_iso = Time.at(now).utc.iso8601
+        db.execute("INSERT INTO nodes(node_id, num, last_heard, first_heard, role) VALUES (?,?,?,?,?)", ["!plan0001", 0x90000001, now, now, "CLIENT"])
+        db.execute("INSERT INTO messages(id, rx_time, rx_iso, from_id, to_id, channel, text) VALUES (?,?,?,?,?,?,?)", [1, now, rx_iso, "!plan0001", "!ffffffff", 0, "hi"])
+        db.execute("INSERT INTO positions(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!plan0001"])
+        db.execute("INSERT INTO telemetry(id, rx_time, rx_iso, node_id) VALUES (?,?,?,?)", [1, now, rx_iso, "!plan0001"])
+        db.execute("INSERT INTO neighbors(node_id, neighbor_id, rx_time) VALUES (?,?,?)", ["!plan0001", "!plan0002", now])
+        db.execute("INSERT INTO traces(id, rx_time, rx_iso, src, dest) VALUES (?,?,?,?,?)", [1, now, rx_iso, 0x11, 0x22])
+        db.execute("INSERT INTO waypoints(id, rx_time, rx_iso, node_id, name) VALUES (?,?,?,?,?)", [1, now, rx_iso, "!plan0001", "Plan pin"])
+      end
+    end
+
+    # Run a stats builder against a recording handle and yield the executed SQL,
+    # its bind params, and the live db handle (so the caller can EXPLAIN it).
+    # Only +get_first_row+ is exercised by the +*_activity_counts+ builders, so
+    # the recorder implements just that method.
+    def with_recorded_statement(builder)
+      with_db do |db|
+        statements = []
+        recorder = Object.new
+        recorder.define_singleton_method(:get_first_row) do |sql, params = []|
+          statements << [sql, params]
+          db.get_first_row(sql, params)
+        end
+        queries.public_send(builder, recorder, stats_cutoffs)
+        sql, params = statements.last
+        yield sql, params, db
+      end
+    end
+
+    it "seeks each telemetry-umbrella source through its rx_time index" do
+      with_recorded_statement(:telemetry_activity_counts) do |sql, params, db|
+        plan = db.execute("EXPLAIN QUERY PLAN #{sql}", params).map { |row| row["detail"] }
+        # Five sources since the W9 umbrella amendment added waypoints.
+        %w[positions telemetry neighbors traces waypoints].each do |table|
+          expect(plan).to include(a_string_matching(/SEARCH #{table} USING INDEX idx_#{table}_rx_time/)),
+            "expected #{table} to be index-seeked; plan was:\n#{plan.join("\n")}"
+        end
+      end
+    end
+
+    it "bounds every stats projection on its raw indexed time column" do
+      with_recorded_statement(:node_activity_counts) { |sql, _, _| expect(sql).to match(/WHERE last_heard >= \?/) }
+      with_recorded_statement(:message_activity_counts) { |sql, _, _| expect(sql).to match(/WHERE rx_time >= \?/) }
+      with_recorded_statement(:telemetry_activity_counts) do |sql, _, _|
+        # One raw-column bound per umbrella source
+        # (positions/telemetry/neighbors/traces/waypoints — five since W9).
+        expect(sql.scan(/rx_time >= \?/).size).to eq(5)
+      end
     end
   end
 
@@ -1357,14 +1571,13 @@ RSpec.describe PotatoMesh::App::Queries do
       expect(queries.query_packets_per_hour(now: now)["meshcore"]).to eq(20) # 480 / 24
     end
 
-    it "keeps reticulum a zero stub even when reticulum activity exists" do
+    it "reports a live reticulum rate when reticulum activity exists" do
       seed_activity([["!reti0001", now - 100, 720, "reticulum"]])
       result = queries.query_packets_per_hour(now: now)
-      # The reticulum scope is always emitted as zero (forward-looking stub)…
-      expect(result["reticulum"]).to eq(0)
-      # …but a reticulum ingestor still contributes to the protocol-agnostic
-      # total (summed across protocols).
-      expect(result["total"]).to eq(30) # sole protocol: 720 / 24
+      # Reticulum went live with the Reticulum ingestor (#888): the scope
+      # carries its real rate and contributes to the protocol-summed total.
+      expect(result["reticulum"]).to eq(30) # 720 / 24
+      expect(result["total"]).to eq(30)
     end
 
     it "rounds the hourly rate to the nearest integer" do
@@ -1449,7 +1662,7 @@ RSpec.describe PotatoMesh::App::Queries do
       expect(starts).to eq(starts.sort)
     end
 
-    it "folds reticulum into the total but emits no reticulum series" do
+    it "emits a reticulum series alongside the other protocols" do
       seed_activity_rows(
         [
           ["!coreaaaa", now - 100, 3_600, "meshcore"],
@@ -1458,7 +1671,7 @@ RSpec.describe PotatoMesh::App::Queries do
       )
       bucket = queries.query_activity_buckets(window_seconds: 86_400, bucket_seconds: 3_600, now: now).first
       expect(bucket["meshcore"]).to eq(3600)
-      expect(bucket).not_to have_key("reticulum")
+      expect(bucket["reticulum"]).to eq(1800)
       expect(bucket["total"]).to eq(3600 + 1800)
     end
 

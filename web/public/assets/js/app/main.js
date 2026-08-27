@@ -65,7 +65,9 @@ import { createMapFocusHandler, DEFAULT_NODE_FOCUS_ZOOM } from './nodes-map-focu
 import { createMapCenterResetHandler } from './map-center-reset.js';
 import { enhanceCoordinateCell } from './nodes-coordinate-links.js';
 import { createShortInfoOverlayStack } from './short-info-overlay-manager.js';
-import { createNodeDetailOverlayManager } from './node-detail-overlay.js';
+// createNodeDetailOverlayManager is dynamic-`import()`ed on first overlay open
+// (see loadNodeDetailOverlayManager) to keep its heavy node-detail renderer
+// subtree out of the dashboard boot graph (frontend perf).
 import { refreshNodeInformation } from './node-details.js';
 import { extractModemMetadata, formatLoraFrequencyMHz, formatModemDisplay, formatPresetDisplay } from './node-modem-metadata.js';
 import {
@@ -168,17 +170,20 @@ import {
 import { renderShortHtml } from './main/short-html-renderer.js';
 import {
   NODE_LIMIT,
+  NODE_TABLE_RENDER_CAP,
   SNAPSHOT_LIMIT,
   TRACE_LIMIT,
   TRACE_MAX_AGE_SECONDS,
   BOOT_CACHE_FLAG,
 } from './main/constants.js';
+import { capNodesForRender, buildShowAllRow, SHOW_ALL_BUTTON_CLASS } from './main/nodes-table-cap.js';
 import {
   fetchNeighbors,
   fetchNodes,
   fetchPositions,
   fetchTelemetry,
   fetchTraces,
+  fetchWaypoints,
   filterRecentTraces,
   resolveSnapshotLimit,
   fetchMessages as fetchMessagesImpl,
@@ -204,7 +209,7 @@ import { createBasemapLayer } from './basemap-config.js';
 import { createTileFailurePolicy } from './main/tile-failure-policy.js';
 import { getActiveFullscreenElement, legendClickHandler } from './main/fullscreen-helpers.js';
 import { createEventStream } from './main/event-stream.js';
-import { flashNodeTargets, flashMessageTargets, emitNodeWaves } from './main/flash.js';
+import { flashNodeTargets, flashMessageTargets, flashElement, emitNodeWaves } from './main/flash.js';
 import { captureOpenMarkerOverlays, restoreMarkerOverlays } from './main/marker-overlay-preservation.js';
 import { collectNodeIds, collectMessageIds, entryMessageId } from './main/flash-targets.js';
 import {
@@ -232,7 +237,13 @@ import {
   filterReportedFields,
   rowActivationHref,
 } from './main/nodes-table-ia.js';
-import { legendLineSampleSvg } from './main/legend-line-samples.js';
+import { legendLineSampleSvg, legendWaypointSampleHtml } from './main/legend-line-samples.js';
+import {
+  buildWaypointOverlayLines,
+  renderWaypointsLayer,
+  waypointGlyph,
+  waypointKey,
+} from './main/waypoint-layer.js';
 
 /**
  * Build the node-table row's two timestamp cells ("last seen" and
@@ -284,8 +295,10 @@ export function initializeApp(config) {
   const autorefreshToggle = document.getElementById('autorefreshToggle');
   const protocolToggleMeshcore = document.getElementById('protocolToggleMeshcore');
   const protocolToggleMeshtastic = document.getElementById('protocolToggleMeshtastic');
+  const protocolToggleReticulum = document.getElementById('protocolToggleReticulum');
   const protocolToggleMeshcoreCount = document.getElementById('protocolToggleMeshcoreCount');
   const protocolToggleMeshtasticCount = document.getElementById('protocolToggleMeshtasticCount');
+  const protocolToggleReticulumCount = document.getElementById('protocolToggleReticulumCount');
   const filterInput = document.getElementById('filterInput');
   const filterClearButton = document.getElementById('filterClear');
   const shortInfoTemplate = document.getElementById('shortInfoOverlayTemplate');
@@ -372,6 +385,8 @@ export function initializeApp(config) {
   let allTelemetryEntries = [];
   /** @type {Array<Object>} */
   let allPositionEntries = [];
+  /** @type {Array<Object>} Community POI waypoints (SPEC W1/W8). */
+  let allWaypoints = [];
   /** @type {Map<string, Object>} */
   let nodesById = new Map();
   let messagesById = new Map();
@@ -395,6 +410,7 @@ export function initializeApp(config) {
   let lastTelemetryTimestamp = 0;
   let lastNeighborTimestamp = 0;
   let lastTraceTimestamp = 0;
+  let lastWaypointTimestamp = 0;
   /** Whether the very first full fetch has completed. */
   let initialFetchDone = false;
   /** Whether the background chat-history backfill is currently running. */
@@ -417,13 +433,29 @@ export function initializeApp(config) {
    * page) — the one-shot background backfill pages backward from here, exactly
    * like {@link chatLiveFrontier}. 0 means "no backfill" (a short newest page,
    * or a warm-cache load whose data is already seeded). Issue #832 / SPEC BP9a.
-   * @type {{ nodes: number, positions: number, telemetry: number, neighbors: number, traces: number }}
+   * @type {{ nodes: number, positions: number, telemetry: number, neighbors: number, traces: number, waypoints: number }}
    */
-  let collectionLiveFrontiers = { nodes: 0, positions: 0, telemetry: 0, neighbors: 0, traces: 0 };
+  let collectionLiveFrontiers = { nodes: 0, positions: 0, telemetry: 0, neighbors: 0, traces: 0, waypoints: 0 };
   /** One-shot guard: the bulk-collection backfill runs once after the first load. */
   let collectionsBackfilled = false;
   /** Settles when the one-shot bulk-collection backfill finishes (test hook). */
   let collectionBackfillPromise = Promise.resolve();
+  /**
+   * Count of full {@link renderFilteredOutputs} repaints. Instrumentation for the
+   * backfill de-jank regression guard: a cold-load backfill streams many pages
+   * (dozens for positions on a busy instance), and each full table + map repaint
+   * is main-thread work, so the pages must be coalesced into a bounded number of
+   * repaints rather than one repaint per page (issue: frontend perf regression).
+   */
+  let renderFilteredOutputsCount = 0;
+  /**
+   * True once the user clicked "show all" to lift the node-table render cap
+   * ({@link NODE_TABLE_RENDER_CAP}); persists for the session so subsequent
+   * refreshes keep showing every row.
+   */
+  let nodeTableExpanded = false;
+  /** Number of node rows the last {@link renderTable} actually rendered (test hook). */
+  let lastRenderedNodeCount = 0;
 
   // Persistent read-side cache (SPEC FC1–FC7). The IndexedDB backend is null
   // when storage is unavailable, and PRIVATE mode disables + wipes the cache —
@@ -516,6 +548,7 @@ export function initializeApp(config) {
       cacheWriteCollection('telemetry', allTelemetryEntries),
       cacheWriteCollection('neighbors', allNeighbors),
       cacheWriteCollection('traces', allTraces),
+      cacheWriteCollection('waypoints', allWaypoints),
       cacheWriteCollection('messages', allMessages.map(messageForCache)),
       cacheWriteCollection('encrypted', allEncryptedMessages.map(messageForCache)),
     ]);
@@ -567,12 +600,13 @@ export function initializeApp(config) {
       return false;
     }
     const nowSeconds = Math.floor(Date.now() / 1000);
-    const [nodeEntries, positionEntries, telemetryEntries, neighborEntries, traceEntries] = await Promise.all([
+    const [nodeEntries, positionEntries, telemetryEntries, neighborEntries, traceEntries, waypointEntries] = await Promise.all([
       readLiveCacheEntries('nodes', nowSeconds),
       readLiveCacheEntries('positions', nowSeconds),
       readLiveCacheEntries('telemetry', nowSeconds),
       readLiveCacheEntries('neighbors', nowSeconds),
       readLiveCacheEntries('traces', nowSeconds),
+      readLiveCacheEntries('waypoints', nowSeconds),
     ]);
     const messageEntries = CHAT_ENABLED ? await readLiveCacheEntries('messages', nowSeconds) : [];
     const encryptedEntries = CHAT_ENABLED ? await readLiveCacheEntries('encrypted', nowSeconds) : [];
@@ -583,7 +617,8 @@ export function initializeApp(config) {
       positionEntries.length === 0 &&
       telemetryEntries.length === 0 &&
       neighborEntries.length === 0 &&
-      traceEntries.length === 0
+      traceEntries.length === 0 &&
+      waypointEntries.length === 0
     ) {
       return false;
     }
@@ -593,6 +628,7 @@ export function initializeApp(config) {
     allTelemetryEntries = telemetryEntries.map(entry => entry.value);
     allNeighbors = neighborEntries.map(entry => entry.value);
     allTraces = traceEntries.map(entry => entry.value);
+    allWaypoints = waypointEntries.map(entry => entry.value);
     rebuildNodeIndex(allNodes);
     const [seededChat, seededEncrypted] = await Promise.all([
       messageNodeHydrator.hydrate(messageEntries.map(entry => entry.value), nodesById),
@@ -617,6 +653,7 @@ export function initializeApp(config) {
     lastTelemetryTimestamp = maxRecordTimestamp(allTelemetryEntries, ['rx_time', 'telemetry_time']);
     lastNeighborTimestamp = maxRecordTimestamp(allNeighbors, ['rx_time']);
     lastTraceTimestamp = maxRecordTimestamp(allTraces, ['rx_time']);
+    lastWaypointTimestamp = maxRecordTimestamp(allWaypoints, ['rx_time']);
     initialFetchDone = true;
     applyFilter();
     return true;
@@ -904,6 +941,31 @@ export function initializeApp(config) {
   }
 
   /**
+   * Fade each changed waypoint's map pin (SPEC W8 as re-rolled: waypoints are
+   * on the flashing side of the live-update boundary). Called after the map
+   * has rendered so the pin elements exist; targets already-rendered markers
+   * only, mirroring {@link flashChangedNodes}.
+   *
+   * @param {Array<Object>} waypointRows Delta rows from the waypoints fetch.
+   * @returns {void}
+   */
+  function flashChangedWaypoints(waypointRows) {
+    if (!Array.isArray(waypointRows) || waypointRows.length === 0) return;
+    const flashed = [];
+    for (const row of waypointRows) {
+      const key = waypointKey(row);
+      if (key == null) continue;
+      const marker = waypointMarkerByKey.get(key);
+      if (!marker) continue; // expired/hidden pins have no live marker
+      // Pins are divIcon markers (no setStyle), so the fade rides the
+      // `.live-flash` class on the marker's DOM element (LV1/LV2 timers).
+      const element = typeof marker.getElement === 'function' ? marker.getElement() : null;
+      if (element && flashElement(element)) flashed.push(key);
+    }
+    if (flashed.length) lastFlashedWaypointKeys = flashed;
+  }
+
+  /**
    * Flash each changed message's chat row(s) and its channel tab header (SPEC
    * VF3). Called after the chat has rendered (so the rows + tabs exist and the
    * message→tab map is populated). Targets already-rendered DOM only.
@@ -1060,6 +1122,17 @@ export function initializeApp(config) {
   let traceLinesVisible = true;
   let neighborLinesToggleButton = null;
   let traceLinesToggleButton = null;
+  /** Leaflet layer group holding the waypoint glyph chips (SPEC W6). */
+  let waypointsLayer = null;
+  /** Whether the waypoint layer is shown (session-only, like the line toggles). */
+  let waypointsVisible = true;
+  let waypointsToggleButton = null;
+  /** Markers rendered by the last waypoint-layer pass (feeds the legend count). */
+  let waypointMarkerCount = 0;
+  /** Waypoint key → live marker, rebuilt each render (W8 re-roll flash). */
+  let waypointMarkerByKey = new Map();
+  /** Waypoint keys flashed by the most recent SSE-ping refresh (test hook). */
+  let lastFlashedWaypointKeys = [];
   let markersLayer = null;
   let spiderLinesLayer = null;
   // Dedicated, never-cleared layer hosting transient LV5 wave rings; each wave
@@ -1625,6 +1698,10 @@ export function initializeApp(config) {
     neighborLinesLayer = L.layerGroup().addTo(map);
     flashWavesLayer = L.layerGroup().addTo(map);
     traceLinesLayer = L.layerGroup().addTo(map);
+    // Waypoint chips (SPEC W6). Renders empty in private mode — the collection
+    // is never fetched there (W3) — and its markers carry zIndexOffset 500 so
+    // POIs annotate above the node markers.
+    waypointsLayer = L.layerGroup().addTo(map);
     // Spider lines render between the connection lines and the markers so the
     // dashed white "leader" lines are visible against neighbour/trace overlays
     // but never sit on top of the marker glyphs themselves.
@@ -1735,15 +1812,17 @@ export function initializeApp(config) {
    */
   function updateNeighborLinesToggleState() {
     if (!neighborLinesToggleButton) return;
-    const label = neighborLinesVisible ? 'Hide neighbor lines' : 'Show neighbor lines';
     // The toggle doubles as the legend key for the solid neighbor-line style
-    // (SPEC UX7, audit D-014).
-    neighborLinesToggleButton.innerHTML = `${legendLineSampleSvg('neighbor')} ${label}`;
+    // (SPEC UX7, audit D-014). The visible label stays static — the pressed
+    // styling carries the state, so no Show/Hide prefix (waypoints re-roll
+    // amendment, matching the design mock); assistive tech still hears the
+    // state via aria-label + aria-pressed.
+    neighborLinesToggleButton.innerHTML = `${legendLineSampleSvg('neighbor')} Neighbor lines`;
     // aria-pressed marks the *selected* (highlighted) state, consistent with the
     // role chips (button.legend-item[aria-pressed="true"]): the toggle is pressed
     // when its lines are visible, unpressed when hidden. (Previously reversed.)
     neighborLinesToggleButton.setAttribute('aria-pressed', neighborLinesVisible ? 'true' : 'false');
-    neighborLinesToggleButton.setAttribute('aria-label', label);
+    neighborLinesToggleButton.setAttribute('aria-label', neighborLinesVisible ? 'Neighbor lines shown' : 'Neighbor lines hidden');
   }
 
   /**
@@ -1772,15 +1851,51 @@ export function initializeApp(config) {
    */
   function updateTraceLinesToggleState() {
     if (!traceLinesToggleButton) return;
-    const label = traceLinesVisible ? 'Hide trace lines' : 'Show trace lines';
     // The toggle doubles as the legend key for the dashed traceroute style
-    // (SPEC UX7, audit D-014).
-    traceLinesToggleButton.innerHTML = `${legendLineSampleSvg('trace')} ${label}`;
+    // (SPEC UX7, audit D-014). Static label; state lives in the pressed
+    // styling + aria (waypoints re-roll amendment, matching the design mock).
+    traceLinesToggleButton.innerHTML = `${legendLineSampleSvg('trace')} Trace lines`;
     // aria-pressed marks the *selected* (highlighted) state, consistent with the
     // role chips: pressed when its lines are visible, unpressed when hidden.
     // (Previously reversed.)
     traceLinesToggleButton.setAttribute('aria-pressed', traceLinesVisible ? 'true' : 'false');
-    traceLinesToggleButton.setAttribute('aria-label', label);
+    traceLinesToggleButton.setAttribute('aria-label', traceLinesVisible ? 'Trace lines shown' : 'Trace lines hidden');
+  }
+
+  /**
+   * Synchronise the Waypoints layer toggle with the active state (SPEC W6,
+   * design 1e-A): the miniature chip sample doubles as the legend key, the
+   * live count shows how many waypoints are on the map, and aria-pressed
+   * follows the same "pressed when visible" convention as the line toggles.
+   *
+   * @returns {void}
+   */
+  function updateWaypointsToggleState() {
+    if (!waypointsToggleButton) return;
+    const label = waypointsVisible ? 'Waypoints shown' : 'Waypoints hidden';
+    waypointsToggleButton.innerHTML =
+      `${legendWaypointSampleHtml()} Waypoints <span class="legend-protocol-count">${waypointMarkerCount}</span>`;
+    waypointsToggleButton.setAttribute('aria-pressed', waypointsVisible ? 'true' : 'false');
+    waypointsToggleButton.setAttribute('aria-label', label);
+  }
+
+  /**
+   * Toggle the Leaflet layer that renders waypoint chips (SPEC W6).
+   *
+   * @param {boolean} visible Whether to show the waypoint layer.
+   * @returns {void}
+   */
+  function setWaypointsVisibility(visible) {
+    waypointsVisible = Boolean(visible);
+    if (waypointsLayer && map) {
+      const hasLayer = map.hasLayer(waypointsLayer);
+      if (waypointsVisible && !hasLayer) {
+        waypointsLayer.addTo(map);
+      } else if (!waypointsVisible && hasLayer) {
+        map.removeLayer(waypointsLayer);
+      }
+    }
+    updateWaypointsToggleState();
   }
 
   /**
@@ -1843,6 +1958,7 @@ export function initializeApp(config) {
     const toggles = [
       { btn: protocolToggleMeshcore, protocol: 'meshcore', name: 'MeshCore' },
       { btn: protocolToggleMeshtastic, protocol: 'meshtastic', name: 'Meshtastic' },
+      { btn: protocolToggleReticulum, protocol: 'reticulum', name: 'Reticulum' },
     ];
     toggles.forEach(({ btn, protocol, name }) => {
       if (!btn) return;
@@ -2007,6 +2123,20 @@ export function initializeApp(config) {
       }));
       updateTraceLinesToggleState();
 
+      // Waypoints layer toggle (SPEC W6, design 1e-A): sits beneath the two
+      // line toggles inside the Meshtastic column — column membership is the
+      // whole "Meshtastic only" statement, mirroring how the line toggles
+      // already live here. Omitted entirely in private mode: the collection
+      // 404s there (W3), so no waypoint UI renders.
+      if (!isPrivateMode) {
+        waypointsToggleButton = L.DomUtil.create('button', 'legend-item legend-toggle-waypoints', meshtasticCol);
+        waypointsToggleButton.type = 'button';
+        waypointsToggleButton.addEventListener('click', legendClickHandler(() => {
+          setWaypointsVisibility(!waypointsVisible);
+        }));
+        updateWaypointsToggleState();
+      }
+
       updateLegendRoleFiltersUI();
 
       // --- Clear filters — full-width below the two columns ---
@@ -2060,16 +2190,63 @@ export function initializeApp(config) {
     setLegendVisibility(false);
   }
 
-  const nodeDetailOverlayManager = createNodeDetailOverlayManager({
-    document,
-    privateMode: isPrivateMode,
-  });
+  // Lazily import + create the node-detail overlay manager on first open, then
+  // cache it. The overlay reuses the heavy node-detail renderer (node-page +
+  // charts, ~125 KB) which the dashboard only needs when a user opens a node, so
+  // keeping it behind a dynamic import removes that subtree from the synchronous
+  // boot graph (frontend perf). The import map still versions the module, so the
+  // on-demand load is cache-busted (AV3).
+  let nodeDetailOverlayManager = null;
+  let nodeDetailOverlayManagerPromise = null;
+  // Indirection so a test can drive the import-failure retry path; production
+  // always dynamic-imports the real module.
+  let importNodeDetailOverlayModule = () => import('./node-detail-overlay.js');
+  /**
+   * Resolve the (memoized) node-detail overlay manager, dynamically importing its
+   * module on first use. A **failed** import is not cached — a transient
+   * chunk-load failure must not leave node links permanently inert — so the next
+   * open re-imports instead of re-hitting the rejected promise.
+   *
+   * @returns {Promise<Object|null>} the overlay manager, or ``null`` when the
+   *   overlay DOM is unavailable.
+   */
+  function loadNodeDetailOverlayManager() {
+    if (nodeDetailOverlayManager) return Promise.resolve(nodeDetailOverlayManager);
+    if (!nodeDetailOverlayManagerPromise) {
+      nodeDetailOverlayManagerPromise = importNodeDetailOverlayModule()
+        .then(({ createNodeDetailOverlayManager }) => {
+          nodeDetailOverlayManager = createNodeDetailOverlayManager({
+            document,
+            privateMode: isPrivateMode,
+          });
+          return nodeDetailOverlayManager;
+        })
+        .catch(err => {
+          // Drop the rejected promise so a later open retries the import rather
+          // than permanently failing (the click already preventDefaulted).
+          nodeDetailOverlayManagerPromise = null;
+          throw err;
+        });
+    }
+    return nodeDetailOverlayManagerPromise;
+  }
 
   document.addEventListener('click', event => {
+    // "Show all nodes" control lifts the node-table render cap (frontend perf).
+    if (event.target.closest(`.${SHOW_ALL_BUTTON_CLASS}`)) {
+      event.preventDefault();
+      expandNodeTable();
+      return;
+    }
     const longNameLink = event.target.closest('.node-long-link');
     if (
       longNameLink &&
-      nodeDetailOverlayManager &&
+      // The overlay root lives in the shared layout; when it is absent the
+      // manager would be null, so fall through to normal link handling. (The
+      // shipped layout always renders the root plus its dialog/close/content
+      // children; the pathological root-present-but-children-missing case is not
+      // reachable here — it resolves the manager to null below and no-ops.)
+      document.getElementById('nodeDetailOverlay') &&
       shouldHandleNodeLongLink(longNameLink) &&
       !(event.metaKey || event.ctrlKey || event.shiftKey || event.altKey)
     ) {
@@ -2079,7 +2256,8 @@ export function initializeApp(config) {
         event.stopPropagation();
         overlayStack.closeAll();
         const label = typeof longNameLink.textContent === 'string' ? longNameLink.textContent.trim() : '';
-        nodeDetailOverlayManager.open({ nodeId: identifier }, { trigger: longNameLink, label })
+        loadNodeDetailOverlayManager()
+          .then(manager => (manager ? manager.open({ nodeId: identifier }, { trigger: longNameLink, label }) : undefined))
           .catch(err => console.error('Failed to open node detail overlay', err));
         return;
       }
@@ -2617,6 +2795,38 @@ export function initializeApp(config) {
   }
 
   /**
+   * Render a node's coloured short-name badge for the waypoint overlay,
+   * resolving the node from the loaded bulk map. Unknown nodes yield an empty
+   * string — the overlay then shows only the canonical id text.
+   *
+   * @param {?string} nodeId Canonical node id.
+   * @returns {string} Badge HTML or ''.
+   */
+  function renderWaypointNodeBadge(nodeId) {
+    if (typeof nodeId !== 'string' || !nodeId || !nodesById.has(nodeId)) return '';
+    const node = nodesById.get(nodeId);
+    return renderShortHtml(node.short_name, node.role, node.long_name, node) || '';
+  }
+
+  /**
+   * Display the waypoint detail card (SPEC W6, design 1d-A) in the shared
+   * short-info overlay chrome.
+   *
+   * @param {HTMLElement} target Anchor element for the overlay.
+   * @param {Object} waypoint Waypoint row.
+   * @returns {void}
+   */
+  function openWaypointOverlay(target, waypoint) {
+    if (!target || !waypoint) return;
+    const lines = buildWaypointOverlayLines(waypoint, {
+      nowSeconds: Math.floor(Date.now() / 1000),
+      authorBadgeHtml: renderWaypointNodeBadge(waypoint.node_id),
+    });
+    if (!lines.length) return;
+    overlayStack.render(target, lines.join('<br/>'));
+  }
+
+  /**
    * Display an overlay describing a neighbour link.
    *
    * @param {HTMLElement} target Anchor element for the overlay.
@@ -2885,6 +3095,49 @@ export function initializeApp(config) {
   }
 
   /**
+   * Build the parts for a waypoint-broadcast chat entry (SPEC W7, amending
+   * LV7): ``📌 Broadcasted waypoint <glyph> <name> — Lat: …, Lon: …,
+   * Expires: …``. The waypoint description (user-authored body text) is
+   * deliberately never rendered here — bodies stay out of the Log.
+   *
+   * @param {Object} entry Structured chat-log entry.
+   * @param {Object} context Display context from {@link buildDisplayContext}.
+   * @returns {{ className: string, html: string }} Entry parts.
+   */
+  function buildWaypointChatEntryParts(entry, context) {
+    const label = context.longName ? String(context.longName) : (context.nodeId || 'Unknown node');
+    const waypoint = entry?.waypoint && typeof entry.waypoint === 'object' ? entry.waypoint : {};
+    const glyph = waypointGlyph(waypoint.icon);
+    const name = waypoint.name != null && String(waypoint.name).trim().length > 0
+      ? String(waypoint.name).trim()
+      : 'Waypoint';
+    const highlights = [];
+    const lat = toFiniteNumber(waypoint.latitude);
+    const lon = toFiniteNumber(waypoint.longitude);
+    if (lat != null) highlights.push({ label: 'Lat', value: lat.toFixed(5) });
+    if (lon != null) highlights.push({ label: 'Lon', value: lon.toFixed(5) });
+    const expire = toFiniteNumber(waypoint.expire);
+    let expiresValue = 'never';
+    if (expire != null && expire > 0) {
+      const remaining = Math.floor(expire - Date.now() / 1000);
+      // The Log keeps expired broadcasts as history (W7); label them honestly.
+      expiresValue = remaining > 0 ? timeHum(remaining) : 'expired';
+    }
+    highlights.push({ label: 'Expires', value: expiresValue });
+    const highlightSuffix = buildHighlightSuffix(highlights);
+    return buildAnnouncementParts({
+      timestampSeconds: entry?.ts ?? null,
+      shortName: context.shortName,
+      longName: label,
+      role: context.role,
+      metadataSource: context.metadataSource,
+      nodeData: context.nodeData,
+      protocol: context.protocol,
+      messageHtml: `${renderEmojiHtml('📌')} ${renderAnnouncementCopy(`Broadcasted waypoint ${glyph} ${name}`, highlightSuffix)}`
+    });
+  }
+
+  /**
    * Compute the class name and HTML for a mixed-feed (Log tab) chat entry,
    * dispatching on the entry type, without touching the DOM. Returns ``null``
    * for entries that should not render. Used by the memoising render path.
@@ -2907,6 +3160,8 @@ export function initializeApp(config) {
         return buildPositionChatEntryParts(entry, context);
       case CHAT_LOG_ENTRY_TYPES.NEIGHBOR:
         return buildNeighborChatEntryParts(entry, context);
+      case CHAT_LOG_ENTRY_TYPES.WAYPOINT:
+        return buildWaypointChatEntryParts(entry, context);
       case CHAT_LOG_ENTRY_TYPES.TRACE:
         return buildTraceChatEntryParts(entry, context);
       case CHAT_LOG_ENTRY_TYPES.MESSAGE:
@@ -3418,6 +3673,7 @@ export function initializeApp(config) {
     positionEntries = [],
     neighborEntries = [],
     traceEntries = [],
+    waypointEntries = [],
     filterQuery = ''
   }) {
     if (!CHAT_ENABLED || !chatEl) return;
@@ -3436,6 +3692,7 @@ export function initializeApp(config) {
       positions: positionEntries,
       neighbors: neighborEntries,
       traces: traceEntries,
+      waypoints: waypointEntries,
       messages,
       logOnlyMessages: encryptedMessages,
       nowSeconds,
@@ -3752,6 +4009,11 @@ export function initializeApp(config) {
    *
    * @type {ReadonlyArray<Object>}
    */
+  // Shared refine references so a coalesced flush dedups them by identity: the
+  // three node-derived collections share the same rebuildNodeDerivedState
+  // function object (so the pending-refine Set collapses them to one call), and
+  // neighbors/traces share a single no-op.
+  const noopRefine = () => {};
   const COLLECTION_BACKFILLS = [
     {
       name: 'nodes',
@@ -3759,7 +4021,7 @@ export function initializeApp(config) {
       idOf: row => row && row.node_id,
       cursorOf: row => row && row.last_heard,
       merge: batch => { allNodes = mergeById(allNodes, batch, 'node_id'); },
-      refine: () => rebuildNodeDerivedState(),
+      refine: rebuildNodeDerivedState,
     },
     {
       name: 'positions',
@@ -3769,7 +4031,7 @@ export function initializeApp(config) {
       merge: batch => {
         allPositionEntries = trimToWindow(mergeById(allPositionEntries, batch, 'id'), recentBackfillFloor());
       },
-      refine: () => rebuildNodeDerivedState(),
+      refine: rebuildNodeDerivedState,
     },
     {
       name: 'telemetry',
@@ -3779,7 +4041,7 @@ export function initializeApp(config) {
       merge: batch => {
         allTelemetryEntries = trimToWindow(mergeById(allTelemetryEntries, batch, 'id'), recentBackfillFloor());
       },
-      refine: () => rebuildNodeDerivedState(),
+      refine: rebuildNodeDerivedState,
     },
     {
       name: 'neighbors',
@@ -3797,7 +4059,7 @@ export function initializeApp(config) {
       // Neighbors stay RAW (like traces) so the Log keeps every per-pair snapshot
       // and the map / overlay consumers dedupe internally; re-aggregating here
       // would erode history exactly as the refresh path used to (bugfix A1).
-      refine: () => {},
+      refine: noopRefine,
     },
     {
       name: 'traces',
@@ -3810,18 +4072,119 @@ export function initializeApp(config) {
       merge: batch => {
         allTraces = trimToWindow(mergeById(allTraces, batch, 'id'), longBackfillFloor());
       },
+      refine: noopRefine,
+    },
+    {
+      name: 'waypoints',
+      fetchPage: (limit, before) => fetchWaypoints(limit, 0, { before }),
+      // Composite server upsert key (id, protocol) — SPEC W5 — so the inclusive
+      // boundary row de-duplicates across pages and protocols never collide.
+      idOf: row => (row ? `${row.protocol}|${row.id}` : undefined),
+      cursorOf: row => row && row.rx_time,
+      merge: batch => {
+        allWaypoints = trimToWindow(
+          mergeByCompositeKey(allWaypoints, batch, ['id', 'protocol']),
+          recentBackfillFloor(),
+        );
+      },
       refine: () => {},
     },
   ];
 
+  // --- Backfill repaint coalescing (frontend perf regression) ---
+  // The one-shot backfill streams many pages (dozens of `/api/positions` on a
+  // busy instance). Each page's re-derive (`rebuildNodeDerivedState` re-aggregates
+  // the whole growing accumulator) + full table/map repaint is main-thread work,
+  // so repainting once per page janks the cold load and competes with user
+  // interaction and the live-refresh flash. Instead, each page's merge stays
+  // immediate (so state is always current) but the re-derive + repaint are
+  // coalesced onto an idle callback: a burst of pages folds into a single
+  // repaint, and the repaint runs in idle time rather than blocking input. The
+  // same rows render — only *when* and *how often* the repaint fires changes.
+  /** Distinct pending refine callbacks (deduped by identity across specs). */
+  const pendingBackfillRefines = new Set();
+  /** True when merged-but-not-yet-repainted backfill rows are waiting. */
+  let backfillRepaintDirty = false;
+  /** Scheduled idle-callback handle, or ``null`` when none is pending. */
+  let backfillRepaintHandle = null;
+
   /**
-   * Merge one streamed backward page into the module state, re-derive what it
-   * feeds, and repaint — progressively, one page at a time, mirroring the chat
-   * history backfill (issue #802). The merge + re-render is synchronous (no
-   * ``await``) so it cannot interleave with a concurrent refresh or another
-   * collection's commit. Each page is network-spaced, so the per-page render is
-   * not a hot loop; the stats fetch is skipped (the authoritative count is
-   * server-computed and unchanged by how many rows the client has paged in).
+   * Schedule work for the next idle slot, degrading to ``setTimeout`` where
+   * ``requestIdleCallback`` is unavailable (e.g. Safari, unit-test envs). The
+   * short timeout bounds how long a repaint can be deferred under sustained load.
+   *
+   * @param {Function} callback Work to run when the main thread is idle.
+   * @returns {*} A handle understood by {@link cancelIdleWork}.
+   */
+  function requestIdleWork(callback) {
+    return typeof requestIdleCallback === 'function'
+      ? requestIdleCallback(callback, { timeout: 250 })
+      : setTimeout(callback, 16);
+  }
+
+  /**
+   * Cancel a handle returned by {@link requestIdleWork}, matching the scheduler
+   * that produced it.
+   *
+   * @param {*} handle The scheduled handle.
+   * @returns {void}
+   */
+  function cancelIdleWork(handle) {
+    if (typeof requestIdleCallback === 'function' && typeof cancelIdleCallback === 'function') {
+      cancelIdleCallback(handle);
+    } else {
+      clearTimeout(handle);
+    }
+  }
+
+  /**
+   * Run the coalesced backfill re-derive(s) and a single repaint, then clear the
+   * pending state. Idempotent: a no-op when nothing is pending, so calling it
+   * again after a flush (or after the trailing idle callback) is harmless.
+   *
+   * @returns {void}
+   */
+  function flushBackfillRepaint() {
+    if (backfillRepaintHandle !== null) {
+      cancelIdleWork(backfillRepaintHandle);
+      backfillRepaintHandle = null;
+    }
+    if (pendingBackfillRefines.size > 0) {
+      // Each distinct refine runs at most once per flush — the three
+      // node-derived collections share `rebuildNodeDerivedState`, so identity
+      // dedup collapses them into a single re-aggregation over the merged state.
+      for (const refine of pendingBackfillRefines) refine();
+      pendingBackfillRefines.clear();
+    }
+    if (backfillRepaintDirty) {
+      backfillRepaintDirty = false;
+      renderFilteredOutputs();
+    }
+  }
+
+  /**
+   * Ensure exactly one idle repaint is scheduled; further pages that arrive
+   * before it fires are folded into the same repaint (the guard makes repeated
+   * calls a no-op until the pending callback runs).
+   *
+   * @returns {void}
+   */
+  function scheduleBackfillRepaint() {
+    if (backfillRepaintHandle !== null) return;
+    backfillRepaintHandle = requestIdleWork(() => {
+      backfillRepaintHandle = null;
+      flushBackfillRepaint();
+    });
+  }
+
+  /**
+   * Merge one streamed backward page into the module state immediately, then
+   * queue a coalesced re-derive + repaint (see the coalescing note above). The
+   * merge is synchronous so it cannot interleave with a concurrent refresh or
+   * another collection's commit and so ``getLoaded*Count`` always reflects every
+   * paged-in row; the repaint is deferred to idle time. The stats fetch is
+   * skipped (the authoritative count is server-computed and unchanged by how many
+   * rows the client has paged in).
    *
    * @param {Object} spec One {@link COLLECTION_BACKFILLS} entry.
    * @param {Array<Object>} batch Freshly-seen rows for this page (the pager only
@@ -3830,8 +4193,9 @@ export function initializeApp(config) {
    */
   function commitBackfillPage(spec, batch) {
     spec.merge(batch);
-    spec.refine();
-    renderFilteredOutputs();
+    pendingBackfillRefines.add(spec.refine);
+    backfillRepaintDirty = true;
+    scheduleBackfillRepaint();
   }
 
   /**
@@ -3865,16 +4229,22 @@ export function initializeApp(config) {
    * One-shot background backfill of every bulk collection (issue #832). After
    * the first paint has rendered each collection's newest page, page the five
    * collections backward through their visibility windows concurrently, each
-   * committing+repainting its pages as they arrive. Each {@link backfillCollection}
-   * self-gates on its frontier, so a collection with none (a short newest page, or
-   * a warm-cache load) returns without a request and the fan-out is a clean no-op
-   * when there is nothing to page — no pointless request, no empty long-load.
-   * Invoked once (guarded by ``collectionsBackfilled`` in {@link refresh}).
+   * merging its pages as they arrive and coalescing the repaints onto idle time
+   * (see {@link commitBackfillPage}). Each {@link backfillCollection} self-gates on
+   * its frontier, so a collection with none (a short newest page, or a warm-cache
+   * load) returns without a request and the fan-out is a clean no-op when there is
+   * nothing to page — no pointless request, no empty long-load. Once every window
+   * is exhausted, a final {@link flushBackfillRepaint} paints the complete state
+   * immediately rather than waiting on the trailing idle callback. Invoked once
+   * (guarded by ``collectionsBackfilled`` in {@link refresh}).
    *
    * @returns {Promise<void>} Resolves when every collection's window is exhausted.
    */
   async function backfillAllCollections() {
     await Promise.all(COLLECTION_BACKFILLS.map(spec => backfillCollection(spec)));
+    // The whole window is now merged; render the final coalesced state at once
+    // instead of waiting for the pending idle repaint.
+    flushBackfillRepaint();
   }
 
   /**
@@ -3920,6 +4290,19 @@ export function initializeApp(config) {
   }
 
   /**
+   * Lift the node-table render cap and re-render the full (filtered/sorted) set.
+   * Wired to the "show all" control appended by {@link renderTable}; only the
+   * table is re-rendered (the map/chat are unaffected by the row cap).
+   *
+   * @returns {void}
+   */
+  function expandNodeTable() {
+    if (nodeTableExpanded) return;
+    nodeTableExpanded = true;
+    renderTable(getFilteredSortedNodes(), Date.now() / 1000);
+  }
+
+  /**
    * Render the nodes table with sorted and filtered data.
    *
    * @param {Array<Object>} nodes Node payloads.
@@ -3933,8 +4316,17 @@ export function initializeApp(config) {
       return;
     }
     const frag = document.createDocumentFragment();
+    // Render only the top N nodes by the active sort; a busy instance's full set
+    // (each node also emits a hidden UX9 disclosure row) balloons the DOM, so the
+    // remaining rows are reachable via the appended "show all" control (perf).
+    // Re-arm the cap once the (filtered) set is small enough not to need it, so
+    // an earlier "show all" does not stay latched after the user filters down and
+    // clears the filter (review #869-3).
+    if (nodes.length <= NODE_TABLE_RENDER_CAP) nodeTableExpanded = false;
+    const { renderNodes, capped } = capNodesForRender(nodes, NODE_TABLE_RENDER_CAP, nodeTableExpanded);
+    lastRenderedNodeCount = renderNodes.length;
     let rowIndex = 0;
-    for (const n of nodes) {
+    for (const n of renderNodes) {
       const tr = document.createElement('tr');
       // Zebra striping is stamped per node row because the hidden disclosure
       // rows (SPEC UX9) would otherwise consume every even nth-child slot.
@@ -4053,6 +4445,10 @@ export function initializeApp(config) {
       extraTr.hidden = true;
       extraTr.innerHTML = extraParts.innerHtml;
       frag.appendChild(extraTr);
+    }
+    if (capped) {
+      // Reveal-the-rest control; its click is handled by the delegated listener.
+      frag.appendChild(buildShowAllRow(document, nodes.length, NODES_TABLE_TOTAL_COLUMNS));
     }
     tb.replaceChildren(frag);
     // Keep the waiting row honest (SPEC UX4): present while the node set is
@@ -4655,6 +5051,31 @@ export function initializeApp(config) {
         },
       });
     }
+    // Waypoint chips (SPEC W6): render above the node markers, honouring the
+    // protocol filter (a hidden protocol drops its waypoints along with its
+    // nodes — the toggle lives in that protocol's legend column, 1e-A) and the
+    // expiry ladder inside the layer module. The count feeds the legend toggle.
+    if (waypointsLayer) {
+      const filteredWaypoints = hiddenProtocols.size > 0
+        ? allWaypoints.filter(waypoint => !hiddenProtocols.has(normalizeFilterProtocol(waypoint && waypoint.protocol)))
+        : allWaypoints;
+      waypointMarkerCount = renderWaypointsLayer({
+        waypoints: filteredWaypoints,
+        layer: waypointsLayer,
+        leaflet: L,
+        nowSeconds: nowSec,
+        markerRegistry: waypointMarkerByKey,
+        onSelect: (waypoint, anchorEl) => {
+          if (!anchorEl) return;
+          if (overlayStack.isOpen(anchorEl)) {
+            overlayStack.close(anchorEl);
+            return;
+          }
+          openWaypointOverlay(anchorEl, waypoint);
+        },
+      });
+      updateWaypointsToggleState();
+    }
     // Re-anchor any overlay preserved above onto its rebuilt marker so it
     // stays open across the re-render instead of being closed by
     // cleanupOrphans (item 7).
@@ -4797,6 +5218,7 @@ export function initializeApp(config) {
       positionEntries: allPositionEntries,
       neighborEntries: allNeighbors,
       traceEntries: allTraces,
+      waypointEntries: allWaypoints,
       filterQuery
     });
   }
@@ -4815,6 +5237,9 @@ export function initializeApp(config) {
    * @returns {void}
    */
   function renderFilteredOutputs(filterQuery = filterInput ? filterInput.value : '') {
+    // Instrumentation for the backfill de-jank guard (see
+    // {@link renderFilteredOutputsCount}); a plain increment, no behaviour change.
+    renderFilteredOutputsCount += 1;
     // Text and role filters apply only to the node table and map; the chat log
     // always receives the full node collection so reply-thread lookups succeed
     // even for nodes that are currently hidden by the active filter.
@@ -4919,6 +5344,7 @@ export function initializeApp(config) {
       const telSince = useSince ? Math.max(0, lastTelemetryTimestamp - 1) : 0;
       const nbSince = useSince ? Math.max(0, lastNeighborTimestamp - 1) : 0;
       const trSince = useSince ? Math.max(0, lastTraceTimestamp - 1) : 0;
+      const wpSince = useSince ? Math.max(0, lastWaypointTimestamp - 1) : 0;
 
       // Cold-load boot prefetch (initial-load latency fix): the early boot module
       // (main/boot-prefetch.js) may have already issued the first-load (since=0)
@@ -4952,6 +5378,14 @@ export function initializeApp(config) {
         console.warn('trace refresh failed; continuing without traceroutes', err);
         return [];
       }) : Promise.resolve([]);
+      // Waypoints are message-grade private (SPEC W3): the route 404s under
+      // PRIVATE, so the fetch is skipped entirely there rather than erroring.
+      const waypointsPromise = want('waypoints') && !isPrivateMode
+        ? fetchWaypoints(NODE_LIMIT, wpSince, { responsePromise: bootResponse('waypoints') }).catch(err => {
+          console.warn('waypoint refresh failed; continuing without waypoints', err);
+          return [];
+        })
+        : Promise.resolve([]);
       const encryptedMessagesPromise = want('messages') ? fetchMessages(MESSAGE_LIMIT, { encrypted: true, since: msgSince, responsePromise: bootResponse('encryptedMessages') }).catch(err => {
         console.warn('encrypted message refresh failed; continuing without encrypted entries', err);
         return [];
@@ -4965,7 +5399,8 @@ export function initializeApp(config) {
         incomingTraces,
         incomingMessages,
         incomingTelemetry,
-        incomingEncryptedMessages
+        incomingEncryptedMessages,
+        incomingWaypoints
       ] = await Promise.all([
         want('nodes') ? fetchNodes(NODE_LIMIT, nodeSince, { responsePromise: bootResponse('nodes') }) : Promise.resolve([]),
         positionsPromise,
@@ -4978,7 +5413,8 @@ export function initializeApp(config) {
         // every refresh after.
         want('messages') ? fetchMessages(MESSAGE_LIMIT, { since: msgSince, responsePromise: bootResponse('messages') }) : Promise.resolve([]),
         telemetryPromise,
-        encryptedMessagesPromise
+        encryptedMessagesPromise,
+        waypointsPromise
       ]);
 
       // Update high-water marks for incremental fetching.
@@ -4994,6 +5430,7 @@ export function initializeApp(config) {
       const incomingTelTs = maxRecordTimestamp(incomingTelemetry, ['rx_time', 'telemetry_time']);
       const incomingNbTs = maxRecordTimestamp(incomingNeighbors, ['rx_time']);
       const incomingTrTs = maxRecordTimestamp(incomingTraces, ['rx_time']);
+      const incomingWpTs = maxRecordTimestamp(incomingWaypoints, ['rx_time']);
       if (incomingNodeTs > lastNodeTimestamp) lastNodeTimestamp = incomingNodeTs;
       const latestMsgTs = Math.max(incomingMsgTs, incomingEncMsgTs);
       if (latestMsgTs > lastMessageTimestamp) lastMessageTimestamp = latestMsgTs;
@@ -5001,6 +5438,7 @@ export function initializeApp(config) {
       if (incomingTelTs > lastTelemetryTimestamp) lastTelemetryTimestamp = incomingTelTs;
       if (incomingNbTs > lastNeighborTimestamp) lastNeighborTimestamp = incomingNbTs;
       if (incomingTrTs > lastTraceTimestamp) lastTraceTimestamp = incomingTrTs;
+      if (incomingWpTs > lastWaypointTimestamp) lastWaypointTimestamp = incomingWpTs;
 
       // Capture each bulk collection's live frontier (oldest cursor of the
       // newest page) so the one-shot background backfill (issue #832) can page
@@ -5019,6 +5457,7 @@ export function initializeApp(config) {
           telemetry: frontierIfFull(incomingTelemetry, NODE_LIMIT, ['rx_time']),
           neighbors: frontierIfFull(incomingNeighbors, NODE_LIMIT, ['rx_time']),
           traces: frontierIfFull(incomingTraces, TRACE_LIMIT, ['rx_time']),
+          waypoints: frontierIfFull(incomingWaypoints, NODE_LIMIT, ['rx_time']),
         };
       }
 
@@ -5046,6 +5485,12 @@ export function initializeApp(config) {
       allTraces = useSince
         ? trimToWindow(mergeById(allTraces, incomingTraces, 'id'), longWindowFloor)
         : incomingTraces;
+      // Waypoints merge on the composite (id, protocol) — the server's upsert
+      // key (SPEC W5) — so a re-broadcast replaces its row and same-id
+      // waypoints from different protocols stay distinct.
+      allWaypoints = useSince
+        ? trimToWindow(mergeByCompositeKey(allWaypoints, incomingWaypoints, ['id', 'protocol']), recentWindowFloor)
+        : incomingWaypoints;
       // Encrypted blobs only feed the mixed Log tab (itself capped), so a count
       // cap is the right memory bound for them.
       const encryptedMessages = useSince
@@ -5092,6 +5537,9 @@ export function initializeApp(config) {
       if (refreshOptions.flash && useSince) {
         flashChangedNodes(collectNodeIds(incomingNodes, incomingPositions, incomingTelemetry));
         flashChangedMessages(collectMessageIds(incomingMessages, incomingEncryptedMessages));
+        // W8 re-roll: a waypoint delta fades its own pin; the author node's
+        // row/marker flash rides the route's companion "nodes" publish.
+        flashChangedWaypoints(incomingWaypoints);
       }
       // Persist the freshly-merged state for the next reload/revisit (SPEC FC2),
       // throttled and fire-and-forget so it never blocks the paint.
@@ -5120,15 +5568,34 @@ export function initializeApp(config) {
     }
   }
 
-  // Kick off the first data load immediately then start the silent background
-  // auto-refresh timer. Paint from the persistent cache first (instant first
-  // paint, SPEC FC2), then refresh fetches only the delta; a disabled/empty
-  // cache makes seedFromCache a no-op so this is the normal cold load.
-  const initialLoadPromise = seedFromCache()
-    .catch(() => false)
-    .then(() => refresh());
-  void initialLoadPromise;
-  restartAutoRefresh();
+  // The layout loads this shared app on every page for the header UI wired above
+  // (mobile menu, instance selector, node-detail overlay). Pages that render via
+  // their own module — /charts, /federation, and a node-detail page — have no
+  // dashboard data surface and fetch their own data, so skip the whole data
+  // pipeline there: the fetch + backfill + auto-refresh/SSE would pull and
+  // backfill rows nothing on the page displays, and previously fired the entire
+  // bulk-collection backfill on every node-detail view (frontend perf).
+  const runsOwnPageModule = Boolean(
+    bodyClassList &&
+      (bodyClassList.contains("view-charts") ||
+        bodyClassList.contains("view-federation") ||
+        bodyClassList.contains("view-node_detail")),
+  );
+  let initialLoadPromise;
+  if (runsOwnPageModule) {
+    // Header UI is already wired above; there is nothing to fetch or refresh.
+    initialLoadPromise = Promise.resolve();
+  } else {
+    // Kick off the first data load immediately then start the silent background
+    // auto-refresh timer. Paint from the persistent cache first (instant first
+    // paint, SPEC FC2), then refresh fetches only the delta; a disabled/empty
+    // cache makes seedFromCache a no-op so this is the normal cold load.
+    initialLoadPromise = seedFromCache()
+      .catch(() => false)
+      .then(() => refresh());
+    void initialLoadPromise;
+    restartAutoRefresh();
+  }
 
   // --- Auto-refresh play/pause toggle ---
   // Live vs. paused is visible text, not a glyph-only secret (SPEC UX6):
@@ -5162,7 +5629,8 @@ export function initializeApp(config) {
    * {@link hiddenProtocols} set.
    *
    * @param {HTMLElement|null} btn Button element.
-   * @param {string} protocol Protocol token (``'meshcore'`` or ``'meshtastic'``).
+   * @param {string} protocol Protocol token (``'meshcore'``, ``'meshtastic'``,
+   *   or ``'reticulum'``).
    * @returns {void}
    */
   function setupMetaProtocolToggle(btn, protocol) {
@@ -5180,6 +5648,7 @@ export function initializeApp(config) {
   }
   setupMetaProtocolToggle(protocolToggleMeshcore, 'meshcore');
   setupMetaProtocolToggle(protocolToggleMeshtastic, 'meshtastic');
+  setupMetaProtocolToggle(protocolToggleReticulum, 'reticulum');
 
   /**
    * Keep the page/tab and header titles at their base text.
@@ -5219,9 +5688,9 @@ export function initializeApp(config) {
    * counts (audit follow-up 04). Uses the same 7-day active figure as the
    * legend column counts, so the same protocol shows the same number in both
    * places; the count both labels the otherwise-unnamed icon button and states
-   * the MeshCore/Meshtastic split.
+   * the per-protocol split.
    *
-   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}}} stats
+   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}, reticulum?: {week: number}}} stats
    *   Stats from /api/stats.
    * @returns {void}
    */
@@ -5231,6 +5700,9 @@ export function initializeApp(config) {
     }
     if (protocolToggleMeshtasticCount) {
       protocolToggleMeshtasticCount.textContent = String(stats?.meshtastic?.week ?? 0);
+    }
+    if (protocolToggleReticulumCount) {
+      protocolToggleReticulumCount.textContent = String(stats?.reticulum?.week ?? 0);
     }
   }
 
@@ -5254,22 +5726,54 @@ export function initializeApp(config) {
    * Hides any remaining /charts nav links unconditionally, and hides legend
    * columns for protocols with zero weekly activity.
    *
-   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}}} stats Stats from /api/stats.
+   * @param {{meshcore?: {week: number}, meshtastic?: {week: number}, reticulum?: {week: number}}} stats Stats from /api/stats.
    * @returns {void}
    */
   function applyProtocolVisibility(stats) {
     const meshcoreWeek = stats?.meshcore?.week ?? 0;
     const meshtasticWeek = stats?.meshtastic?.week ?? 0;
+    const reticulumWeek = stats?.reticulum?.week ?? 0;
 
     // Hide legend columns for protocols with no activity in the past 7 days.
     if (meshcoreColEl) meshcoreColEl.style.display = meshcoreWeek === 0 ? 'none' : '';
     if (meshtasticColEl) meshtasticColEl.style.display = meshtasticWeek === 0 ? 'none' : '';
 
-    // Show protocol toggle buttons only when both protocols have weekly
-    // activity — filtering is pointless when only one protocol is present.
-    const bothActive = meshcoreWeek > 0 && meshtasticWeek > 0;
-    if (protocolToggleMeshcore) protocolToggleMeshcore.hidden = !bothActive;
-    if (protocolToggleMeshtastic) protocolToggleMeshtastic.hidden = !bothActive;
+    // Show a protocol's toggle button only when that protocol has weekly
+    // activity and at least one other protocol does too — filtering is
+    // pointless when only one protocol is present. (Generalises the original
+    // two-protocol "both active" rule to the reticulum era, #888.)
+    const weeks = [meshcoreWeek, meshtasticWeek, reticulumWeek];
+    const activeProtocols = weeks.filter(week => week > 0).length;
+    const toggleHidden = week => !(week > 0 && activeProtocols >= 2);
+    // When a chip is hidden by the visibility rule, its protocol must also
+    // leave the hiddenProtocols set: a user who toggled the protocol off and
+    // then lost the chip (activity dropped below the 2-protocol threshold)
+    // would otherwise have no control left to bring those nodes back. The
+    // strand scenario always leaves at least one protocol active, so an
+    // all-zero payload (an empty instance, or the degraded local fallback
+    // after a stats-fetch failure) is deliberately excluded — a transient
+    // stats blank must not wipe the user's explicit toggle state.
+    let unstranded = false;
+    for (const [btn, protocol, week] of [
+      [protocolToggleMeshcore, 'meshcore', meshcoreWeek],
+      [protocolToggleMeshtastic, 'meshtastic', meshtasticWeek],
+      [protocolToggleReticulum, 'reticulum', reticulumWeek],
+    ]) {
+      const hidden = toggleHidden(week);
+      if (btn) btn.hidden = hidden;
+      if (hidden && activeProtocols > 0 && hiddenProtocols.has(protocol)) {
+        hiddenProtocols.delete(protocol);
+        unstranded = true;
+      }
+    }
+    if (unstranded) {
+      // Re-run the same sync path a chip click uses so the nodes reappear.
+      // Bounded: the dropped protocols are no longer in the set, so the
+      // nested applyFilter's stats callback cannot un-strand again.
+      updateMetaProtocolToggleUI();
+      updateLegendRoleFiltersUI();
+      applyFilter();
+    }
 
     // Always hide any /charts links in the nav to keep the page hidden.
     document.querySelectorAll('a[href="/charts"]').forEach(el => {
@@ -5392,6 +5896,25 @@ export function initializeApp(config) {
       getLoadedMessageCount: () => allMessages.length,
       /** Number of node rows currently loaded into the table (test use only). */
       getLoadedNodeCount: () => allNodes.length,
+      /** Waypoints currently loaded (SPEC W8 plumbing; test use only). */
+      getLoadedWaypoints: () => allWaypoints,
+      /** Waypoint keys faded by the most recent SSE-ping refresh (test hook). */
+      getLastFlashedWaypointKeys: () => lastFlashedWaypointKeys,
+      /** Inject a waypoint marker into the registry (W8 flash test hook). */
+      _setWaypointMarkerForTests: (key, marker) => waypointMarkerByKey.set(key, marker),
+      /** Waypoint layer visibility + toggle hooks (SPEC W6; test use only). */
+      setWaypointsVisibility,
+      isWaypointsVisible: () => waypointsVisible,
+      getWaypointsToggleButton: () => waypointsToggleButton,
+      /** Inject a mock toggle button element for legend-state tests. */
+      _setWaypointsToggleButton: btn => {
+        waypointsToggleButton = btn;
+      },
+      updateWaypointsToggleState,
+      openWaypointOverlay,
+      _setLoadedWaypoints: rows => {
+        allWaypoints = Array.isArray(rows) ? rows : [];
+      },
       /** Number of position entries currently loaded (test use only). */
       getLoadedPositionCount: () => allPositionEntries.length,
       /** Number of telemetry entries currently loaded (test use only). */
@@ -5400,6 +5923,35 @@ export function initializeApp(config) {
       getLoadedNeighborCount: () => allNeighbors.length,
       /** Number of trace entries currently loaded (test use only). */
       getLoadedTraceCount: () => allTraces.length,
+      /** Number of node rows the last renderTable actually rendered (test use only). */
+      getRenderedNodeCount: () => lastRenderedNodeCount,
+      /** Whether the node-table render cap has been lifted (test use only). */
+      isNodeTableExpanded: () => nodeTableExpanded,
+      /**
+       * Cumulative count of full {@link renderFilteredOutputs} repaints (test
+       * use only) — the backfill de-jank guard resets this after first paint and
+       * asserts the streamed backfill coalesces into a bounded repaint count.
+       */
+      getRenderCount: () => renderFilteredOutputsCount,
+      /** Reset the repaint counter (test use only). */
+      resetRenderCount: () => {
+        renderFilteredOutputsCount = 0;
+      },
+      /**
+       * Resolve the lazily-imported, memoized node-detail overlay manager (test
+       * use only) — the same loader the ``.node-long-link`` click path uses.
+       */
+      loadNodeDetailOverlayManager,
+      /**
+       * Override the overlay-module importer (test use only) so the import-failure
+       * retry path can be exercised.
+       *
+       * @param {() => Promise<Object>} importer Replacement dynamic importer.
+       * @returns {void}
+       */
+      _setNodeDetailOverlayImporter(importer) {
+        importNodeDetailOverlayModule = importer;
+      },
       /** The persistent data cache instance (test use only). */
       dataCache,
       /** Seed in-memory state from the persistent cache (test use only). */
@@ -5410,8 +5962,15 @@ export function initializeApp(config) {
       flushCacheWrites: () => pendingCacheWrite,
       /** Promise resolving once the one-shot chat-history backfill finishes (test hook). */
       flushBackfill: () => backfillPromise,
-      /** Promise resolving once the one-shot bulk-collection backfill finishes (test hook). */
-      flushCollectionBackfills: () => collectionBackfillPromise,
+      /**
+       * Await the one-shot bulk-collection backfill, then flush any pending
+       * coalesced repaint so the rendered state is settled and deterministic for
+       * tests (test hook).
+       */
+      flushCollectionBackfills: async () => {
+        await collectionBackfillPromise;
+        flushBackfillRepaint();
+      },
       /** Empty the persistent cache — the "clear cached data" control (FC4). */
       clearDataCache,
       /** Project an original lat/lon + pixel offset into a display LatLng. */

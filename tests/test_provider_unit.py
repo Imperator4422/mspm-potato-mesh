@@ -1597,6 +1597,11 @@ def _telemetry_env(monkeypatch, *, contacts=None, frozen_time=1_700_000_000):
         contacts: Optional contact dicts pre-registered on the interface.
         frozen_time: Wall-clock second ``time.time`` is pinned to.
 
+    Transmission is permitted here (SPEC MA7 defaults it off) so these tests
+    exercise the poll machinery itself; the policy is covered in
+    ``tests/test_tx_policy_unit.py``, and a test that needs it closed simply
+    re-patches the flag afterwards.
+
     Returns:
         Tuple ``(mc_tel, iface, stub, captured)`` — module under test, the
         interface, the stubbed handlers module, and the captured packet list.
@@ -1608,6 +1613,9 @@ def _telemetry_env(monkeypatch, *, contacts=None, frozen_time=1_700_000_000):
     stub = _make_stub_handlers_module()
     stub.store_packet_dict = lambda pkt: captured.append(pkt)
     monkeypatch.setattr(mc_tel.config, "_debug_log", lambda *_a, **_k: None)
+    monkeypatch.setattr(mc_tel.config, "TX_ENABLED", True)
+    monkeypatch.setattr(mc_tel.config, "TX_ANNOUNCE", True)
+    monkeypatch.setattr(mc_tel.config, "RX_ONLY", False)
     monkeypatch.setattr(_time, "time", lambda: frozen_time)
     iface = _MeshcoreInterface(target=None)
     for contact in contacts or []:
@@ -2162,8 +2170,96 @@ def test_telemetry_poll_loop_disabled_and_ticking(monkeypatch):
     assert calls["contact"] >= 1  # first on-air poll after one interval
 
 
+@pytest.mark.parametrize(
+    ("closed", "expected_gate"),
+    [
+        ({"TX_ENABLED": False}, "TX_ENABLED"),
+        ({"RX_ONLY": True}, "RX_ONLY"),
+    ],
+)
+def test_poll_contact_telemetry_refuses_closed_policy(
+    monkeypatch, closed, expected_gate
+):
+    """A closed transmit policy stops the poll *at the request*, not just the loop.
+
+    Covers the gate inside ``_poll_contact_telemetry`` itself: without this the
+    check could be deleted and every other test would still pass, because the
+    loop-entry interval check would mask it.
+    """
+    import types
+    import data.mesh_ingestor.activity as activity
+    import data.mesh_ingestor.tx_policy as tx_policy
+
+    mc_tel, iface, stub, _captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    iface.host_node_id = "!deadbeef"
+    for name, value in closed.items():
+        monkeypatch.setattr(mc_tel.config, name, value)
+    assert tx_policy.describe_tx_policy()["blocked_by"] == expected_gate
+
+    calls = {"telemetry": 0, "status": 0}
+
+    class _Commands:
+        async def req_telemetry_sync(self, contact):  # pragma: no cover
+            calls["telemetry"] += 1
+            return None
+
+        async def req_status_sync(self, contact):  # pragma: no cover
+            calls["status"] += 1
+            return None
+
+    activity.take_packet_count()  # drain
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            types.SimpleNamespace(commands=_Commands()), iface, stub, {}
+        )
+    )
+    assert calls == {"telemetry": 0, "status": 0}
+    assert activity.take_packet_count() == 0
+
+
+def test_poll_contact_telemetry_status_fallback_rechecks_policy(monkeypatch):
+    """The status fallback is a second transmission and takes its own check.
+
+    A policy that closes between the telemetry pull and the status fallback must
+    stop the fallback frame; one check covering both requests would let it out.
+    """
+    import types
+    import data.mesh_ingestor.activity as activity
+
+    mc_tel, iface, stub, _captured = _telemetry_env(
+        monkeypatch, contacts=[{"public_key": _TEST_CONTACT_KEY, "adv_name": "Sensor"}]
+    )
+    iface.host_node_id = "!deadbeef"
+    calls = {"telemetry": 0, "status": 0}
+
+    class _Commands:
+        async def req_telemetry_sync(self, contact):
+            calls["telemetry"] += 1
+            # The operator revokes permission while this request is in flight.
+            monkeypatch.setattr(mc_tel.config, "TX_ENABLED", False)
+            return None
+
+        async def req_status_sync(self, contact):  # pragma: no cover
+            calls["status"] += 1
+            return None
+
+    activity.take_packet_count()  # drain
+    asyncio.run(
+        mc_tel._poll_contact_telemetry(
+            types.SimpleNamespace(commands=_Commands()), iface, stub, {}
+        )
+    )
+    assert calls == {"telemetry": 1, "status": 0}
+    assert activity.take_packet_count() == 1  # only the first request went out
+
+
 def test_telemetry_poll_loop_rx_only_disables_on_air_polls(monkeypatch):
-    """RX_ONLY forbids ingestor TX: contact polls stop, local self reads stay."""
+    """The legacy RX_ONLY veto still stops contact polls even with TX_ENABLED=1.
+
+    Local companion-link self reads cost no airtime and continue regardless.
+    """
     import types
 
     mc_tel, iface, stub, _captured = _telemetry_env(
@@ -4323,6 +4419,7 @@ def _make_fake_meshcore_mod(
     autoadd_config: int | None = 0x1F,
     autoadd_get_raises: bool = False,
     autoadd_set_error: bool = False,
+    omit_event_names: tuple = (),
 ):
     """Build a minimal fake ``meshcore`` module for testing :func:`_run_meshcore`.
 
@@ -4339,37 +4436,48 @@ def _make_fake_meshcore_mod(
             ``mc.ensure_contacts()`` (after the ``fail_ensure_contacts`` check)
             so tests can populate ``iface._contacts`` mid-startup.  Used to
             assert the startup ordering required by issue #788.
+        autoadd_config: Initial ``autoadd_config`` byte reported by
+            ``get_autoadd_config`` (``None`` simulates a pre-1.16 ERROR reply).
+        autoadd_get_raises: When ``True``, ``get_autoadd_config`` raises a
+            :class:`TimeoutError`.
+        autoadd_set_error: When ``True``, ``set_autoadd_config`` replies ERROR.
+        omit_event_names: Event names to drop from the fake ``EventType`` enum,
+            simulating a ``meshcore`` build predating the release that added
+            them (e.g. ``("CONTACT_DELETED",)`` for a pre-2.3.7 library).  The
+            runner must skip handlers whose event name is absent rather than
+            raising ``KeyError``.
     """
     import enum
 
+    _event_names = [
+        "CHANNEL_INFO",
+        "SELF_INFO",
+        "CONTACTS",
+        "NEW_CONTACT",
+        "NEXT_CONTACT",
+        "CHANNEL_MSG_RECV",
+        "CONTACT_MSG_RECV",
+        "ADVERTISEMENT",
+        "CONTACT_DELETED",
+        "RX_LOG_DATA",
+        "DISCONNECTED",
+        # Telemetry surfaces subscribed since TI-A3.
+        "TELEMETRY_RESPONSE",
+        "STATUS_RESPONSE",
+        "BATTERY",
+        "CONNECTED",
+        "ACK",
+        "OK",
+        "ERROR",
+        "NO_MORE_MSGS",
+        "MESSAGES_WAITING",
+        "MSG_SENT",
+        "CURRENT_TIME",
+        "UNKNOWN_EVT",
+    ]
     EventType = enum.Enum(
         "EventType",
-        [
-            "CHANNEL_INFO",
-            "SELF_INFO",
-            "CONTACTS",
-            "NEW_CONTACT",
-            "NEXT_CONTACT",
-            "CHANNEL_MSG_RECV",
-            "CONTACT_MSG_RECV",
-            "ADVERTISEMENT",
-            "CONTACT_DELETED",
-            "RX_LOG_DATA",
-            "DISCONNECTED",
-            # Telemetry surfaces subscribed since TI-A3.
-            "TELEMETRY_RESPONSE",
-            "STATUS_RESPONSE",
-            "BATTERY",
-            "CONNECTED",
-            "ACK",
-            "OK",
-            "ERROR",
-            "NO_MORE_MSGS",
-            "MESSAGES_WAITING",
-            "MSG_SENT",
-            "CURRENT_TIME",
-            "UNKNOWN_EVT",
-        ],
+        [n for n in _event_names if n not in omit_event_names],
     )
 
     class _FakeCommands:
@@ -4972,6 +5080,54 @@ def test_run_meshcore_enables_auto_update_and_subscribes_advert(monkeypatch):
     assert fake_mod.EventType.RX_LOG_DATA in iface._mc.subscribed_events
 
 
+def test_run_meshcore_skips_event_names_absent_from_library(monkeypatch):
+    """A handler whose event name is unknown to the installed library is skipped.
+
+    Regression for the meshcore-2.3.5 crash-loop: the SPEC RF5
+    ``CONTACT_DELETED`` handler is always present in the handler map, but the
+    ``EventType`` enum only gained that member in meshcore 2.3.7.  Against an
+    older library ``EventType["CONTACT_DELETED"]`` raised
+    ``KeyError('CONTACT_DELETED')`` at subscribe time, which propagated out of
+    :func:`_run_meshcore` and made *every* connection attempt fail with
+    ``Failed to create mesh interface`` — a permanent reconnect loop.  The
+    runner must instead skip any handler whose event name is absent from
+    ``EventType.__members__`` (subscribing only to known events) so a stale
+    library — or any future event name added ahead of the pinned floor — cannot
+    take down the whole interface.  The skipped no-op handler loses nothing.
+    """
+    import asyncio
+    import data.mesh_ingestor.protocols.meshcore as _mod
+
+    logs: list = []
+    monkeypatch.setattr(
+        _mod.config, "_debug_log", lambda msg, **kw: logs.append((msg, kw))
+    )
+    # Simulate a library predating EventType.CONTACT_DELETED (pre-2.3.7).
+    fake_mod = _make_fake_meshcore_mod(omit_event_names=("CONTACT_DELETED",))
+    _patch_meshcore_mod(monkeypatch, _mod, fake_mod)
+    assert "CONTACT_DELETED" not in fake_mod.EventType.__members__
+
+    iface = _MeshcoreInterface(target=None)
+    _connected, error_holder = asyncio.run(
+        _run_until_connected(iface, "/dev/ttyUSB0", fake_mod, _mod)
+    )
+
+    # The absent event name must not crash the connection.
+    assert error_holder[0] is None
+    assert iface.isConnected is True
+    # Known sibling events are still subscribed; only the unknown one is skipped.
+    assert fake_mod.EventType.ADVERTISEMENT in iface._mc.subscribed_events
+    assert fake_mod.EventType.RX_LOG_DATA in iface._mc.subscribed_events
+    assert not any(
+        getattr(evt, "name", None) == "CONTACT_DELETED"
+        for evt in iface._mc.subscribed_events
+    )
+    # The skip is surfaced as a warning naming the absent event.
+    skip_logs = [kw for _msg, kw in logs if kw.get("event") == "CONTACT_DELETED"]
+    assert skip_logs, "expected a debug log recording the skipped event"
+    assert skip_logs[0].get("severity") == "warning"
+
+
 def _run_meshcore_with_autoadd(monkeypatch, **factory_kwargs):
     """Drive ``_run_meshcore`` with a fake lib and return ``(iface, error_holder, logs)``.
 
@@ -5071,7 +5227,7 @@ def test_run_meshcore_autoadd_set_rejected_logs_warning(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_send_channel_announcement_meshtastic_sends_and_counts():
+def test_send_channel_announcement_meshtastic_sends_and_counts(permit_tx):
     """Meshtastic sends on CHANNEL_INDEX and counts the transmission (MA1)."""
     import data.mesh_ingestor.activity as activity
     import data.mesh_ingestor.config as config
@@ -5088,7 +5244,63 @@ def test_send_channel_announcement_meshtastic_sends_and_counts():
     assert activity.take_packet_count() == 1
 
 
-def test_send_channel_announcement_meshtastic_noop_without_sendtext():
+@pytest.mark.parametrize(
+    "closed",
+    [
+        {"TX_ENABLED": False},
+        {"TX_ANNOUNCE": False},
+        {"RX_ONLY": True},
+    ],
+)
+def test_send_channel_announcement_meshtastic_refuses_closed_policy(
+    permit_tx, monkeypatch, closed
+):
+    """The transmit primitive enforces the gates itself, not just its caller.
+
+    ``send_channel_announcement`` is a public duck-typed capability, so a second
+    caller reaching past the daemon must not be able to put a frame on the air.
+    """
+    import data.mesh_ingestor.activity as activity
+
+    for name, value in closed.items():
+        monkeypatch.setattr(permit_tx, name, value)
+    calls = []
+
+    class _Iface:
+        def sendText(self, text, channelIndex=0):
+            calls.append(text)
+
+    activity.take_packet_count()  # drain
+    MeshtasticProvider().send_channel_announcement(_Iface(), "hello mesh")
+    assert calls == []
+    assert activity.take_packet_count() == 0
+
+
+def test_send_channel_announcement_meshcore_refuses_closed_policy(
+    permit_tx, monkeypatch
+):
+    """The MeshCore primitive refuses before touching the event loop."""
+    import types as _types
+    import data.mesh_ingestor.activity as activity
+
+    monkeypatch.setattr(permit_tx, "TX_ENABLED", False)
+    iface = _MeshcoreInterface(target=None)
+    sent = []
+
+    class _Commands:
+        async def send_chan_msg(self, chan, msg, timestamp=None):  # pragma: no cover
+            sent.append((chan, msg))
+
+    iface._mc = _types.SimpleNamespace(commands=_Commands())
+    iface._loop = None  # never reached: the gate returns first
+
+    activity.take_packet_count()  # drain
+    MeshcoreProvider().send_channel_announcement(iface, "hello mesh")
+    assert sent == []
+    assert activity.take_packet_count() == 0
+
+
+def test_send_channel_announcement_meshtastic_noop_without_sendtext(permit_tx):
     """An interface lacking sendText is a no-op that counts no TX."""
     import data.mesh_ingestor.activity as activity
 
@@ -5097,7 +5309,7 @@ def test_send_channel_announcement_meshtastic_noop_without_sendtext():
     assert activity.take_packet_count() == 0
 
 
-def test_send_channel_announcement_meshcore_sends_and_counts():
+def test_send_channel_announcement_meshcore_sends_and_counts(permit_tx):
     """MeshCore schedules send_chan_msg on its loop and counts the TX (MA1)."""
     import asyncio as _asyncio
     import threading as _threading
@@ -5130,7 +5342,7 @@ def test_send_channel_announcement_meshcore_sends_and_counts():
         loop.close()
 
 
-def test_send_channel_announcement_meshcore_noop_guards():
+def test_send_channel_announcement_meshcore_noop_guards(permit_tx):
     """No-op (no TX) for a wrong iface type or a missing/closed loop or handle."""
     import asyncio as _asyncio
     import types as _types
@@ -5180,3 +5392,59 @@ def test_send_channel_announcement_is_optional_MeshProtocol_member():
 
     assert isinstance(_Minimal(), MeshProtocol)
     assert not hasattr(_Minimal(), "send_channel_announcement")
+
+
+# ---------------------------------------------------------------------------
+# ReticulumProvider conformance
+# ---------------------------------------------------------------------------
+
+from data.mesh_ingestor.protocols.reticulum import (  # noqa: E402 - path setup
+    ReticulumProvider,
+    _ReticulumInterface,
+)
+
+
+def test_reticulum_provider_satisfies_protocol():
+    """ReticulumProvider must structurally satisfy the Provider Protocol."""
+    assert isinstance(ReticulumProvider(), MeshProtocol)
+
+
+def test_reticulum_provider_name():
+    """ReticulumProvider.name must be 'reticulum'."""
+    assert ReticulumProvider().name == "reticulum"
+
+
+def test_reticulum_subscribe_returns_empty_list():
+    """RNS has no pubsub topics; subscribe() must return an empty list."""
+    assert ReticulumProvider().subscribe() == []
+
+
+def test_reticulum_node_snapshot_items_non_interface():
+    """node_snapshot_items must return [] for any non-_ReticulumInterface object."""
+    assert ReticulumProvider().node_snapshot_items(object()) == []
+
+
+def test_reticulum_extract_host_node_id_uses_config(monkeypatch):
+    """extract_host_node_id surfaces the operator-supplied INGESTOR_NODE_ID."""
+    import data.mesh_ingestor.protocols.reticulum as _mod
+
+    monkeypatch.setattr(_mod.config, "INGESTOR_NODE_ID", "!aabbccdd")
+    assert ReticulumProvider().extract_host_node_id(object()) == "!aabbccdd"
+    monkeypatch.setattr(_mod.config, "INGESTOR_NODE_ID", None)
+    assert ReticulumProvider().extract_host_node_id(object()) is None
+
+
+def test_reticulum_provider_lazy_registered_in_protocols_package():
+    """protocols.__getattr__ must resolve ReticulumProvider lazily."""
+    import data.mesh_ingestor.protocols as protocols_pkg
+
+    assert protocols_pkg.ReticulumProvider is ReticulumProvider
+    assert "ReticulumProvider" in protocols_pkg.__all__
+
+
+def test_reticulum_interface_close_is_idempotent():
+    """_ReticulumInterface.close() must not raise when called multiple times."""
+    iface = _ReticulumInterface(target=None)
+    iface.close()
+    iface.close()  # must not raise
+    assert iface.isConnected is False

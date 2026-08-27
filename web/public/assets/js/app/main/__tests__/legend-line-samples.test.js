@@ -23,7 +23,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { legendLineSampleSvg } from '../legend-line-samples.js';
+import { legendLineSampleSvg, legendWaypointSampleHtml } from '../legend-line-samples.js';
+import { FALLBACK_GLYPH } from '../waypoint-layer.js';
 
 test('neighbor sample is a solid 24px line', () => {
   const svg = legendLineSampleSvg('neighbor');
@@ -44,4 +45,30 @@ test('trace sample is dashed 6 2 so it inks the full 22px sample', () => {
 
 test('unknown kinds fall back to the solid sample', () => {
   assert.equal(legendLineSampleSvg('mystery'), legendLineSampleSvg('neighbor'));
+});
+
+test('legendWaypointSampleHtml is a miniature of the on-map teardrop pin (1c-B)', () => {
+  const html = legendWaypointSampleHtml();
+  assert.match(html, /legend-waypoint-sample/);
+  assert.match(html, /aria-hidden="true"/);
+  // The sample mirrors the marker silhouette: dark chrome, three round corners
+  // + one sharp tail corner, rotated with the glyph counter-rotated upright.
+  assert.match(html, /background:#1c1c1c/);
+  assert.match(html, /border-radius:50% 50% 50% 2px/);
+  assert.match(html, /rotate\(-45deg\)/);
+  assert.match(html, /rotate\(45deg\)/);
+  // F2: the swatch is a 12px box with a 7px glyph (design 1e-A), legible next to
+  // the 12px role dots — not the shipped 11px box / 6px smudge that sat 1px short.
+  assert.match(html, /width:12px/);
+  assert.match(html, /height:12px/);
+  assert.match(html, /font-size:7px/);
+  assert.doesNotMatch(html, /width:11px/);
+  assert.doesNotMatch(html, /height:11px/);
+  assert.doesNotMatch(html, /font-size:6px/);
+  // F2: the swatch carries the layer's canonical marker glyph (📌), imported from
+  // waypoint-layer.js so the key can never drift from the pins' fallback glyph.
+  assert.ok(html.includes(FALLBACK_GLYPH), 'swatch uses the layer canonical glyph');
+  assert.doesNotMatch(html, /✈/);
+  // Regression guard: never the old square-chip radius.
+  assert.doesNotMatch(html, /border-radius:3px/);
 });

@@ -540,7 +540,7 @@ git grep -nA2 'def version_fallback' -- web/lib/potato_mesh/config.rb
 `{ nodes, messages, telemetry }`, each metric carrying integer
 `{ hour, day, week, month }`, with `sampled` still present and `false`. The old
 flat keys (`active_nodes`, integer-valued `meshcore`/`meshtastic`) are **gone** —
-this is the intended, versioned break. `version_fallback` returns `"0.7.4"`, and
+this is the intended, versioned break. `version_fallback` returns `"0.7.5"`, and
 `test_version_sync.py` **passes** — the bump is applied in lockstep across all
 five language manifests (`data.VERSION`, `Config.version_fallback`,
 `web/package.json`, `app/pubspec.yaml`, `matrix/Cargo.toml`; `matrix/Cargo.lock`
@@ -574,6 +574,8 @@ consistent with the existing list endpoints.
 `nodes` by `last_heard`. Window cutoffs are unchanged — `hour` 3600s, `day`
 86 400s, `week` `week_seconds`, `month` `four_weeks_seconds` — so a row older than
 `four_weeks_seconds` is excluded from `month` (28-day floor, preserves C4).
+**Amended by W9 (see WP-A8):** with the waypoints feature the umbrella
+additionally counts `waypoints` rows — the check re-baselines to five tables.
 
 ### S-A4 — Privacy: messages zeroed in private mode — S5
 *Run the server with `PRIVATE=1`.*
@@ -1061,7 +1063,9 @@ lifetime/TTL helper) with co-located `__tests__`.
 canonical record id (`neighbors` by the composite `(node_id, neighbor_id)` key),
 backed by IndexedDB; values written in one session are retrievable from a fresh
 store instance over the same backing database (the reload/revisit path). Reads of
-an absent id return a miss.
+an absent id return a miss. **Extended by W8 (see WP-A5):** the store also
+round-trips `waypoints`, keyed by the composite `protocol|id` (the server's
+upsert key), at the 7 d / 7 d tier.
 
 ### FC-A2 — Seed-from-cache, fetch only the delta — FC2
 ```bash
@@ -1086,7 +1090,9 @@ or equal) eviction window. A node last updated 26 h ago is **stale yet not
 evicted** (still served); a node 8 d old is evicted; **no entry younger than 7
 days is ever evicted**; a trace 20 d old is retained, a trace 29 d old is
 evicted. No staleness/eviction window exceeds the server's visibility floor
-(7-day bulk; 28-day per-id/trace), preserving C4.
+(7-day bulk; 28-day per-id/trace), preserving C4. **Extended by W8 (see
+WP-A5):** `waypoints` joins the 7 d stale / 7 d evict tier, keyed on
+`rx_time`.
 
 ### FC-A4 — Privacy: PRIVATE disables + wipes the cache; clear control empties it — FC4
 ```bash
@@ -1508,7 +1514,8 @@ event for collection *X* the SSE client invokes the **existing** delta fetch for
 *X* with `since=<cached high-water>` and merges by id through the FC2 cache — it
 issues no broadcast re-fetch of unrelated collections and adds no new privacy or
 window logic of its own. Protocol-neutral: the event names the collection, never
-the protocol (Invariant IV).
+the protocol (Invariant IV). **Extended by W8 (see WP-A5):** `waypoints` joins
+the collection set as the seventh member.
 
 ### PS-A4 — Publish-on-change at all six ingest routes, coalesced — PS4
 ```bash
@@ -1520,7 +1527,8 @@ collection's change event after a successful write, co-located with the existing
 `ApiCache.invalidate_prefix` calls in `routes/ingest.rb`. A burst of writes to one
 collection within the debounce window is **coalesced** into a bounded number of
 emitted events (not one event per row), so a message flood cannot stampede
-subscribers.
+subscribers. **Extended by W8 (see WP-A5):** `POST /api/waypoints` publishes
+identically as the seventh ingest route.
 
 ### PS-A5 — Push replaces the 60 s poll; reconnect-resync + slow safety poll — PS5
 ```bash
@@ -1987,7 +1995,9 @@ telemetry, trace, and encrypted message. The generic "updated node info
 heard** (a position/telemetry/neighbour/trace/message suppresses a redundant
 advert line). **Amends the prior LV-A7**, which required a plaintext message entry
 in the Log -- the oversight corrected here. Hidden-protocol and PRIVATE gates
-already applied to the chat are unchanged.
+already applied to the chat are unchanged. **Extended by W7 (see WP-A7):** a
+`📌 Broadcasted waypoint` entry class joins the list; the waypoint description
+(user-authored body text) never appears in the Log.
 
 ### LV-A8 -- channel-tab dropdown selector -- LV8
 ```bash
@@ -3162,9 +3172,10 @@ with `protocol="meshcore"`. The poll loop honours
 only — no broker, Invariant I). Each contact is additionally capped by a
 fixed 24 h per-node cooldown (stamped at the poll attempt; an all-fresh
 roster tick transmits nothing, and departed contacts are pruned from the
-stamp table). `RX_ONLY=1` forbids every ingestor-initiated transmission:
-contact polls stop entirely while the airtime-free companion-link self reads
-continue.
+stamp table). The transmit policy forbids every ingestor-initiated
+transmission unless `TX_ENABLED=1` (**default `0`**), with the legacy
+`RX_ONLY=1` vetoing it regardless: contact polls stop entirely while the
+airtime-free companion-link self reads continue.
 
 ### TI-R1 — Regression: prior acceptance still holds
 ```bash
@@ -3992,8 +4003,10 @@ merged `packets` figure, appends the per-interval delta to its hourly
 `MAX`-per-protocol 24 h packets/hour moving average (MA4–MA5). Each ingestor then
 periodically broadcasts a one-line activity summary — numbers **dogfed from the
 target instance's own API** — on its protocol's default channel (MA6), gated by
-`RX_ONLY` (reused as the transmit gate), the target's `/version` privacy flag
-(fail-closed), and a ≥ 24 h post-start delay (MA7–MA8), via an **optional**
+`TX_ENABLED` (the master transmit switch, default `0`), `TX_ANNOUNCE` (the
+narrower announcement opt-in, default `0`), the target's `/version` privacy flag
+(fail-closed), and a ≥ 24 h post-start delay (MA7–MA8), with the legacy
+`RX_ONLY` retained as a veto, via an **optional**
 duck-typed provider send
 that leaves `MeshProtocol` conformance intact (MA9). Unless a check says
 otherwise, start the server in **public** mode
@@ -4077,19 +4090,23 @@ where `<N>` = the target's `GET /api/stats` `<protocol>.nodes.day` and `<M>` =
 line is truncated to the protocol's character limit. `<domain>` = the configured
 `INSTANCE_DOMAIN`.
 
-### MA-A7 — Announcement gates: RX_ONLY, privacy fail-closed, 24 h — MA7
+### MA-A7 — Announcement gates: TX_ENABLED, TX_ANNOUNCE, privacy fail-closed, 24 h — MA7
 ```bash
+( . .venv/bin/activate && pytest -q tests/test_tx_policy_unit.py )
 ( . .venv/bin/activate && pytest -q tests/test_announce_unit.py \
-    -k "gate or private or rx_only or elapsed" )
+    -k "gate or private or suppressed or elapsed or monotonic" )
 ```
-**Expected:** pass. **No** announcement is sent when any gate fails: `RX_ONLY=1`
-(the **reused** receive-only flag — its existing MeshCore-poll TX suppression now
-also covers the announcement, so it is the sole opt-out; no separate `ENABLE_TX`
-env exists); the target `/version` reports `private_mode: true`; the `/version`
-fetch **errors or is unparseable** (fail-closed — treated as private/skip); or
-`< 24 h` have elapsed since ingestor start. With `RX_ONLY` unset (the default
-`0`), `private_mode: false`, and `≥ 24 h` elapsed, exactly one announcement per
-24 h per domain is transmitted.
+**Expected:** both pass. **No** announcement is sent when any gate fails:
+`TX_ENABLED` is unset (**the default `0`** — an ingestor deployed to feed a map
+transmits nothing at all, announcement or telemetry poll); `TX_ANNOUNCE` is unset
+(the default `0` — permission to transmit is not permission to broadcast
+unsolicited on a shared human channel); the legacy `RX_ONLY=1` is set (it vetoes
+`TX_ENABLED=1` and the contradiction is warned about at startup); the target
+`/version` reports `private_mode: true`; the `/version` fetch **errors or is
+unparseable** (fail-closed — treated as private/skip); or `< 24 h` have elapsed
+since ingestor start. With `TX_ENABLED=1`, `TX_ANNOUNCE=1`, `RX_ONLY` unset,
+`private_mode: false`, and `≥ 24 h` elapsed, exactly one announcement per 24 h per
+domain is transmitted. Each closed gate names itself in the log (`blocked_by`).
 
 ### MA-A8 — Default channel/scope + 24 h cadence — MA8
 ```bash
@@ -4418,3 +4435,694 @@ bridge poll/handle suites (every node mock now serves the `%21` path), the
 MB-A1 compacted-row suite, and the per-id node route specs (synthetic flag,
 stale/fresh, since-filter, opt-out) — the fallback fires only on the
 empty-result path, so none of their outcomes may change.
+
+---
+
+## Bugfix: Frontend load performance regression
+
+Since the module-graph preload (#815/#832) and the bulk-collection backfill (#835),
+amplified by the design/UX work (#855/#859/#860), the dashboard's cold-load cost
+grew. Two root causes plus three first-paint levers are addressed, all
+frontend/template only — no API/DB change; the C4/C7 window floors,
+`MAX_QUERY_LIMIT`, privacy, and the FC persistent cache are untouched, and the full
+7-/28-day history still backfills (only *when* it repaints changes, not *which*
+rows are reachable):
+
+- **(RC-A)** the layout preloaded *every* served JS module on every page even
+  though a page only runs the graph reachable from its own entries → scope the
+  modulepreload set to the current view's **static** import closure (the AV3 import
+  map still versions the whole graph).
+- **(RC-B)** the one-shot backfill repainted the entire node table + map once per
+  streamed page (dozens of `/api/positions` pages on a busy instance), on the main
+  thread → coalesce the per-page repaints onto a bounded idle callback.
+- **(FP-A3)** the render-blocking Leaflet CDN `<script>` blocked first paint on the
+  unpkg round-trip → `defer` it.
+- **(FP-A4)** the dashboard's node overlay statically pulled the ~125 KB node-detail
+  renderer into the boot graph → dynamic-`import()` it on first open.
+- **(FP-A5)** `/charts`, `/federation`, and node-detail pages ran the whole
+  dashboard data pipeline (fetch + backfill + SSE) on top of their own module →
+  skip that pipeline on those views.
+
+### FP-A1 — The dashboard preloads only its own module graph (RC-A)
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "modulepreloads the dashboard's own module graph" )
+( cd web && bundle exec rspec spec/asset_import_map_spec.rb )
+```
+**Expected:** pass. `GET /` emits `<link rel="modulepreload">` for the dashboard's
+own graph (e.g. `main.js`) but **not** for other pages' entry modules
+(`charts-page.js`, `federation-page.js`). The `<script type="importmap">` still
+version-stamps the **whole** served graph (AV3), so navigating to those pages still
+receives cache-busted modules. `AssetImportMap.import_closure` walks each entry's
+**static** `import` / `export … from` graph (dynamic `import()` is excluded — it is
+lazy, so it must not be eagerly preloaded); a module absent from a preload set still
+loads on demand (AV3 degradation).
+
+### FP-A2 — The bulk-collection backfill coalesces its repaints (RC-B)
+```bash
+( cd web && node --test public/assets/js/app/__tests__/main-collection-backfill.test.js )
+```
+**Expected:** pass. Streaming N backward pages into a bulk collection triggers a
+**bounded** number of full `renderFilteredOutputs` repaints (≤1 coalesced repaint
+for the test's three node pages), not one per page — the merge stays immediate so
+`getLoadedNodeCount()` still reflects every paged-in row, but the table + map
+repaint is coalesced onto an idle callback. The existing #832 backfill behaviour
+(every collection pages backward past the newest 1000-row page; a short page fires
+no request; a failed page is swallowed) is unchanged.
+
+### FP-A3 — Leaflet is deferred so it does not block first paint
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "loads the CDN Leaflet script deferred" )
+```
+**Expected:** pass. The Leaflet CDN `<script>` in the layout head carries `defer`,
+so it no longer blocks first paint on the unpkg round-trip. The map init runs on
+`DOMContentLoaded` (after deferred scripts execute in document order), so
+`window.L` is ready in time; a missing `L` still degrades to the "map unavailable"
+placeholder (unchanged).
+
+### FP-A4 — The node-detail overlay subtree is lazy-loaded, not in the boot preload
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "keeps the lazily-loaded node-detail overlay subtree out" )
+( cd web && node --test public/assets/js/app/__tests__/main-node-overlay-lazy.test.js )
+```
+**Expected:** pass. The dashboard boot preload contains **no** `modulepreload` for
+`node-page.js` / `node-detail-overlay.js` (the ~125 KB node-detail renderer + charts
+subtree); `main.js` dynamic-`import()`s it on first `.node-long-link` open and
+memoises it (a concurrent open reuses the single in-flight import). The module stays
+in the import map for the on-demand load (AV3). The overlay's own behaviour
+(`node-detail-overlay.test.js`) is unchanged.
+
+### FP-A5 — Self-rendering pages skip the shared dashboard data pipeline
+```bash
+( cd web && node --test public/assets/js/app/__tests__/main-view-gating.test.js )
+```
+**Expected:** pass. On a `view-charts`, `view-federation`, or `view-node_detail`
+body, `initializeApp` wires the shared header (mobile menu, instance selector, node
+overlay) but issues **no** `/api/*` fetch, backfill, or SSE — that data pipeline
+(which previously fired the whole bulk-collection backfill on every node-detail
+view) is skipped. The dashboard view still fetches and loads its data.
+
+### FP-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** every prior check still passes. At risk and explicitly required to
+remain green: **PL-A1/PL-A2** (progressive chat load — same coalescing family),
+the **#832** collection-backfill guards (`main-collection-backfill.test.js`), the
+asset cache-busting specs (**AV1–AV5**, `asset_import_map_spec.rb` /
+`asset_versioning_spec.rb` — the import map is unchanged), and **B1** (all suites).
+The map still initialises on the dashboard/map views (Leaflet defer), node overlays
+still open (now lazily), and `/charts`, `/federation`, node-detail pages still
+render via their own modules. No API/event contract changes, so **C2** and the
+Python suite are unaffected.
+
+---
+
+## Bugfix: MeshCore ingestor crash-loop on a stale `meshcore` (KeyError `CONTACT_DELETED`)
+
+The SPEC RF5 `CONTACT_DELETED` no-op handler is always registered in the MeshCore
+handler map, but `meshcore`'s `EventType` enum only gained that member in 2.3.7,
+while `data/requirements.txt` still pinned the floor at `meshcore>=2.3.5`. On any
+deployment that resolved a pre-2.3.7 wheel, the runner's
+`EventType["CONTACT_DELETED"]` subscribe lookup
+(`data/mesh_ingestor/protocols/meshcore/runner.py`) raised
+`KeyError('CONTACT_DELETED')`, which propagated out of `_run_meshcore`, so **every**
+connection attempt failed with `Failed to create mesh interface` — a permanent 5 s
+reconnect loop that ingested nothing. Fixed on two independent axes: the floor is
+bumped to `meshcore>=2.3.8` (the latest release, which defines the member), and the
+runner now subscribes only to event names present in `EventType.__members__`,
+skipping (with a warning) any handler whose event the installed library does not
+define — so this class of version-skew crash cannot recur for a future event name
+added ahead of the pinned floor.
+
+### EC-A1 — the runner skips handler event-names absent from the installed library — RF5
+```bash
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py -k "skips_event_names_absent" )
+```
+**Expected:** pass. With a fake `meshcore` whose `EventType` omits `CONTACT_DELETED`
+(a pre-2.3.7 library), `_run_meshcore` connects successfully: no `KeyError`
+propagates (`error_holder[0] is None`, `iface.isConnected`), the known sibling
+events (`ADVERTISEMENT`, `RX_LOG_DATA`) stay subscribed, `CONTACT_DELETED` is **not**
+subscribed, and the skip is debug-logged as a warning naming the event.
+
+### EC-A2 — the `meshcore` floor provides `EventType.CONTACT_DELETED`
+```bash
+grep -nE 'meshcore>=2\.3\.8' data/requirements.txt
+```
+**Expected:** pass. `data/requirements.txt` pins `meshcore>=2.3.8`; version 2.3.7
+introduced `EventType.CONTACT_DELETED = "contact_deleted"` (2.3.5/2.3.6 lack it), so
+a fresh ingestor image build satisfies the RF5 handler at the enum level.
+
+### EC-R1 — Regression: prior acceptance still holds
+```bash
+( . .venv/bin/activate && pytest -q tests/ )
+( cd web && bundle exec rspec ) && ( cd web && npm test )
+```
+**Expected:** every prior check still passes. Explicitly required to remain green:
+**RF-A5** (`CONTACT_DELETED` is subscribed and is a debug no-op — unchanged when the
+member is present, as with the pinned library) and **RF-A1..A6 / RF-R1** (all
+MeshCore RF-metrics behavior). The runner change is subscribe-time only — no
+event/POST contract changes — so **C2** and the Ruby/JS suites are unaffected.
+
+---
+
+## Perf: static-asset caching & stats cache TTL
+
+Two delivery-side perf improvements from the `dweb` profiling. Neither changes an
+API/event contract. The `/api/stats` GVL-freeze root cause is tracked separately
+in **issue #866** (query pushdown); the items here are the safe, independent parts.
+
+### CA-A1 — Version-busted JS/CSS carry a long-lived Cache-Control
+```bash
+( cd web && bundle exec rspec spec/asset_cache_control_spec.rb )
+( cd web && bundle exec rspec spec/app_spec.rb -e "static asset caching" )
+```
+**Expected:** both pass. `PotatoMesh::App::AssetCacheControl` (wired via `use` after
+`Rack::Deflater`) stamps a long-lived `Cache-Control` on a `GET`/`HEAD` for a
+`/assets/**` **JS/CSS** URL (`.js`/`.mjs`/`.css`) carrying a non-empty `?v=`
+cache-buster (emitted by `asset_url`), so returning/staying visitors serve them
+from cache instead of revalidating every asset. The value is
+`public, max-age=31536000, immutable` **only for a pinned build** — one whose
+version is unique per build (baked `ENV["APP_VERSION"]` or git-derived), signalled
+by `APP_VERSION_PINNED`; a deployment on the constant fallback version (e.g. a
+Docker image built without `.git` and no baked version) is **not** pinned and gets
+`public, max-age=300` instead (bounded/revalidatable, so the unchanged `?v=` can
+never pin stale JS for a year). **Non-JS/CSS** assets
+(images/favicons/SVG — SPEC AV4) are left untouched even when they carry `?v=`
+(keep `Last-Modified`/`ETag` revalidation), and an existing `Cache-Control` (e.g.
+one nginx set when serving `/assets/` from disk) is never overwritten. *Note:* the
+first command runs the full middleware unit spec (its examples are not named
+"static asset caching", so it must run un-filtered); the second runs the
+integration examples.
+
+### CA-A2 — `/api/stats` cache TTL is configurable (bounds recompute frequency)
+```bash
+( cd web && bundle exec rspec spec/config_spec.rb -e "stats_cache_ttl_seconds" )
+```
+**Expected:** pass. `PotatoMesh::Config.stats_cache_ttl_seconds` defaults to **60 s**
+(was a hardcoded 15 s) and reads `STATS_CACHE_TTL_SECONDS`; `GET /api/stats` uses it.
+This bounds how often the CPU-bound aggregation can run. *Documented limit:* ingest
+POSTs still invalidate `api:stats:`, so on write-heavy instances write frequency —
+not this TTL — governs recompute frequency; decoupling stats from write-invalidation
+and stale-while-revalidate land with the query fix (**#866**), where the recompute
+is cheap enough that neither reintroduces the freeze.
+
+### CA-A3 — Baked, `v`-prefixed `APP_VERSION` + explicit pinned gate
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "#determine_app_version" )
+```
+**Expected:** pass. `resolve_app_version` prefers a non-blank `ENV["APP_VERSION"]`
+(the git version baked into the image by `web/Dockerfile`'s `ARG APP_VERSION` →
+`ENV APP_VERSION`, computed by `.github/workflows/docker.yml` via
+`git describe --tags --long --abbrev=7`) over the in-image `git describe` /
+`Config.version_fallback` path; a blank/unset value keeps the git-then-fallback
+behavior. The resolved `APP_VERSION` is always **`v`-prefixed** (`0.7.5` → `v0.7.5`)
+so every build shape advertises the same string, and `app_version_pinned?` reports
+`true` for a baked-ENV/git version and `false` for the constant fallback.
+`AssetCacheControl` keys `immutable` on that `APP_VERSION_PINNED` flag — **not** a
+value comparison (which would misfire now that the fallback is also `v`-prefixed).
+This closes the **SPEC AV1** limitation *for Docker*: the image's `?v=` buster
+becomes unique per build, so **CA-A1** resolves to
+`public, max-age=31536000, immutable` inside the image instead of the bounded
+`max-age=300` fallback — the full year-long caching win with no stale-JS risk.
+`Config.version_fallback` stays bare `0.7.5` (polyglot manifest sync unaffected).
+
+### CA-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && bundle exec rspec )
+```
+**Expected:** all green. The `/api/stats` shape/counts (**S-A1**–**S-A6**), the
+asset-versioning specs (**AV1**–**AV5**, unchanged), and **B1** stay green; the TTL
+change is value-only (cache invalidation on write is unchanged) and the middleware
+only adds a response header for versioned assets.
+
+---
+
+## Bugfix: `/api/stats` recompute holds the GVL (telemetry umbrella index pushdown, issue #866)
+
+`GET /api/stats` recomputes its scope × metric × window tree on the request that
+finds the `ApiCache` entry expired (`application/routes/api.rb`, TTL
+`Config.stats_cache_ttl_seconds` — default 60 s; a hardcoded 15 s when this bug was
+filed, made configurable by #868). On a single-process Puma the recompute holds the
+MRI GVL for its whole duration, so any request arriving during it stalls. The
+cost was the `telemetry` umbrella: its four sources (`positions` + `telemetry` +
+`neighbors` + `traces`) are `UNION ALL`-ed
+into the `visible` CTE, which SQLite **materialises** and then scans once per window
+(12×). Because the outer window filter sits on the aliased `t`, the per-table
+`idx_*_rx_time` index cannot apply and the entire table is scanned. Fix: push the
+widest (`month` = now − `four_weeks_seconds`) cutoff onto each projection's **raw**
+indexed column — `node_activity_counts` → `last_heard`, `message_activity_counts`
+and every `telemetry_activity_counts` branch → `rx_time` — so `visible` is
+pre-filtered to the 28-day slice through the index before aliasing. Provably
+lossless by **S4** (month is the widest of {hour, day, week, month}, so any row it
+prunes contributes 0 to every window); counts stay **byte-identical**. Query layer
+only — no route, cache, JSON-shape, privacy, or federation change.
+
+### SP-A1 — the stats projections index-seek instead of materialise-and-full-scan
+```bash
+( cd web && bundle exec rspec spec/queries_spec.rb -e "windowed stats query plan" )
+```
+**Expected:** pass. The telemetry-umbrella `EXPLAIN QUERY PLAN` reaches each of
+`positions`, `telemetry`, `neighbors`, and `traces` via `SEARCH … USING INDEX
+idx_<table>_rx_time`, and every projection bounds its raw indexed time column
+(`node_activity_counts` on `last_heard >= ?`; `message_activity_counts` and all four
+umbrella branches on `rx_time >= ?`). Before the fix the umbrella emitted
+`MATERIALIZE visible` + one full `SCAN <table>` per source + 12× `SCAN visible` and
+used no index — this guard failed for exactly that reason. **Amended by W9 (see
+WP-A8):** the umbrella's fifth source, `waypoints`, joins the same pushdown —
+the plan spec asserts `idx_waypoints_rx_time` is seeked and counts five
+`rx_time >= ?` bounds.
+
+### SP-A2 — counts stay byte-identical (losslessness, S2/S3/S4)
+```bash
+( cd web && bundle exec rspec spec/queries_spec.rb -e "active_node_stats" -e "telemetry umbrella" )
+```
+**Expected:** pass. `query_active_node_stats` returns the same scope × metric ×
+window counts as before the pushdown — `total` unfiltered with protocol subsets
+(S2), the telemetry umbrella (S3 — four tables when this fix landed, **five
+after the W9 waypoints amendment**, see WP-A8), and unchanged window cutoffs
+with the 28-day `month` floor (S4). The pushed-down `month` bound removes only
+rows that already scored 0 in every window, so no count changes.
+
+### SP-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && bundle exec rspec ) && ( cd web && npm test )
+( . .venv/bin/activate && pytest -q tests/ )
+```
+**Expected:** every prior check still passes. Explicitly required to remain green:
+**S-A1** (`/api/stats` shape + `sampled:false`), **S-A4** (messages zeroed under
+`PRIVATE=1`), **S-A5** (`reticulum` zero stub), and **S-A6 / A3c** (one-way
+federation stats compatibility) — the fix changes only *how* the counts are
+computed, not the payload. No POST/event contract change, so **C2** and the Python
+suite are unaffected.
+
+---
+
+## Feature: Meshtastic waypoints (first-class POI layer, issue #848)
+
+Maps to SPEC decisions **W1–W10**; **W9 amends S3** (S-A3 is re-baselined by
+WP-A8) and **W7 amends LV7** (LV-A7 gains one entry class). Context: Meshtastic
+`WAYPOINT_APP` broadcasts were previously dropped unhandled by the ingestor;
+they become a protocol-stamped `waypoints` collection (radio → ingestor →
+authenticated `POST` → SQLite → additive `GET /api/waypoints` → map layer +
+Log tab + legend toggle per the confirmed design variants 1c-A/1d-A/1e-A),
+gated at **message-grade privacy**.
+
+### WP-A1 — Ingestor captures WAYPOINT_APP; canonical contract documented — W1/W2
+```bash
+( . .venv/bin/activate && pytest -q tests/test_waypoint_unit.py )
+git grep -n "waypoints" -- data/mesh_ingestor/CONTRACTS.md
+```
+**Expected:** pytest passes: the waypoint handler decodes a `WAYPOINT_APP`
+packet into the documented event — waypoint `id`, `name`, `description`,
+`icon` codepoint, `latitude`/`longitude` (from the protobuf `*_i` integer
+fields), `expire` (unix; 0/absent = never), `locked_to`/author as canonical
+`!%08x` ids (C3), `rx_time`, `protocol: "meshtastic"` — queues
+`POST /api/waypoints`, and tolerates malformed payloads without crashing the
+daemon. The grep shows `CONTRACTS.md` documents the `POST`/`GET
+/api/waypoints` shapes as protocol-neutral (any protocol may emit; Meshtastic
+is today's only emitter).
+
+### WP-A2 — POST /api/waypoints: auth, validation, 201, cross-ingestor upsert — W4/W5
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "/api/waypoints" )
+```
+**Expected:** pass. No/wrong bearer token → **403** (C1's established
+`require_token!` contract); a non-Array/non-Hash body → **400**
+`{"error":"invalid payload"}` (IC-A4); a valid snake_case payload → **201**
+(IC-A3) and the row is stored. Re-POSTing the same waypoint
+`id` (same or different ingestor) **upserts**: one row whose
+name/description/icon/coords/`expire`/`locked_to` are updated and whose
+`rx_time` advances (C5/W5) — never a duplicate.
+
+### WP-A3 — GET /api/waypoints: floors, cursor, protocol filter, expiry exclusion — W4/W5
+```bash
+( cd web && bundle exec rspec spec/queries_spec.rb -e "waypoint" )
+```
+**Expected:** pass. Rows are snake_case with canonical ids; the 7-day rolling
+window floor on `rx_time` cannot be widened by `since` (C4); `?before=<unix>`
+is an inclusive upper bound that only narrows (BP1-style keyset paging;
+non-positive/non-integer values ignored as absent); `?protocol=` filters via
+the unchanged `KNOWN_PROTOCOLS` gate (A4a); a waypoint whose `expire` is in
+the past is **excluded** from results from that moment; `expire`-never rows
+are served until the 7-day window on `rx_time` drops them (no physical
+delete-at-expiry).
+
+### WP-A4 — Message-grade privacy: PRIVATE 404s, no events, opt-out excluded — W3
+*Run the server with `PRIVATE=1`.*
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:41447/api/waypoints
+( cd web && bundle exec rspec spec/pubsub_spec.rb -e "waypoint" \
+         && bundle exec rspec spec/queries_spec.rb -e "waypoint opt-out" )
+```
+**Expected:** the curl prints **404** (mirrors A2a for `/api/messages`). The
+pubsub spec proves no `waypoints` change event is published or delivered under
+`PRIVATE=1` (PS6 pattern). The queries spec proves a waypoint authored by an
+opted-out node (`NODE_OPT_OUT_MARKER`) never appears on any read surface (S5
+filter pattern). Public mode is unaffected.
+
+### WP-A5 — Seventh SSE collection; cache tier 7 d / 7 d; waypoints flash — W8 (re-rolled)
+```bash
+( cd web && bundle exec rspec spec/pubsub_spec.rb -e "publishes on every ingest route" \
+         && bundle exec rspec spec/pubsub_spec.rb -e "publishes nodes on a waypoints ingest" )
+( cd web && node --test public/assets/js/app/main/__tests__/data-cache.test.js \
+                        public/assets/js/app/main/__tests__/event-stream.test.js \
+                        public/assets/js/app/__tests__/main-waypoints.test.js )
+```
+**Expected:** pass. `POST /api/waypoints` publishes a thin, coalesced
+`waypoints` event co-located with its cache invalidation (PS4 + LV6 settle
+window) **and a companion `nodes` event** (the ingest advances the author's
+`last_heard`; W8 as re-rolled — the earlier silent-side wording is
+superseded); the SSE client reacts to a `waypoints` ping with the existing
+since-delta fetch and merge-by-id (PS3 pattern — no new privacy or window
+logic); the persistent cache round-trips the `waypoints` collection keyed by
+the composite `protocol|id` (mirroring the server's `(id, protocol)` upsert
+key, like FC-A1's composite neighbors key) at the message-grade tier (stale
+**7 d** / evict **7 d**, FC3). A waypoint delta **fades its own pin** via the
+standard `.live-flash` element fade, and the author's row/marker flash rides
+the companion `nodes` publish (asserted in `main-waypoints.test.js`).
+
+### WP-A6 — Map layer: teardrop pin, expiry dimming, minimal card, legend toggle — W6 (re-rolled: 1c-B/1d-C/1e-A)
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/waypoint-layer.test.js \
+                        public/assets/js/app/__tests__/main-waypoints.test.js )
+```
+**Expected:** pass. Markers are 24 px **teardrop pins** (1c-B: the dark
+overlay chrome — `#1c1c1c`, hairline border — as a three-round-one-sharp-
+corner square rotated −45° so the sharp corner is the downward tail; the
+glyph counter-rotates upright; the icon anchor sits on the tail tip so the
+pin points at the coordinate; 📌 fallback for missing/invalid codepoints;
+stacked above node markers); marker opacity follows the expiry ladder
+(remaining < 1 h → 0.4, < 24 h → 0.7, else 1; never → 1). Opening a marker
+renders the 1d-C **minimal card** in the standard overlay chrome — exactly
+`<glyph> <name>`, the description when present, and
+`<expiry> · by <badge>` (expiry ∈ `in <duration>` / `expired` / `never`) —
+with the coordinates, `wpt <id>`, and locked-to reference **absent** (they
+render on the node page, WP-A9). The legend gains a **Waypoints** toggle with
+live count inside the **Meshtastic column** (beneath the neighbor/trace line
+toggles), honours the `aria-pressed` conventions (NT-A1/UX8), hides the layer
+when unpressed, and stays session-only like the line toggles; hiding a
+protocol also hides its waypoints (confirmed coupling). The neighbor/trace
+line toggles read as static `Neighbor lines` / `Trace lines` (no Show/Hide
+prefix; state in `aria-label` + pressed styling — the re-roll's user
+amendment). Both maps (dashboard + `/map`) mount the layer from the shared
+code path.
+
+### WP-A7 — Log entry class; the description never reaches the Log — W7 (LV7 amendment)
+```bash
+( cd web && node --test public/assets/js/app/__tests__/chat-log-tabs.test.js \
+                        public/assets/js/app/__tests__/main-waypoints.test.js )
+```
+**Expected:** pass. A waypoint broadcast yields exactly one Log entry —
+`📌 Broadcasted waypoint <glyph> <name> — Lat: <lat>, Lon: <lon>, Expires:
+<relative|never>` (asserted against the rendered entry HTML in
+`main-waypoints.test.js`) — and the waypoint **description string appears
+nowhere in `logEntries`**: it is stripped at the model seam in
+`buildChatTabModel` (asserted model-level in `chat-log-tabs.test.js`), exactly
+as decrypted message bodies never enter the Log model, preserving LV-A7's
+bodies-never-in-the-Log principle against any future renderer change.
+Hidden-protocol gating applies as for every entry; under `PRIVATE` the
+collection 404s (WP-A4), so no entries exist.
+
+### WP-A8 — Stats: telemetry umbrella re-baselined to five tables — W9 (S3 amendment)
+```bash
+( cd web && bundle exec rspec spec/queries_spec.rb -e "telemetry umbrella" )
+```
+**Expected:** pass. With one in-window row in each of `positions`,
+`telemetry`, `neighbors`, `traces`, **and `waypoints`**, the `telemetry`
+metric counts **all five tables** by `rx_time` in `total`; an additional
+meshcore-stamped waypoint row lands in the `meshcore` scope
+(`meshcore.telemetry.hour == 1`, asserted), proving waypoint rows are
+protocol-stamped and S2's subset property holds. The S4 windows and S5
+opt-out/privacy behavior are unchanged; `messages`/`nodes` metrics are
+untouched. This check **re-baselines S-A3** per the W9 amendment.
+
+### WP-A9 — Node-page Waypoints section + per-author lookup — W11 (re-roll; amends W10)
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "W11" \
+         && bundle exec rspec spec/queries_spec.rb -e "28-day per-id waypoint window" )
+( cd web && node --test public/assets/js/app/__tests__/node-page.test.js )
+```
+**Expected:** pass. `GET /api/waypoints/:id` serves the waypoints authored by
+one node (canonical id or num ref) with the standard per-id **28-day** window
+on `rx_time` — a 10-day-old broadcast is visible per-author while the bulk
+feed's 7-day floor still hides it (C4 preserved) — plus the expiry exclusion,
+opt-out, and protocol filters shared with the bulk query; under `PRIVATE=1`
+the path 404s through the same W3 wildcard filter. The node detail page (and
+its dashboard overlay, which reuses the same renderer) shows a **Waypoints**
+section listing each broadcast with the fields the minimal card omits —
+glyph+name, `wpt <id>`, 5-decimal coords, `Expires: in …/expired/never`,
+`🔒 Locked to <badge>` (mono-id fallback when no badge resolves), and a
+live-ticking heard age — and renders nothing (no section) for a node without
+waypoints. The client fetch short-circuits in private mode and maps 404 to an
+absent section.
+
+### WP-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec ) \
+  && ( . .venv/bin/activate && pytest -q tests/ && black --check data tests )
+( cd web && bundle exec rufo --check . )
+```
+**Expected:** every prior check still passes. At risk and explicitly required
+to remain green: **S-A3** (re-baselined by WP-A8 — the umbrella now counts
+five tables); **PS-A3/PS-A4** (their six-collection/six-route enumerations now
+read seven — specs updated, not removed); **FC-A1/FC-A3** (the cache
+round-trips the added collection); **LV-A7** (one added entry class; the
+bodies-never-in-the-Log assertion keeps passing); **A2/A2a** (privacy —
+`/api/waypoints` joins the PRIVATE-404 surface; message behavior unchanged);
+**A4/A4a** (parity — protocol-neutral contract, `KNOWN_PROTOCOLS` unchanged);
+**C2** (its `test_mesh.py` replay suite is unchanged and stays green; the new
+waypoint shapes are validated by `tests/test_waypoint_unit.py` plus the Ruby
+route specs, additively); the legend specs (**UX-A6, NT-A1, LC-A1**) updated
+for the new toggle and the static line-toggle labels (the re-roll amendment —
+`aria-pressed` semantics unchanged); **PD-A1** and the node-page suite (the
+W11 Waypoints section is additive — every existing node-page section renders
+identically); **VF/LV** (waypoints joined the flashing side per the W8
+re-roll: the added `nodes` publish mirrors the established positions/messages
+pattern, so VF-A2's SSE-ping gating and LV-A2's stacked timers must keep
+passing); and **B1–B5** (all suites, coverage floor, API docs, exact Apache
+headers, formatters).
+
+---
+
+## Perf: LCP critical-path refinements (DevTools trace)
+
+Three independent refinements from a Chrome DevTools LCP/Insights trace of the
+dashboard (LCP element = a map tile, ~269 ms). None changes an API/event
+contract; all are presentation/delivery-layer only.
+
+### LR-A1 — Unversioned site icons carry a bounded Cache-Control
+```bash
+( cd web && bundle exec rspec spec/asset_cache_control_spec.rb )
+( cd web && bundle exec rspec spec/app_spec.rb -e "GET /potatomesh-logo.svg" -e "GET /favicon.ico" )
+```
+**Expected:** all pass. The site icons (`/potatomesh-logo.svg`, `/favicon.ico`,
+`/favicon.png`) are served straight off `public/` by Sinatra's static handler,
+which sets **no** `Cache-Control` (DevTools flagged the logo at a 0 ms TTL — a
+revalidation every page load). `PotatoMesh::App::AssetCacheControl` now stamps a
+bounded, revalidatable `public, max-age=86400` (`ICON_CACHE_CONTROL`) on those
+paths when the response carries no `Cache-Control` — **not** `immutable` (they
+have no `?v=` buster, so a changed icon self-heals within a day). An existing
+`Cache-Control` (e.g. the favicon fallback route's own, or one nginx set) is
+never overwritten, and the `/assets/**` versioned-JS/CSS logic (**CA-A1**) is
+untouched.
+
+### LR-A2 — LCP-critical cross-origin origins are preconnected
+```bash
+( cd web && bundle exec rspec spec/app_spec.rb -e "preconnects to the Leaflet" )
+```
+**Expected:** pass. The layout `<head>` emits `<link rel="preconnect">` for
+`https://unpkg.com` (Leaflet CDN — render-blocking CSS + the JS that must run
+before any tile is requested) and **both** always-on tile hosts —
+`https://a.basemaps.cartocdn.com` (the CARTO Voyager base layer, painted first)
+and `https://a.tile.openstreetmap.fr` (the HOT overlay that fades in over it; the
+LCP element is a map tile) — all `crossorigin` to match the tiles' anonymous CORS
+and Leaflet's `crossorigin`, so the warmed sockets are reused. Three hints, within
+the ≤4 preconnect budget. This overlaps the DNS/TLS handshakes with parsing
+instead of gating the tiles' resource-load delay.
+
+### LR-A3 — The chat-tabs re-render does one arrow-visibility reflow, not several
+```bash
+( cd web && node --test public/assets/js/app/__tests__/chat-tabs.test.js )
+```
+**Expected:** pass (behaviour unchanged). `renderChatTabs` no longer reads the
+tab-list geometry (`updateArrows`) right after the subtree rebuild — that layout
+was thrown away when `setActiveTab` un-hides the active panel — so a live refresh
+does a **single** arrow-visibility pass after every structural + scroll write,
+collapsing the DevTools-flagged forced-reflow hotspot from multiple synchronous
+reflows to one. Scroll-restore (bugfix B) and arrow visibility are unchanged.
+
+### LR-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && bundle exec rspec ) && ( cd web && npm test )
+```
+**Expected:** all green. **CA-A1**/**CA-A3** (versioned-asset caching), **FP-A1–
+FP-A5** (frontend load perf), the chat-tabs scroll-restore specs, and **B1–B5**
+stay green; the changes only add response headers for icon paths, two `<head>`
+preconnect hints, and reorder one geometry read in `chat-tabs.js`.
+
+---
+
+## Bugfix: Waypoints shipped-review audit (Claude Design turn 2, screen 2a)
+
+Three defects the Claude Design live audit found in the **shipped** waypoints
+feature (`PotatoMesh Waypoints.dc.html`, screen 2a) — the code diverged from the
+confirmed design (**W6**/**W11**). Presentation-layer only; no API/event contract
+changes. (The audit's *open question* — the permanent "Waypoints 0" legend row —
+is deliberately left as-is, consistent with the always-present neighbor/trace
+toggles.)
+
+### WA-A1 — Node-page waypoint list is flush like its sibling sections (F1)
+```bash
+( cd web && node --test public/assets/js/app/__tests__/node-page.test.js )
+( cd web && grep -nE '\.node-detail__waypoint-list\s*\{' public/assets/styles/base.css )
+```
+**Expected:** both pass. `renderWaypointsSection` emits `.node-detail__waypoint-list`
+/ `.node-detail__waypoint`; `base.css` now defines the list with the same reset
+its siblings use (`list-style:none; margin:0; padding:0; display:flex;
+flex-direction:column; gap:6px`), so the section renders **flush** — not with UA
+disc bullets + a 40px indent — on both the node page and the dashboard
+node-detail overlay (shared renderer). Invisible on live instances until the
+first waypoint is served, which is why it shipped.
+
+### WA-A2 — Legend swatch is a legible 12px/7px 📌 (F2)
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/legend-line-samples.test.js )
+```
+**Expected:** pass. `legendWaypointSampleHtml` renders a **12px** box with a **7px**
+glyph (design 1e-A) — legible beside the 12px role dots, not the shipped 11px/6px
+smudge that sat 1px short — and carries the layer's canonical marker glyph **📌**
+(`FALLBACK_GLYPH`), not `✈` (which read as "airfield" and never matched the pins).
+
+### WA-A3 — The whole pin fits its hit box; the crown is clickable (F3)
+```bash
+( cd web && node --test public/assets/js/app/main/__tests__/waypoint-layer.test.js )
+```
+**Expected:** pass. A 24px pin rotated 45° spans ~34px, so `WAYPOINT_ICON_SIZE` is
+**[34, 34]** (was 34×30) with the body inset 5px on both axes (`top:5px`, was
+`top:0`) and `WAYPOINT_ICON_ANCHOR` **[17, 34]** — the full silhouette, crown
+included, sits inside the marker's clickable box while the tail tip stays anchored
+on the coordinate. Fixes clicks near the crown falling outside the hit area
+(Leaflet does not clip, so the pin *looked* fine but part of it was unclickable).
+
+### WA-R1 — Regression: prior acceptance still holds
+```bash
+( cd web && npm test ) && ( cd web && bundle exec rspec )
+```
+**Expected:** all green. **WP-A1–WP-A9** (waypoints feature), the node-page /
+legend / map-layer suites, and **B1–B5** stay green; the changes add one CSS rule,
+resize the legend swatch, and grow the pin's icon box — nothing touches the API,
+storage, SSE, or privacy paths.
+
+---
+
+## Bugfix: TX kill switch failed open; transmit policy is now default-off (`TX_*`)
+
+Maps to SPEC decision **MA7** (amended ×2). Every ingestor-initiated mesh
+transmission is now off unless asked for, expressed once in
+`data/mesh_ingestor/tx_policy.py` and enforced at each of the four transmit
+sites beside `activity.record_tx()`. Two operator flags — `TX_ENABLED` (master)
+and `TX_ANNOUNCE` (announcement opt-in), both default `0` — replace `ANNOUNCE`,
+and the legacy `RX_ONLY` is retained as an undocumented veto.
+
+### TX-A1 — The kill switch cannot fail open — MA7 a
+```bash
+( . .venv/bin/activate && pytest -q tests/test_tx_policy_unit.py \
+    -k "kill_switch or fails_safe or spellings" )
+```
+**Expected:** pass. `RX_ONLY` was parsed as an exact `os.environ.get(...) == "1"`,
+so `RX_ONLY=true`, `TRUE`, `yes`, `on`, `" 1"` and `"1 "` all resolved to
+**False** and the receive-only ingestor **transmitted anyway**. Every one of those
+spellings now engages the switch, and an *unrecognized* value resolves to
+engaged — a kill switch fails toward killed. `TX_ENABLED` / `TX_ANNOUNCE` fail the
+opposite way for the same reason: toward silence. All three **warn** on an
+unparseable value rather than raising — deliberately unlike `TRANSPORT`,
+`PROTOCOL` and `MESH_UDP_PORT`, which all reject a bad value at import. Those
+are selectors with no safe fallback; a transmit flag has one, so a typo costs a
+feature rather than the ingestor's ability to keep *receiving*.
+
+### TX-A2 — Transmission is off by default, at every altitude — MA7 a/b
+```bash
+( . .venv/bin/activate && pytest -q tests/test_tx_policy_unit.py \
+    -k "defaults_off or TransmitPermitted or AnnouncementsPermitted" )
+( . .venv/bin/activate && pytest -q tests/test_provider_unit.py \
+    -k "refuses_closed_policy or status_fallback_rechecks" )
+( . .venv/bin/activate && pytest -q tests/test_announce_unit.py \
+    -k "refuses_when_transmit_policy_closed or suppressed" )
+```
+**Expected:** all pass. With no TX env set, `transmit_permitted()` is `False`: the
+MeshCore on-air contact telemetry/status polls do not run **and** no announcement
+is sent. The gate is enforced at **three** altitudes, not one — the daemon entry
+point (`maybe_run_announcements`), the exported mid-level send
+(`send_announcement_to_instance`), and the transmit primitives themselves (both
+providers' `send_channel_announcement`, and each of the two on-air requests in
+`_poll_contact_telemetry`, beside that site's `record_tx`). The mid-level check
+is load-bearing rather than redundant: `send_channel_announcement` is **not** a
+`MeshProtocol` member (`mesh_protocol.py` defines five, and this is not one of
+them), so nothing structurally forces a provider to carry the gate — the
+`CLAUDE.md` protocol checklist now asks for it, but a checklist is documentation,
+not enforcement. Verified by execution: without this check,
+`run_announcement_cycle` — which is in `announce.__all__` — transmits through a
+gateless provider with every flag off. Companion-link self reads
+(USB/BLE to the operator's own radio) are not transmissions and continue.
+
+### TX-A3 — `TX_ENABLED=1` + `RX_ONLY=1` resolves to silence, loudly — MA7 a
+```bash
+( . .venv/bin/activate && pytest -q tests/test_tx_policy_unit.py -k "contradict or matrix" )
+```
+**Expected:** pass. The legacy veto wins over the new master switch — a kill
+switch an operator deliberately engaged is never silently overridden by a flag
+that arrives later in the same `.env` — and the contradictory combination emits a
+`warning` at startup naming `RX_ONLY`, because resolving to *silence* is the
+surprising direction for whoever just set `TX_ENABLED=1`.
+
+### TX-A4 — The flags reach every packaged deployment — MA10
+```bash
+( . .venv/bin/activate && pytest -q tests/test_tx_policy_unit.py -k "DeploymentSurface" )
+( TX_ENABLED=1 docker compose config | grep -E '^\s+TX_(ENABLED|ANNOUNCE):' )
+```
+**Expected:** both pass. The opt-in previously reached **no** packaged
+deployment: `x-ingestor-base.environment:` is a closed allowlist with no
+`env_file:`, so `ANNOUNCE=1` in `.env` never entered the container, and
+`flake.nix` and `data/Dockerfile` were equally closed. `docker-compose.yml` now
+passes both flags through (the `.dev`/`.prod` overlays inherit the mapping), the
+image declares both defaults in each stage, the Nix module exposes `txEnabled` /
+`txAnnounce`, and `.env.example` documents them under a `TRANSMIT SETTINGS`
+heading. A knob nobody can set is a knob that does not exist.
+
+### TX-A5 — The 24 h anti-spam delay survives an NTP step — MA7 c
+```bash
+( . .venv/bin/activate && pytest -q tests/test_announce_unit.py -k "monotonic" )
+( . .venv/bin/activate && pytest -q tests/test_daemon_unit.py -k "announcements_delegates" )
+```
+**Expected:** pass. The delay was measured against wall clock
+(`ingestors.STATE.start_time`, `time.time()`), so on an RTC-less host — a Pi or
+SBC, exactly the hardware these run on — a post-boot NTP step of hours-to-years
+cleared it instantly and the first announcement fired on the next 60 s loop.
+Scheduling now reads `ingestors.ingestor_start_monotonic()` and `time.monotonic()`,
+matching every other daemon timer. `start_time` stays wall clock because it goes
+out on the heartbeat wire (D8 unchanged).
+
+### TX-A6 — Operator-facing docs describe `TX_*` and never `RX_ONLY` — MA7
+```bash
+( grep -c 'TX_ENABLED' README.md ) && ( ! grep -q 'RX_ONLY' README.md )
+( . .venv/bin/activate && pytest -q tests/test_tx_policy_unit.py -k "not_reintroduced" )
+```
+**Expected:** pass. `README.md` carries a **Transmitting on the mesh** section —
+what each flag turns on, the two-flag truth table, the literal announcement text,
+what is never gated, and the startup log line to check — rather than the feature
+being visible only in release notes. `RX_ONLY` appears nowhere in it: it remains
+supported in code for existing deployments but is retired from documentation.
+
+### TX-R1 — Regression: prior acceptance still holds
+```bash
+( . .venv/bin/activate && pytest -q tests/ ) && ( cd web && bundle exec rspec ) && ( cd web && npm test )
+```
+**Expected:** all green. At risk and explicitly required to remain green:
+**MA-A1–MA-A9** (the activity feature — counting, heartbeat delta, aggregation and
+`/api/stats` are untouched; only the gates moved), **TI-A3** (MeshCore telemetry —
+the poll machinery is unchanged, its permission now defaults off, and the
+acceptance text is amended to say so), **A4b** (provider conformance — the gate is
+inside the optional duck-typed send, so `MeshProtocol` is untouched), and **C2**
+(canonical POST shapes — `tests/` fixtures unmodified). The web app is not
+touched at all: no Ruby, JS, API, storage, SSE, or privacy path changes.
+

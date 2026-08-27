@@ -585,6 +585,106 @@ RSpec.describe PotatoMesh::App::DataProcessing do
   end
 
   # ---------------------------------------------------------------------------
+  # upsert_node — cross-protocol node-row hijack guard
+  #
+  # nodes.node_id is a global TEXT primary key, and both the MeshCore and
+  # Reticulum id mappings truncate a native identifier to its first 4 bytes,
+  # so nodes on *different* protocols can collide on one node_id.  A colliding
+  # record must be skipped wholesale: reticulum announces stamp a wall-clock
+  # lastHeard, so the freshness guard alone would let them flip the stored
+  # row's protocol and overwrite its fields.  Same-protocol collisions remain
+  # the accepted MeshCore-inherited merge behaviour (CONTRACTS.md, "Reticulum
+  # node id mapping").
+  # ---------------------------------------------------------------------------
+  describe "#upsert_node — cross-protocol id collision guard" do
+    include_context "with isolated db"
+
+    it "leaves an existing meshtastic row untouched when a reticulum record collides" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now - 600,
+        "num" => 0xaabbccdd,
+        "user" => { "longName" => "Meshtastic Original", "shortName" => "MTOR" },
+      })
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "user" => {
+          "longName" => "Reticulum Impostor",
+          "shortName" => "aabb",
+          "publicKey" => "aabbccdd" + "00" * 12,
+        },
+      }, protocol: "reticulum")
+      row = read_node(db)
+      db.close
+      expect(row["protocol"]).to eq("meshtastic")
+      expect(row["long_name"]).to eq("Meshtastic Original")
+      expect(row["public_key"]).to be_nil
+      expect(row["last_heard"]).to eq(now - 600)
+    end
+
+    it "leaves an existing reticulum row untouched when a meshtastic record collides" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now - 600,
+        "user" => {
+          "longName" => "Reticulum Original",
+          "shortName" => "aabb",
+          "publicKey" => "aabbccdd" + "00" * 12,
+        },
+      }, protocol: "reticulum")
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "num" => 0xaabbccdd,
+        "user" => { "longName" => "Meshtastic Impostor", "shortName" => "MTIM" },
+      })
+      row = read_node(db)
+      db.close
+      expect(row["protocol"]).to eq("reticulum")
+      expect(row["long_name"]).to eq("Reticulum Original")
+      expect(row["short_name"]).to eq("aabb")
+      expect(row["last_heard"]).to eq(now - 600)
+    end
+
+    it "still applies normal same-protocol updates" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now - 600,
+        "user" => {
+          "longName" => "Reticulum Node",
+          "shortName" => "aabb",
+          "publicKey" => "aabbccdd" + "00" * 12,
+        },
+      }, protocol: "reticulum")
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "user" => {
+          "longName" => "Reticulum Node Renamed",
+          "shortName" => "aabb",
+          "publicKey" => "aabbccdd" + "00" * 12,
+        },
+      }, protocol: "reticulum")
+      row = read_node(db)
+      db.close
+      expect(row["protocol"]).to eq("reticulum")
+      expect(row["long_name"]).to eq("Reticulum Node Renamed")
+      expect(row["last_heard"]).to eq(now)
+    end
+
+    it "keeps the #747 self-heal: a meshcore record reclaims a default-meshtastic row" do
+      db = open_db
+      dp.upsert_node(db, "!aabbccdd", { "lastHeard" => now - 600, "num" => 0xaabbccdd })
+      dp.upsert_node(db, "!aabbccdd", {
+        "lastHeard" => now,
+        "user" => { "longName" => "MeshCore Contact", "shortName" => "MC" },
+      }, protocol: "meshcore")
+      row = read_node(db)
+      db.close
+      expect(row["protocol"]).to eq("meshcore")
+      expect(row["long_name"]).to eq("MeshCore Contact")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # upsert_node — issue #782: position sentinel handling
   #
   # Meshtastic firmware emits `(lat=0, lon=0)` and `position.time=0` whenever
@@ -874,6 +974,183 @@ RSpec.describe PotatoMesh::App::DataProcessing do
   end
 
   # ---------------------------------------------------------------------------
+  # insert_waypoint — SPEC W1/W5: POI upsert, expiry, sentinel handling
+  # ---------------------------------------------------------------------------
+  describe "#insert_waypoint" do
+    include_context "with isolated db"
+
+    def read_waypoint(db, id)
+      db.execute("SELECT * FROM waypoints WHERE id = ?", [id]).first
+    end
+
+    it "ignores a non-Hash payload without raising" do
+      db = open_db
+      expect { dp.insert_waypoint(db, "junk") }.not_to raise_error
+      expect(db.get_first_value("SELECT COUNT(*) FROM waypoints")).to eq(0)
+      db.close
+    end
+
+    it "ignores a payload without a waypoint id" do
+      db = open_db
+      dp.insert_waypoint(db, { "name" => "No id", "rx_time" => now })
+      expect(db.get_first_value("SELECT COUNT(*) FROM waypoints")).to eq(0)
+      db.close
+    end
+
+    it "stores a full waypoint and registers the author node" do
+      db = open_db
+      dp.insert_waypoint(db, {
+        "id" => 41_206,
+        "node_num" => 0x3769b133,
+        "rx_time" => now - 60,
+        "rx_iso" => Time.at(now - 60).utc.iso8601,
+        "name" => "Tempelhofer Feld",
+        "description" => "See further",
+        "icon" => 0x2708,
+        "latitude" => 52.4751642,
+        "longitude" => 13.4029586,
+        "expire" => now + 3600,
+        "locked_to" => 0x3769b133,
+        "snr" => -8.5,
+        "rssi" => -90,
+        "hop_limit" => 3,
+        "payload_b64" => "AQI=",
+        "ingestor" => "!feedf00d",
+      })
+      row = read_waypoint(db, 41_206)
+      node = db.execute("SELECT node_id, last_heard FROM nodes WHERE node_id = ?", ["!3769b133"]).first
+      db.close
+      expect(row["node_id"]).to eq("!3769b133")
+      expect(row["node_num"]).to eq(0x3769b133)
+      expect(row["name"]).to eq("Tempelhofer Feld")
+      expect(row["icon"]).to eq(0x2708)
+      expect(row["expire"]).to eq(now + 3600)
+      expect(row["locked_to"]).to eq("!3769b133")
+      expect(row["protocol"]).to eq("meshtastic")
+      expect(node).not_to be_nil
+      expect(node["last_heard"]).to eq(now - 60)
+    end
+
+    it "clamps a future rx_time to now and derives rx_iso" do
+      db = open_db
+      dp.insert_waypoint(db, { "id" => 2, "node_id" => "!aabbccdd", "rx_time" => now + 9999, "name" => "Soon" })
+      row = read_waypoint(db, 2)
+      db.close
+      expect(row["rx_time"]).to be_between(now, now + 5)
+      expect(row["rx_iso"]).not_to be_nil
+    end
+
+    it "defaults a missing rx_time to now" do
+      db = open_db
+      dp.insert_waypoint(db, { "id" => 3, "node_id" => "!aabbccdd", "name" => "Clockless" })
+      row = read_waypoint(db, 3)
+      db.close
+      expect(row["rx_time"]).to be_between(now - 5, now + 5)
+    end
+
+    it "derives coordinates from the protobuf integer fields" do
+      db = open_db
+      dp.insert_waypoint(db, {
+        "id" => 4,
+        "node_id" => "!aabbccdd",
+        "rx_time" => now,
+        "latitude_i" => (52.5 * 1e7).to_i,
+        "longitude_i" => (13.4 * 1e7).to_i,
+      })
+      row = read_waypoint(db, 4)
+      db.close
+      expect(row["latitude"]).to be_within(1e-6).of(52.5)
+      expect(row["longitude"]).to be_within(1e-6).of(13.4)
+    end
+
+    it "collapses the paired (0, 0) no-fix sentinel to NULL (issue #782)" do
+      db = open_db
+      dp.insert_waypoint(db, { "id" => 5, "node_id" => "!aabbccdd", "rx_time" => now, "latitude" => 0.0, "longitude" => 0.0 })
+      row = read_waypoint(db, 5)
+      db.close
+      expect(row["latitude"]).to be_nil
+      expect(row["longitude"]).to be_nil
+    end
+
+    it "stores expire = 0 as NULL (never expires, W5)" do
+      db = open_db
+      dp.insert_waypoint(db, { "id" => 6, "node_id" => "!aabbccdd", "rx_time" => now, "expire" => 0 })
+      row = read_waypoint(db, 6)
+      db.close
+      expect(row["expire"]).to be_nil
+    end
+
+    it "upserts a newer re-broadcast as the full new state (W5)" do
+      db = open_db
+      dp.insert_waypoint(db, {
+        "id" => 7, "node_id" => "!aabbccdd", "rx_time" => now - 120,
+        "name" => "Old name", "description" => "Old body", "expire" => now + 60, "snr" => -4.0,
+      })
+      dp.insert_waypoint(db, {
+        "id" => 7, "node_id" => "!aabbccdd", "rx_time" => now - 60,
+        "name" => "New name",
+      })
+      row = read_waypoint(db, 7)
+      db.close
+      expect(row["name"]).to eq("New name")
+      expect(row["description"]).to be_nil
+      expect(row["expire"]).to be_nil
+      expect(row["rx_time"]).to eq(now - 60)
+      # Radio metadata COALESCEs: an update without snr keeps the last reading.
+      expect(row["snr"]).to eq(-4.0)
+    end
+
+    it "drops an out-of-order stale re-broadcast (C5 guard)" do
+      db = open_db
+      dp.insert_waypoint(db, { "id" => 8, "node_id" => "!aabbccdd", "rx_time" => now - 30, "name" => "Fresh" })
+      dp.insert_waypoint(db, { "id" => 8, "node_id" => "!aabbccdd", "rx_time" => now - 300, "name" => "Stale" })
+      row = read_waypoint(db, 8)
+      db.close
+      expect(row["name"]).to eq("Fresh")
+      expect(row["rx_time"]).to eq(now - 30)
+    end
+
+    it "falls back to a lowercased bang id when the reference is not canonicalisable" do
+      db = open_db
+      dp.insert_waypoint(db, { "id" => 9, "node_id" => "!ZZZZ", "rx_time" => now, "name" => "Odd id" })
+      row = read_waypoint(db, 9)
+      db.close
+      expect(row["node_id"]).to eq("!zzzz")
+    end
+
+    it "derives a canonical id from a negative node_num via the fallback path" do
+      db = open_db
+      dp.insert_waypoint(db, { "id" => 10, "node_num" => -5, "rx_time" => now, "name" => "Wrapped" })
+      row = read_waypoint(db, 10)
+      db.close
+      expect(row["node_id"]).to eq("!fffffffb")
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # canonical_locked_to — SPEC W1: locked_to → canonical id mapping
+  # ---------------------------------------------------------------------------
+  describe "#canonical_locked_to" do
+    it "maps a node num to the canonical id" do
+      expect(dp.canonical_locked_to(0x3769b133)).to eq("!3769b133")
+    end
+
+    it "normalises an already-canonical id string" do
+      expect(dp.canonical_locked_to("!3769B133")).to eq("!3769b133")
+    end
+
+    it "treats 0 as unlocked" do
+      expect(dp.canonical_locked_to(0)).to be_nil
+      expect(dp.canonical_locked_to("0")).to be_nil
+    end
+
+    it "returns nil for nil and garbage references" do
+      expect(dp.canonical_locked_to(nil)).to be_nil
+      expect(dp.canonical_locked_to("not a node")).to be_nil
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # upsert_node — Bug 2: role must not be reset by no-user packets
   # ---------------------------------------------------------------------------
   describe "#upsert_node — role preservation" do
@@ -1114,7 +1391,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
         "user" => { "longName" => "Alice", "shortName" => "  A ", "role" => "COMPANION", "synthetic" => true },
       }, protocol: "meshcore")
       row = db.execute("SELECT synthetic FROM nodes WHERE node_id = '!synth111'").first
-      expect(row[0]).to eq(1)
+      expect(row.values.first).to eq(1)
       db.close
     end
 
@@ -1126,7 +1403,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
         "user" => { "longName" => "Alice", "shortName" => "  A ", "role" => "COMPANION", "synthetic" => false },
       }, protocol: "meshcore")
       row = db.execute("SELECT synthetic FROM nodes WHERE node_id = '!real1111'").first
-      expect(row[0]).to eq(0)
+      expect(row.values.first).to eq(0)
       db.close
     end
 
@@ -1143,7 +1420,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
         "user" => { "longName" => "Alice", "shortName" => "  A ", "role" => "COMPANION", "synthetic" => true },
       }, protocol: "meshcore")
       row = db.execute("SELECT synthetic FROM nodes WHERE node_id = '!aabbccdd'").first
-      expect(row[0]).to eq(0)
+      expect(row.values.first).to eq(0)
       db.close
     end
 
@@ -1159,7 +1436,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
         "user" => { "longName" => "Bob", "shortName" => " B ", "role" => "COMPANION", "synthetic" => false },
       }, protocol: "meshcore")
       row = db.execute("SELECT synthetic FROM nodes WHERE node_id = '!synth222'").first
-      expect(row[0]).to eq(0)
+      expect(row.values.first).to eq(0)
       db.close
     end
 
@@ -1179,7 +1456,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
         "user" => { "longName" => "Carol", "shortName" => "  C ", "role" => "COMPANION", "publicKey" => "cc" * 32 },
       }, protocol: "meshcore")
       # Message should now point to the real node.
-      msg_from = db.execute("SELECT from_id FROM messages WHERE id = 42").first[0]
+      msg_from = db.get_first_value("SELECT from_id FROM messages WHERE id = 42")
       expect(msg_from).to eq(real_id)
       # Synthetic node should be gone.
       synth_row = db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first
@@ -1234,7 +1511,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
         "user" => { "longName" => "Eve", "shortName" => "  E ", "role" => "COMPANION", "publicKey" => "ee" * 32 },
       }, protocol: "meshcore")
       # Both messages should now reference the real node.
-      from_ids = db.execute("SELECT from_id FROM messages WHERE id IN (51,52) ORDER BY id").map { |r| r[0] }
+      from_ids = db.execute("SELECT from_id FROM messages WHERE id IN (51,52) ORDER BY id").map { |r| r.values.first }
       expect(from_ids).to all(eq(real_id))
       # Both synthetic nodes gone.
       remaining = db.execute("SELECT node_id FROM nodes WHERE node_id IN (?,?)", [synth_a, synth_b]).flatten
@@ -1270,7 +1547,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       # Real node still there.
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [real_id]).first).not_to be_nil
       # Pre-existing message redirected.
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 71").first[0]).to eq(real_id)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 71")).to eq(real_id)
       db.close
     end
 
@@ -1284,7 +1561,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       }, protocol: "meshcore")
       row = db.execute("SELECT synthetic FROM nodes WHERE node_id = ?", [synth_id]).first
       expect(row).not_to be_nil
-      expect(row[0]).to eq(1)
+      expect(row.values.first).to eq(1)
       db.close
     end
 
@@ -1339,7 +1616,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       # operator can resolve the ambiguity manually.
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).not_to be_nil
       # Message untouched.
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 91").first[0]).to eq(synth_id)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 91")).to eq(synth_id)
       # Both real rows still present.
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [real_a]).first).not_to be_nil
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [real_b]).first).not_to be_nil
@@ -1375,7 +1652,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
         "user" => { "longName" => "Liam", "shortName" => "L", "role" => "COMPANION", "publicKey" => "dd" * 32 },
       }, protocol: "meshcore")
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).not_to be_nil
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 92").first[0]).to eq(synth_id)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 92")).to eq(synth_id)
     ensure
       db&.close
     end
@@ -1476,9 +1753,34 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       # meshtastic synthetic node must be untouched.
       synth_row = db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first
       expect(synth_row).not_to be_nil
-      msg_from = db.execute("SELECT from_id FROM messages WHERE id = 61").first[0]
+      msg_from = db.get_first_value("SELECT from_id FROM messages WHERE id = 61")
       expect(msg_from).to eq(synth_id)
       db.close
+    end
+
+    it "migrates via positional row reads on an array-row DB handle (production mode)" do
+      # Production write handles are array-row (results_as_hash = false), so the
+      # synthetic-id read maps rows by positional index — exercise that non-Hash arm.
+      db = SQLite3::Database.new(PotatoMesh::Config.db_path)
+      real_id = "!realARR1"
+      synth_id = "!synthAR1"
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [real_id, "Peggy", "meshcore", 0, now - 100, now - 100],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Peggy", "meshcore", 1, now, now],
+      )
+      db.execute(
+        "INSERT INTO messages(id,rx_time,rx_iso,from_id,to_id,protocol) VALUES (?,?,?,?,?,?)",
+        [84, now, "2025-01-01T00:00:00Z", synth_id, "^all", "meshcore"],
+      )
+      dp.merge_synthetic_nodes(db, real_id, "Peggy")
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 84")).to eq(real_id)
+    ensure
+      db&.close
     end
 
     # Regression: a chat-derived synthetic carries the most recent time the node
@@ -1539,7 +1841,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       dp.merge_synthetic_nodes(db, fresh_real, name)
 
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 91").first[0]).to eq(fresh_real)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 91")).to eq(fresh_real)
       # The stale real row itself is left alone: retention stays the only
       # data-expiry authority.
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [stale_real]).first).not_to be_nil
@@ -1585,7 +1887,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       }, protocol: "meshcore")
 
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 93").first[0]).to eq(live)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 93")).to eq(live)
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [retired]).first).not_to be_nil
     ensure
       db&.close
@@ -1684,7 +1986,33 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       )
       dp.merge_into_real_node(db, synth_id, "Niaj")
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 81").first[0]).to eq(real_id)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 81")).to eq(real_id)
+    ensure
+      db&.close
+    end
+
+    it "merges via positional row reads on an array-row DB handle (production mode)" do
+      # Production opens write handles with the default results_as_hash = false
+      # (array rows — see Database#open_database), so exercise the non-Hash arm of
+      # the node_id read that a chat-derived synthetic upsert takes in prod.
+      db = SQLite3::Database.new(PotatoMesh::Config.db_path)
+      real_id = "!realARR0"
+      synth_id = "!synthAR0"
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [real_id, "Olivia", "meshcore", 0, now - 100, now - 100],
+      )
+      db.execute(
+        "INSERT INTO nodes(node_id,long_name,protocol,synthetic,last_heard,first_heard) VALUES (?,?,?,?,?,?)",
+        [synth_id, "Olivia", "meshcore", 1, now, now],
+      )
+      db.execute(
+        "INSERT INTO messages(id,rx_time,rx_iso,from_id,to_id,protocol) VALUES (?,?,?,?,?,?)",
+        [83, now, "2025-01-01T00:00:00Z", synth_id, "^all", "meshcore"],
+      )
+      dp.merge_into_real_node(db, synth_id, "Olivia")
+      expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 83")).to eq(real_id)
     ensure
       db&.close
     end
@@ -1734,7 +2062,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       # Neither real should take the synthetic's messages because we cannot
       # tell which Paul actually sent the chat.
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).not_to be_nil
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 82").first[0]).to eq(synth_id)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 82")).to eq(synth_id)
     ensure
       db&.close
     end
@@ -1810,7 +2138,7 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       dp.merge_into_real_node(db, synth_id, "Ronda")
 
       expect(db.execute("SELECT node_id FROM nodes WHERE node_id = ?", [synth_id]).first).to be_nil
-      expect(db.execute("SELECT from_id FROM messages WHERE id = 92").first[0]).to eq(fresh_real)
+      expect(db.get_first_value("SELECT from_id FROM messages WHERE id = 92")).to eq(fresh_real)
     ensure
       db&.close
     end
@@ -2980,10 +3308,20 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       result = dp_with_lookup.send(
         :resolve_record_protocol,
         registered_db,
-        { "protocol" => "reticulum" },
+        { "protocol" => "loramesh" },
         "!mcingest1",
       )
       expect(result).to eq("meshcore")
+    end
+
+    it "honours an explicit reticulum stamp" do
+      result = dp_with_lookup.send(
+        :resolve_record_protocol,
+        registered_db,
+        { "protocol" => "reticulum" },
+        "!mcingest1",
+      )
+      expect(result).to eq("reticulum")
     end
 
     it "ignores a non-Hash record and falls back to ingestor lookup" do
@@ -3020,13 +3358,13 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       dp_with_lookup.send(
         :resolve_record_protocol,
         registered_db,
-        { "protocol" => "reticulum" },
+        { "protocol" => "loramesh" },
         "!mcingest1",
       )
       expect(warnings).not_to be_empty
       log = warnings.first
       expect(log[:message]).to match(/malformed protocol stamp/i)
-      expect(log[:value]).to eq("reticulum")
+      expect(log[:value]).to eq("loramesh")
       expect(log[:ingestor]).to eq("!mcingest1")
     end
 
@@ -3063,12 +3401,13 @@ RSpec.describe PotatoMesh::App::DataProcessing do
       expect(helper.send(:normalize_protocol_value, "meshcore")).to eq("meshcore")
       expect(helper.send(:normalize_protocol_value, "MESHTASTIC")).to eq("meshtastic")
       expect(helper.send(:normalize_protocol_value, "  Meshcore  ")).to eq("meshcore")
+      expect(helper.send(:normalize_protocol_value, "Reticulum")).to eq("reticulum")
     end
 
     it "returns nil for unknown or malformed values" do
       expect(helper.send(:normalize_protocol_value, nil)).to be_nil
       expect(helper.send(:normalize_protocol_value, "")).to be_nil
-      expect(helper.send(:normalize_protocol_value, "reticulum")).to be_nil
+      expect(helper.send(:normalize_protocol_value, "loramesh")).to be_nil
       expect(helper.send(:normalize_protocol_value, 42)).to be_nil
     end
   end

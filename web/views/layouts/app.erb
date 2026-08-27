@@ -60,6 +60,16 @@
   <link rel="icon" type="image/png" sizes="256x256" href="/favicon.png" />
   <link rel="icon" type="image/svg+xml" sizes="any" href="/potatomesh-logo.svg" />
   <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
+  <%# Warm the cross-origin connections on the LCP critical path so their DNS/TLS
+      handshakes overlap parsing instead of gating the map's first paint: the
+      Leaflet CDN (unpkg — render-blocking CSS + the JS that must run before any
+      tile is requested) and both always-on tile hosts — the CARTO Voyager base
+      layer (painted first) and the HOT overlay that fades in over it (the LCP
+      element is a map tile). `crossorigin` matches the tiles' anonymous CORS and
+      Leaflet's crossorigin attribute so the warmed sockets are actually reused. %>
+  <link rel="preconnect" href="https://unpkg.com" crossorigin />
+  <link rel="preconnect" href="https://a.basemaps.cartocdn.com" crossorigin />
+  <link rel="preconnect" href="https://a.tile.openstreetmap.fr" crossorigin />
   <% if (defined?(current_view_mode) ? current_view_mode : nil).to_s == "dashboard" %>
   <% # Escape characters that could prematurely close the <script> element
      # (or be misinterpreted as HTML) when meta_name/canonical_base/
@@ -80,12 +90,14 @@
   <%# Import map versions the entire served JS module graph (SPEC AV3); must
       precede any module load so relative imports resolve to the busted URLs. %>
   <script type="importmap"><%= asset_import_map_json %></script>
-  <%# Preload the whole ES-module graph in parallel so the browser fetches it in
-      one round trip instead of discovering it import-tier by import-tier; this
-      removes the waterfall that delayed the first /api data paint. Same set the
-      import map versions; emitted after it so module URLs resolve to the busted
-      targets. A module absent here still loads normally on demand. %>
-  <%= asset_modulepreload_tags %>
+  <%# Preload — in parallel, so the browser skips the import-tier waterfall that
+      delayed the first /api data paint — only the module graph THIS view loads,
+      not the whole served tree (a landing page must not download the node-detail
+      / charts / federation page graphs it never runs). The import map above still
+      versions the whole graph (AV3), so a later navigation stays cache-busted, and
+      a module absent from this scoped set still loads on demand. %>
+  <% preload_view_mode = (defined?(current_view_mode) ? current_view_mode : nil) %>
+  <%= asset_modulepreload_tags(asset_preload_entry_modules(preload_view_mode)) %>
   <%# Cold-load data prefetch: an early async module fires the first-load API
       requests in parallel with the module graph so data paints without waiting
       for the whole bundle to boot. Runs only on cold loads (the cache module
@@ -106,10 +118,16 @@
     integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
     crossorigin=""
   />
+  <%# `defer` so this external script does not block first paint on the unpkg
+      round-trip. Deferred scripts run in document order after parsing but before
+      DOMContentLoaded, and the map init runs on DOMContentLoaded, so `window.L`
+      is ready by the time the app initialises (a missing L still degrades to the
+      "map unavailable" placeholder). %>
   <script
     src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
     crossorigin=""
+    defer
   ></script>
 </head>
 <% body_classes = ["dark"]
@@ -240,8 +258,8 @@
           </div>
         <% end %>
         <%# Protocol toggles carry the live per-protocol count (audit follow-up
-            04): the two icon buttons were unlabelled, so a count both names them
-            and states the MeshCore/Meshtastic split. JS fills the counts. %>
+            04): the icon buttons were unlabelled, so a count both names them
+            and states the per-protocol split. JS fills the counts. %>
         <button id="protocolToggleMeshcore" type="button" class="icon-button protocol-toggle-btn" aria-label="Hide MeshCore nodes" aria-pressed="false" title="Toggle MeshCore node visibility" hidden>
           <img src="/assets/img/meshcore.svg" alt="" width="20" height="20" aria-hidden="true" class="protocol-toggle-icon" loading="lazy" decoding="async" />
           <span id="protocolToggleMeshcoreCount" class="protocol-toggle-count" aria-hidden="true"></span>
@@ -249,6 +267,10 @@
         <button id="protocolToggleMeshtastic" type="button" class="icon-button protocol-toggle-btn" aria-label="Hide Meshtastic nodes" aria-pressed="false" title="Toggle Meshtastic node visibility" hidden>
           <img src="/assets/img/meshtastic.svg" alt="" width="20" height="20" aria-hidden="true" class="protocol-toggle-icon" loading="lazy" decoding="async" />
           <span id="protocolToggleMeshtasticCount" class="protocol-toggle-count" aria-hidden="true"></span>
+        </button>
+        <button id="protocolToggleReticulum" type="button" class="icon-button protocol-toggle-btn" aria-label="Hide Reticulum nodes" aria-pressed="false" title="Toggle Reticulum node visibility" hidden>
+          <img src="/assets/img/reticulum.svg" alt="" width="20" height="20" aria-hidden="true" class="protocol-toggle-icon" loading="lazy" decoding="async" />
+          <span id="protocolToggleReticulumCount" class="protocol-toggle-count" aria-hidden="true"></span>
         </button>
         <span id="footerActiveNodes" class="meta-active-nodes"></span>
         <%# The join strip moved to the footer (audit follow-up 04), freeing the

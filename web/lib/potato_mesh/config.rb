@@ -84,6 +84,10 @@ module PotatoMesh
     DEFAULT_INITIAL_FEDERATION_DELAY_SECONDS = 2
     DEFAULT_FEDERATION_SEED_DOMAINS = %w[potatomesh.net potatomesh.jmrp.io mesh.qrp.ro].freeze
     DEFAULT_OG_IMAGE_TTL_SECONDS = 3_600
+    # Cache lifetime for the +GET /api/stats+ activity aggregation. The recompute
+    # is CPU-bound and, on a single-process MRI deployment, holds the GVL for its
+    # duration (see issue #866), so a longer TTL bounds how often it can run.
+    DEFAULT_STATS_CACHE_TTL_SECONDS = 60
     DEFAULT_OG_IMAGE_VIEWPORT_WIDTH = 1_200
     DEFAULT_OG_IMAGE_VIEWPORT_HEIGHT = 630
     DEFAULT_OG_IMAGE_NAVIGATION_TIMEOUT = 15
@@ -315,13 +319,13 @@ module PotatoMesh
     # Provide the fallback version string when git metadata is unavailable.
     #
     # 0.7.0 introduced the breaking /api/stats response-shape change
-    # (SPEC S1); 0.7.4 is the current patch release, kept in lockstep with
-    # the other language manifests. The matching +git tag v0.7.4+ is the
+    # (SPEC S1); 0.7.5 is the current patch release, kept in lockstep with
+    # the other language manifests. The matching +git tag v0.7.5+ is the
     # maintainer release step.
     #
     # @return [String] semantic version identifier.
     def version_fallback
-      "0.7.4"
+      "0.7.5"
     end
 
     # Default refresh interval for frontend polling routines.
@@ -872,6 +876,16 @@ module PotatoMesh
     # @return [Integer] positive cache duration in seconds.
     def og_image_ttl_seconds
       fetch_positive_integer("OG_IMAGE_TTL_SECONDS", DEFAULT_OG_IMAGE_TTL_SECONDS)
+    end
+
+    # Cache lifetime for the +GET /api/stats+ activity aggregation, in seconds.
+    # The aggregation is CPU-bound and holds the MRI GVL while it runs (issue
+    # #866), so this TTL bounds how frequently a request can trigger the
+    # recompute. Tunable via +STATS_CACHE_TTL_SECONDS+.
+    #
+    # @return [Integer] positive cache duration in seconds.
+    def stats_cache_ttl_seconds
+      fetch_positive_integer("STATS_CACHE_TTL_SECONDS", DEFAULT_STATS_CACHE_TTL_SECONDS)
     end
 
     # Viewport width used for the headless browser preview capture.
