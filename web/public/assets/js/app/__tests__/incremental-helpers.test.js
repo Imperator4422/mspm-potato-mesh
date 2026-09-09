@@ -16,7 +16,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { maxRecordTimestamp, minRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit, trimToWindow } from '../incremental-helpers.js';
+import { maxRecordTimestamp, minRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit, trimToWindow, mergeAndTrim } from '../incremental-helpers.js';
 
 // ---------------------------------------------------------------------------
 // maxRecordTimestamp
@@ -306,4 +306,99 @@ test('trimToWindow returns the input unchanged for an unusable floor', () => {
 test('trimToWindow returns input for non-array values', () => {
   assert.equal(trimToWindow(null, 100), null);
   assert.equal(trimToWindow(undefined, 100), undefined);
+});
+
+const idOf = r => r.id;
+const rxOf = r => r.rx_time;
+
+test('mergeAndTrim merges new rows in and trims below the floor, in one pass', () => {
+  const existing = [{ id: 1, rx_time: 10 }, { id: 2, rx_time: 200 }];
+  const incoming = [{ id: 3, rx_time: 300 }];
+  const result = mergeAndTrim(existing, incoming, idOf, rxOf, 100);
+  assert.deepEqual(result.map(r => r.id).sort(), [2, 3]);
+});
+
+test('mergeAndTrim: incoming replaces an existing row with the same key', () => {
+  const existing = [{ id: 1, rx_time: 100, text: 'old' }];
+  const incoming = [{ id: 1, rx_time: 150, text: 'new' }];
+  const result = mergeAndTrim(existing, incoming, idOf, rxOf, 0);
+  assert.equal(result.length, 1);
+  assert.equal(result[0].text, 'new');
+});
+
+test('mergeAndTrim returns the same existing reference when incoming is empty and nothing is below the floor', () => {
+  const existing = [{ id: 1, rx_time: 100 }, { id: 2, rx_time: 200 }];
+  const result = mergeAndTrim(existing, [], idOf, rxOf, 50);
+  assert.strictEqual(result, existing);
+});
+
+test('mergeAndTrim allocates a filtered array when incoming is empty but something is below the floor', () => {
+  const existing = [{ id: 1, rx_time: 10 }, { id: 2, rx_time: 200 }];
+  const result = mergeAndTrim(existing, [], idOf, rxOf, 100);
+  assert.notStrictEqual(result, existing);
+  assert.deepEqual(result.map(r => r.id), [2]);
+});
+
+test('mergeAndTrim with no floor (0/NaN/negative) never trims, merge-only', () => {
+  const existing = [{ id: 1, rx_time: 10 }];
+  const incoming = [{ id: 2, rx_time: 20 }];
+  for (const floor of [0, Number.NaN, -5]) {
+    const result = mergeAndTrim(existing, incoming, idOf, rxOf, floor);
+    assert.deepEqual(result.map(r => r.id).sort(), [1, 2]);
+  }
+});
+
+test('mergeAndTrim retains a record with a missing/non-numeric timestamp regardless of the floor', () => {
+  const existing = [{ id: 1 }, { id: 2, rx_time: 'nope' }];
+  const incoming = [{ id: 3, rx_time: 300 }];
+  const result = mergeAndTrim(existing, incoming, idOf, rxOf, 100);
+  assert.deepEqual(result.map(r => r.id).sort(), [1, 2, 3]);
+});
+
+test('mergeAndTrim skips a record whose key resolves to null/undefined', () => {
+  const existing = [{ rx_time: 100 }]; // no id
+  const incoming = [{ id: 1, rx_time: 200 }];
+  const result = mergeAndTrim(existing, incoming, idOf, rxOf, 0);
+  assert.deepEqual(result.map(r => r.id), [1]);
+});
+
+test('mergeAndTrim tolerates a non-array existing (first load) and empty incoming', () => {
+  assert.deepEqual(mergeAndTrim(undefined, [], idOf, rxOf, 100), undefined);
+  const result = mergeAndTrim(null, [{ id: 1, rx_time: 100 }], idOf, rxOf, 0);
+  assert.deepEqual(result.map(r => r.id), [1]);
+});
+
+test('mergeAndTrim is equivalent to trimToWindow(mergeById(existing, incoming, key), floor) for the same inputs', () => {
+  const existing = [
+    { id: 1, rx_time: 10 },
+    { id: 2, rx_time: 150 },
+    { id: 3, rx_time: 250 },
+  ];
+  const incoming = [
+    { id: 2, rx_time: 260, text: 'updated' },
+    { id: 4, rx_time: 5 }, // below floor
+    { id: 5, rx_time: 400 },
+  ];
+  const floor = 100;
+
+  const viaTwoCalls = trimToWindow(mergeById(existing, incoming, 'id'), floor, 'rx_time');
+  const viaMergeAndTrim = mergeAndTrim(existing, incoming, idOf, rxOf, floor);
+
+  const normalize = arr => arr.map(r => ({ id: r.id, rx_time: r.rx_time, text: r.text })).sort((a, b) => a.id - b.id);
+  assert.deepEqual(normalize(viaMergeAndTrim), normalize(viaTwoCalls));
+});
+
+test('mergeAndTrim avoids the allocation the two-call form always pays on an empty-incoming, nothing-to-trim tick', () => {
+  const existing = [{ id: 1, rx_time: 100 }, { id: 2, rx_time: 200 }];
+  // The two-call form still allocates: mergeById short-circuits to `existing`
+  // on empty incoming, but trimToWindow's `.filter` always returns a new
+  // array once the floor is valid — even when nothing is actually dropped.
+  // This is exactly the redundant work mergeAndTrim's single-pass form exists
+  // to skip (issue: frontend perf regression, Phase 8).
+  const viaTwoCalls = trimToWindow(mergeById(existing, [], 'id'), 50, 'rx_time');
+  assert.notStrictEqual(viaTwoCalls, existing, 'trimToWindow always reallocates once the floor is valid');
+  assert.deepEqual(viaTwoCalls, existing, 'but the content is identical — nothing was actually below the floor');
+
+  const viaMergeAndTrim = mergeAndTrim(existing, [], idOf, rxOf, 50);
+  assert.strictEqual(viaMergeAndTrim, existing, 'mergeAndTrim reuses the existing reference instead');
 });

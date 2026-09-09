@@ -6,6 +6,11 @@
 ### Features
 * Data/Web: Reticulum protocol support — `PROTOCOL=reticulum` selects a passive RNS announce listener that ingests `lxmf.delivery`/`nomadnetwork.node` announces as `protocol="reticulum"` nodes; the web app whitelists the protocol end-to-end (ingest + `?protocol=` filter), serves live `reticulum` stats scopes and activity-series keys, signs a live `reticulum_nodes_count` on the federation wire (the v2 canonical already carried the field, so peer signatures are unaffected), and renders reticulum nodes across the UI (icon, filter chip, mesh-activity row, federation column) (SPEC S6/FS2/MA5/MA-F2/F2-2 as amended)
 
+### Fixes
+* Web: a live-driven refresh's node-derived state (display name, position, distance, telemetry) now re-aggregates only the nodes this tick's delta actually touched, instead of every node in the collection — a node not touched this tick keeps its exact previous object, unallocated. The position/telemetry/neighbor/trace/waypoint accumulators now merge and window-evict old rows in a single pass instead of two, with the eviction check itself throttled to once/60s when nothing new arrived
+* Web: a live-driven dashboard refresh now routes each tick to only the render stages the collections that actually changed touch, instead of unconditionally rebuilding the node table, the whole map, and every chat tab on every SSE ping — a messages-only ping no longer re-clears and redraws the map, and a nodes/positions/telemetry-only ping no longer rebuilds the chat log; chat message hydration is likewise limited to the incoming delta rows instead of the full retained window (SPEC PS-perf)
+* Web: live-driven dashboard refreshes (SSE pings, resync, safety poll, unpause) are now coalesced behind a single in-flight guard, so a burst or an overlapping trigger can no longer fire two refreshes at once; the SSE-ping debounce also widens from 250ms to 1000ms (overridable via `LIVE_DEBOUNCE_MS`) (SPEC PS3/PS4)
+
 ## v0.7.5
 
 ### Features
