@@ -251,3 +251,71 @@ test('warm cache + capped since-page bridges the orphaned middle gap', async () 
     env.cleanup();
   }
 });
+
+test('Phase 7: cold load writes every row; a later 1-row delta writes back only that row', async () => {
+  const fake = createFakeIndexedDb();
+  const nodeB = { node_id: '!b', short_name: 'B', long_name: 'Node B', last_heard: NOW, protocol: 'meshtastic' };
+  let secondCall = false;
+  function stubFetch(url) {
+    if (url.startsWith('/api/nodes/')) return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(null) });
+    if (url.startsWith('/api/nodes')) {
+      // First (cold) call returns the full set; every call after returns only
+      // the one changed/new row — exactly what a `since=`-scoped delta fetch
+      // would return on a live instance.
+      const body = secondCall ? [nodeB] : NODES;
+      secondCall = true;
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) });
+    }
+    if (url.startsWith('/api/messages')) {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(url.includes('encrypted=true') ? [] : MESSAGES) });
+    }
+    return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve([]) });
+  }
+
+  const env = createDomEnvironment({ includeBody: true });
+  env.registerElement('chat', env.createElement('div', 'chat'));
+  const originalFetch = globalThis.fetch;
+  const originalIdb = globalThis.indexedDB;
+  globalThis.fetch = stubFetch;
+  globalThis.indexedDB = fake.factory;
+  try {
+    const { _testUtils } = initializeApp(CONFIG);
+    await _testUtils.initialLoad;
+    await _testUtils.flushCacheWrites();
+    await _testUtils.flushBackfill();
+
+    // Cold load's write-back is the "first write": every row of every
+    // collection, dirty-tracking notwithstanding.
+    const storedAfterCold = await createIndexedDbBackend({ indexedDB: fake.factory, databaseName: 'potato-mesh-cache' }).readAll('nodes');
+    assert.deepEqual(storedAfterCold.map(e => e.key).sort(), ['!a'], 'cold load writes the full node set');
+
+    const putAllCalls = [];
+    const originalPutAll = _testUtils.dataCache.putAll.bind(_testUtils.dataCache);
+    _testUtils.dataCache.putAll = (collection, entries) => {
+      putAllCalls.push({ collection, entries });
+      return originalPutAll(collection, entries);
+    };
+
+    _testUtils.bypassCacheWriteThrottle();
+    await _testUtils.refresh();
+    await _testUtils.flushCacheWrites();
+
+    const nodesPutAllCalls = putAllCalls.filter(c => c.collection === 'nodes');
+    assert.equal(nodesPutAllCalls.length, 1, 'exactly one nodes write-back happened for the delta refresh');
+    assert.deepEqual(
+      nodesPutAllCalls[0].entries.map(e => e.key),
+      ['!b'],
+      'the delta write-back includes only the changed/new row, not the whole collection',
+    );
+
+    const storedAfterDelta = await createIndexedDbBackend({ indexedDB: fake.factory, databaseName: 'potato-mesh-cache' }).readAll('nodes');
+    assert.deepEqual(
+      storedAfterDelta.map(e => e.key).sort(), ['!a', '!b'],
+      'the store itself still holds both rows — a dirty-only write upserts, it never wipes the untouched row',
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.indexedDB = originalIdb;
+    env.cleanup();
+  }
+});
