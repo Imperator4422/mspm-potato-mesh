@@ -6,6 +6,9 @@
 ### Features
 * Data/Web: Reticulum protocol support — `PROTOCOL=reticulum` selects a passive RNS announce listener that ingests `lxmf.delivery`/`nomadnetwork.node` announces as `protocol="reticulum"` nodes; the web app whitelists the protocol end-to-end (ingest + `?protocol=` filter), serves live `reticulum` stats scopes and activity-series keys, signs a live `reticulum_nodes_count` on the federation wire (the v2 canonical already carried the field, so peer signatures are unaffected), and renders reticulum nodes across the UI (icon, filter chip, mesh-activity row, federation column) (SPEC S6/FS2/MA5/MA-F2/F2-2 as amended)
 
+### Fixes
+* Web: the dashboard's persistent IndexedDB cache write-back now writes only the rows that actually changed since the last write, instead of re-serialising and rewriting every row of every collection (nodes, positions, telemetry, neighbors, traces, waypoints, messages) on every 30s cycle; the first write after a cold load, a cache seed, or a "clear cached data" still writes everything, since there is nothing to diff against yet
+
 ## v0.7.5
 
 ### Features

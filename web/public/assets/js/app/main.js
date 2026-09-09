@@ -475,6 +475,57 @@ export function initializeApp(config) {
   const CACHE_WRITE_INTERVAL_SECONDS = 30;
   /** Settles when the most recent write-back's stores have flushed (test hook). */
   let pendingCacheWrite = Promise.resolve();
+  /**
+   * Cache keys dirtied since the last write-back, per collection (issue:
+   * frontend perf regression, Phase 7). {@link writeBackCache} used to
+   * serialise every row of every collection on each 30s write regardless of
+   * how many actually changed; this lets it write only the rows a delta,
+   * backfill page, or chat-history page actually touched.
+   * @type {Map<string, Set<string>>}
+   */
+  const cacheDirtyKeys = new Map();
+
+  /**
+   * Mark the cache keys of the given records dirty for `collection`, so the
+   * next {@link writeBackCache} includes them.
+   *
+   * @param {string} collection Cache collection name.
+   * @param {Array<Object>} records Rows whose cache keys should be marked
+   *   dirty; each record's key is computed with {@link cacheKeyFor} for
+   *   `collection`, so passing a position/telemetry row here (rather than a
+   *   `nodes` row) still dirties the right `nodes` cache key when
+   *   `collection` is `'nodes'` — both carry the same `node_id`.
+   * @returns {void}
+   */
+  function markCacheDirty(collection, records) {
+    if (!Array.isArray(records) || records.length === 0) return;
+    let keys = cacheDirtyKeys.get(collection);
+    if (!keys) {
+      keys = new Set();
+      cacheDirtyKeys.set(collection, keys);
+    }
+    for (const record of records) {
+      const key = cacheKeyFor(collection, record);
+      if (key != null) keys.add(key);
+    }
+  }
+
+  /**
+   * Filter `records` down to only those whose cache key was marked dirty for
+   * `collection` since the last write-back.
+   *
+   * @param {string} collection Cache collection name.
+   * @param {Array<Object>} records Full current in-memory collection.
+   * @returns {Array<Object>} The dirty subset (possibly empty).
+   */
+  function dirtyRecordsFor(collection, records) {
+    const keys = cacheDirtyKeys.get(collection);
+    if (!keys || keys.size === 0 || !Array.isArray(records)) return [];
+    return records.filter(record => {
+      const key = cacheKeyFor(collection, record);
+      return key != null && keys.has(key);
+    });
+  }
 
   /**
    * Record (in ``localStorage``, synchronously readable by the cold-load boot
@@ -530,9 +581,19 @@ export function initializeApp(config) {
   }
 
   /**
-   * Throttled full write-back of the live dashboard state to the cache (SPEC
-   * FC2). Runs at most once per {@link CACHE_WRITE_INTERVAL_SECONDS} (always on
-   * the first successful refresh). No-op when the cache is disabled.
+   * Throttled write-back of the live dashboard state to the cache (SPEC FC2).
+   * Runs at most once per {@link CACHE_WRITE_INTERVAL_SECONDS} (always on the
+   * first successful refresh). No-op when the cache is disabled.
+   *
+   * The first write (cold load, or after a cache clear) writes every row of
+   * every collection — there is nothing dirty to diff against yet, and the
+   * store may be stale/absent. Every write after that includes only rows
+   * `markCacheDirty` flagged since the previous write (issue: frontend perf
+   * regression, Phase 7): serialising and IDB-writing the full node/position/
+   * telemetry/etc. collections every 30s regardless of how many rows actually
+   * changed was pure waste on a busy, mostly-unchanging instance. `putAll`
+   * upserts per key (never clears the store), so omitting an unchanged row
+   * leaves its already-cached value exactly as it was.
    *
    * @returns {void}
    */
@@ -541,17 +602,20 @@ export function initializeApp(config) {
     if (lastCacheWriteSeconds && nowSeconds - lastCacheWriteSeconds < CACHE_WRITE_INTERVAL_SECONDS) {
       return;
     }
+    const isFirstWrite = lastCacheWriteSeconds === 0;
     lastCacheWriteSeconds = nowSeconds;
+    const rowsFor = (collection, records) => (isFirstWrite ? records : dirtyRecordsFor(collection, records));
     pendingCacheWrite = Promise.allSettled([
-      cacheWriteCollection('nodes', allNodes),
-      cacheWriteCollection('positions', allPositionEntries),
-      cacheWriteCollection('telemetry', allTelemetryEntries),
-      cacheWriteCollection('neighbors', allNeighbors),
-      cacheWriteCollection('traces', allTraces),
-      cacheWriteCollection('waypoints', allWaypoints),
-      cacheWriteCollection('messages', allMessages.map(messageForCache)),
-      cacheWriteCollection('encrypted', allEncryptedMessages.map(messageForCache)),
+      cacheWriteCollection('nodes', rowsFor('nodes', allNodes)),
+      cacheWriteCollection('positions', rowsFor('positions', allPositionEntries)),
+      cacheWriteCollection('telemetry', rowsFor('telemetry', allTelemetryEntries)),
+      cacheWriteCollection('neighbors', rowsFor('neighbors', allNeighbors)),
+      cacheWriteCollection('traces', rowsFor('traces', allTraces)),
+      cacheWriteCollection('waypoints', rowsFor('waypoints', allWaypoints)),
+      cacheWriteCollection('messages', rowsFor('messages', allMessages).map(messageForCache)),
+      cacheWriteCollection('encrypted', rowsFor('encrypted', allEncryptedMessages).map(messageForCache)),
     ]);
+    cacheDirtyKeys.clear();
     // Mark the cache populated so the next load skips the cold prefetch in favour
     // of the faster FC2 seed-then-delta path — only when we actually have data to
     // persist and the cache is enabled (PRIVATE / no-IndexedDB leave it cold).
@@ -668,6 +732,10 @@ export function initializeApp(config) {
     await dataCache.clear();
     // Re-enable the cold prefetch on the next load now that the cache is empty.
     setCachePresentFlag(false);
+    // The store is now empty, so the next writeBackCache() must write every
+    // row again (Phase 7's dirty-only write assumes the store already holds
+    // whatever wasn't marked dirty — false the instant it has just been wiped).
+    lastCacheWriteSeconds = 0;
   }
 
   // NODE_LIMIT, TRACE_LIMIT, TRACE_MAX_AGE_SECONDS, and SNAPSHOT_LIMIT are
@@ -3909,6 +3977,9 @@ export function initializeApp(config) {
     if (rows.length === 0) return;
     const floor = Math.floor(Date.now() / 1000) - CHAT_RECENT_WINDOW_SECONDS;
     allMessages = trimToWindow(mergeById(allMessages, rows, 'id'), floor);
+    // Phase 7: mark the cache dirty from this backfilled page, same as
+    // refresh() does for a live delta.
+    markCacheDirty('messages', rows);
     rerenderChatLog();
   }
 
@@ -4193,6 +4264,14 @@ export function initializeApp(config) {
    */
   function commitBackfillPage(spec, batch) {
     spec.merge(batch);
+    // Phase 7: mark the cache dirty from this page's rows, same as refresh()
+    // does for a live delta. A positions/telemetry page also dirties 'nodes'
+    // (its refine re-enriches node objects from the same rows), matching the
+    // equivalent extra markCacheDirty('nodes', ...) calls in refresh().
+    markCacheDirty(spec.name, batch);
+    if (spec.name === 'positions' || spec.name === 'telemetry') {
+      markCacheDirty('nodes', batch);
+    }
     pendingBackfillRefines.add(spec.refine);
     backfillRepaintDirty = true;
     scheduleBackfillRepaint();
@@ -5503,6 +5582,25 @@ export function initializeApp(config) {
         ? trimToWindow(mergeById(allMessages, incomingMessages, 'id'), messageWindowFloor)
         : incomingMessages;
 
+      // Mark cache keys dirty from this tick's actual delta rows (issue:
+      // frontend perf regression, Phase 7) — writeBackCache later writes only
+      // these. A node's cached row also changes shape when its position or
+      // telemetry changes (distance/last-reading fields are enriched onto it
+      // by rebuildNodeDerivedState below), so a position/telemetry delta marks
+      // 'nodes' dirty too, even though the nodes endpoint itself returned
+      // nothing this tick — cacheKeyFor('nodes', row) reads row.node_id
+      // regardless of which collection the row actually came from.
+      markCacheDirty('nodes', incomingNodes);
+      markCacheDirty('nodes', incomingPositions);
+      markCacheDirty('nodes', incomingTelemetry);
+      markCacheDirty('positions', incomingPositions);
+      markCacheDirty('telemetry', incomingTelemetry);
+      markCacheDirty('neighbors', incomingNeighbors);
+      markCacheDirty('traces', incomingTraces);
+      markCacheDirty('waypoints', incomingWaypoints);
+      markCacheDirty('messages', incomingMessages);
+      markCacheDirty('encrypted', incomingEncryptedMessages);
+
       // Aggregate per-source snapshots into locals and enrich the node collection
       // from the merged sources.  Shared with the background backfill so a streamed
       // page re-derives identically (issue #832).  The per-packet accumulators
@@ -5960,6 +6058,17 @@ export function initializeApp(config) {
       initialLoad: initialLoadPromise,
       /** Promise resolving once the latest cache write-back has flushed (test hook). */
       flushCacheWrites: () => pendingCacheWrite,
+      /**
+       * Rewind the write-back throttle so the next {@link writeBackCache} call
+       * runs immediately, without waiting out {@link CACHE_WRITE_INTERVAL_SECONDS}
+       * of wall-clock time and without resetting the dirty-tracking "first
+       * write" behaviour (test use only, Phase 7).
+       */
+      bypassCacheWriteThrottle: () => {
+        lastCacheWriteSeconds = Math.floor(Date.now() / 1000) - CACHE_WRITE_INTERVAL_SECONDS - 1;
+      },
+      /** Cache keys currently marked dirty per collection (test use only, Phase 7). */
+      getCacheDirtyKeys: () => cacheDirtyKeys,
       /** Promise resolving once the one-shot chat-history backfill finishes (test hook). */
       flushBackfill: () => backfillPromise,
       /**
