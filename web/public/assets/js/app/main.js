@@ -114,7 +114,8 @@ import {
   aggregateTelemetrySnapshots,
 } from './snapshot-aggregator.js';
 import { normalizeNodeCollection } from './node-snapshot-normalizer.js';
-import { maxRecordTimestamp, minRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit, trimToWindow } from './incremental-helpers.js';
+import { maxRecordTimestamp, minRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit, trimToWindow, mergeAndTrim } from './incremental-helpers.js';
+import { createSnapshotIndex } from './main/node-snapshot-index.js';
 import { buildTraceSegments } from './trace-paths.js';
 import { buildNeighborSegments } from './main/neighbor-segments.js';
 import { createNeighborLineCache } from './main/neighbor-line-cache.js';
@@ -396,6 +397,55 @@ export function initializeApp(config) {
   let nodesById = new Map();
   let messagesById = new Map();
   let nodesByNum = new Map();
+  /**
+   * `allNodes`'s current array index per node id (issue: frontend perf
+   * regression, Phase 8) — lets {@link rebuildNodeDerivedState}'s partial path
+   * splice a touched node's freshly re-aggregated object into `allNodes` in
+   * place (O(1) per touched node) instead of rebuilding the whole array.
+   * Resynced fully whenever a full rebuild runs; a brand-new node id appended
+   * during a partial rebuild gets a new entry here too.
+   * @type {Map<string, number>}
+   */
+  let nodeArrayPositionById = new Map();
+  /** Per-node position-packet grouping, kept alongside `allPositionEntries` (Phase 8). */
+  const positionSnapshotIndex = createSnapshotIndex(row => (row && typeof row.node_id === 'string' ? row.node_id : null));
+  /** Per-node telemetry-packet grouping, kept alongside `allTelemetryEntries` (Phase 8). */
+  const telemetrySnapshotIndex = createSnapshotIndex(row => (row && typeof row.node_id === 'string' ? row.node_id : null));
+  /**
+   * Per-collection wall clock of the last time an empty-incoming tick paid
+   * for {@link mergeAndTrim}'s eviction scan (issue: frontend perf
+   * regression, Phase 8). That scan is already a cheap read-only pass (no
+   * allocation) rather than the old two-call form's guaranteed reallocation,
+   * but on a very large accumulator even a read-only scan adds up over a
+   * busy instance's steady stream of ticks — a window floor only moves by
+   * the wall clock, so checking for eviction more than once a minute buys
+   * no meaningfully earlier cleanup.
+   * @type {Map<string, number>}
+   */
+  const lastWindowCheckSeconds = new Map();
+  const WINDOW_CHECK_INTERVAL_SECONDS = 60;
+
+  /**
+   * Resolve the floor to pass {@link mergeAndTrim} for `collection` this
+   * tick: the real floor whenever there is incoming data (the scan is free
+   * then — the merge traversal happens regardless), otherwise the real floor
+   * only once every {@link WINDOW_CHECK_INTERVAL_SECONDS} and `0` (skip the
+   * scan entirely) on every tick in between.
+   *
+   * @param {string} collection Collection name (throttle key).
+   * @param {number} floor The collection's real window floor (unix seconds).
+   * @param {boolean} hasIncoming Whether this tick's delta for `collection`
+   *   is non-empty.
+   * @param {number} nowSeconds Current wall clock, unix seconds.
+   * @returns {number} The floor to pass to `mergeAndTrim` this call.
+   */
+  function trimFloorForTick(collection, floor, hasIncoming, nowSeconds) {
+    if (hasIncoming) return floor;
+    const last = lastWindowCheckSeconds.get(collection) || 0;
+    if (nowSeconds - last < WINDOW_CHECK_INTERVAL_SECONDS) return 0;
+    lastWindowCheckSeconds.set(collection, nowSeconds);
+    return floor;
+  }
   // No ``fetchNodeById`` is supplied, so the hydrator resolves senders purely
   // from the already-loaded bulk node map (``nodesById``) and renders an ``!id``
   // placeholder on a miss — it never issues per-node ``GET /api/nodes/:id``
@@ -738,6 +788,10 @@ export function initializeApp(config) {
     allTraces = traceEntries.map(entry => entry.value);
     allWaypoints = waypointEntries.map(entry => entry.value);
     rebuildNodeIndex(allNodes);
+    // The seeded accumulators bypass refresh()'s per-tick index upkeep, so
+    // sync the Phase 8 indexes here or the first partial rebuild would see
+    // none of the cached position/telemetry history.
+    resyncSnapshotIndexes();
     const [seededChat, seededEncrypted] = await Promise.all([
       messageNodeHydrator.hydrate(messageEntries.map(entry => entry.value), nodesById),
       messageNodeHydrator.hydrate(encryptedEntries.map(entry => entry.value), nodesById),
@@ -4316,6 +4370,54 @@ export function initializeApp(config) {
   }
 
   /**
+   * Run the per-node enrichment pipeline (name fallback, position merge,
+   * distance, telemetry merge, field normalisation) on a set of already-
+   * aggregated node objects. Every step here is single-node-independent (no
+   * cross-node computation), so calling it on a small touched-only subset
+   * and splicing the results back is equivalent to calling it on the whole
+   * set (Phase 8's partial-rebuild path relies on this).
+   *
+   * @param {Array<Object>} nodes Aggregated node objects to enrich, mutated
+   *   in place and also returned.
+   * @param {Array<Object>} positions Aggregated position snapshots (any
+   *   node's, not just those in `nodes` — `mergePositionsIntoNodes` looks
+   *   each one up by id and ignores the rest).
+   * @param {Array<Object>} telemetry Aggregated telemetry snapshots, same
+   *   caveat as `positions`.
+   * @returns {Array<Object>} `nodes`, enriched in place.
+   */
+  function enrichNodes(nodes, positions, telemetry) {
+    nodes.forEach(applyNodeNameFallback);
+    mergePositionsIntoNodes(nodes, positions);
+    computeDistances(nodes);
+    mergeTelemetryIntoNodes(nodes, telemetry);
+    normalizeNodeCollection(nodes);
+    return nodes;
+  }
+
+  /**
+   * Resync every Phase 8 index (`nodeArrayPositionById`,
+   * `positionSnapshotIndex`, `telemetrySnapshotIndex`) exactly against the
+   * current `allNodes` / `allPositionEntries` / `allTelemetryEntries`. Called
+   * by every path that replaces those arrays wholesale without going through
+   * the partial merge in `refresh()` — the full rebuild, and the cache seed
+   * (which fills the accumulators straight from IndexedDB and would otherwise
+   * leave the indexes empty for the whole session on a warm load, so the
+   * first partial rebuild could only see this session's delta rows).
+   *
+   * @returns {void}
+   */
+  function resyncSnapshotIndexes() {
+    nodeArrayPositionById = new Map();
+    allNodes.forEach((node, index) => {
+      const id = node && (node.node_id ?? node.nodeId);
+      if (id != null) nodeArrayPositionById.set(id, index);
+    });
+    positionSnapshotIndex.rebuild(allPositionEntries);
+    telemetrySnapshotIndex.rebuild(allTelemetryEntries);
+  }
+
+  /**
    * Re-aggregate the per-source snapshot arrays and re-enrich the node
    * collection (display name, position, distance, telemetry) from the current
    * module-level ``all*`` sources, then rebuild the node lookup index. Shared by
@@ -4324,20 +4426,93 @@ export function initializeApp(config) {
    * refresh. Does not touch ``allMessages`` / ``allEncryptedMessages`` (hydrated
    * separately) or ``allTraces`` (not node-derived).
    *
+   * @param {{ touchedNodeIds?: ?Set<string> }} [options] `touchedNodeIds`: the
+   *   node ids whose own row, position, or telemetry actually changed this
+   *   tick (Phase 8, issue: frontend perf regression). When given, only
+   *   those nodes are re-aggregated/re-enriched; every other node keeps its
+   *   previous object — reused by reference, not recomputed — which also
+   *   gives Phase 3d's entry signatures a stable identity to compare against.
+   *   `null`/omitted (the initial load, a resync, and every backfill/history
+   *   commit call this with no argument) means "re-aggregate everything",
+   *   exactly the pre-Phase-8 behaviour.
    * @returns {void}
    */
-  function rebuildNodeDerivedState() {
+  function rebuildNodeDerivedState({ touchedNodeIds = null } = {}) {
+    if (touchedNodeIds instanceof Set && touchedNodeIds.size > 0) {
+      // Partial path: only the touched nodes are re-aggregated/re-enriched;
+      // every other node keeps its exact previous object (both the array
+      // slot and `nodesById`'s reference to it are left untouched below).
+      //
+      // Source rows come from `allNodes` — the authoritative, 1-row-per-node
+      // merged collection — filtered to the touched ids in a single pass; a
+      // touched id with no row there yet (a brand-new node discovered via a
+      // position/telemetry packet that arrived before its own `nodes` row)
+      // gets a minimal synthesised row so aggregateNodeSnapshots still has
+      // something to key on, exactly like a full rebuild would derive one
+      // once the row search below the picks it up next tick.
+      const rawTouchedRows = [];
+      const foundIds = new Set();
+      allNodes.forEach((node, index) => {
+        const id = node && (node.node_id ?? node.nodeId);
+        if (id != null && touchedNodeIds.has(id)) {
+          rawTouchedRows.push(node);
+          foundIds.add(id);
+          // Refresh the index for every touched id found in `allNodes` right
+          // now: a node that arrived via this same tick's mergeById (above,
+          // in refresh()) is already in `allNodes` but `nodeArrayPositionById`
+          // has not seen it yet — without this, the splice-back loop below
+          // would treat it as "no existing slot" and append a *second*,
+          // duplicate row instead of overwriting the one already there.
+          nodeArrayPositionById.set(id, index);
+        }
+      });
+      for (const id of touchedNodeIds) {
+        if (!foundIds.has(id)) rawTouchedRows.push({ node_id: id });
+      }
+
+      const aggregatedTouchedNodes = aggregateNodeSnapshots(rawTouchedRows);
+      const touchedPositions = [];
+      const touchedTelemetry = [];
+      for (const id of touchedNodeIds) {
+        touchedPositions.push(...positionSnapshotIndex.get(id));
+        touchedTelemetry.push(...telemetrySnapshotIndex.get(id));
+      }
+      const aggregatedTouchedPositions = aggregatePositionSnapshots(touchedPositions);
+      const aggregatedTouchedTelemetry = aggregateTelemetrySnapshots(touchedTelemetry);
+      enrichNodes(aggregatedTouchedNodes, aggregatedTouchedPositions, aggregatedTouchedTelemetry);
+
+      // Splice each freshly re-aggregated node into its existing array slot
+      // (O(1) per touched node, via nodeArrayPositionById) — or append it and
+      // record a new slot, for a node id `allNodes` didn't have yet.
+      for (const node of aggregatedTouchedNodes) {
+        const id = node && (node.node_id ?? node.nodeId);
+        if (id == null) continue;
+        const existingIndex = nodeArrayPositionById.get(id);
+        const existingNode = existingIndex != null ? allNodes[existingIndex] : undefined;
+        const existingId = existingNode && (existingNode.node_id ?? existingNode.nodeId);
+        if (existingIndex != null && existingId === id) {
+          allNodes[existingIndex] = node;
+        } else {
+          nodeArrayPositionById.set(id, allNodes.length);
+          allNodes.push(node);
+        }
+      }
+      // Cheap relative to the enrichment pipeline (Map insertion only, no
+      // per-node computation) — rebuilt in full every call, partial included.
+      rebuildNodeIndex(allNodes);
+      return;
+    }
+
     const aggregatedNodes = aggregateNodeSnapshots(allNodes);
     const aggregatedPositions = aggregatePositionSnapshots(allPositionEntries);
     const aggregatedTelemetry = aggregateTelemetrySnapshots(allTelemetryEntries);
     // Enrich merged node records with display name, position, distance, and
     // telemetry before any rendering or filtering takes place.
-    aggregatedNodes.forEach(applyNodeNameFallback);
-    mergePositionsIntoNodes(aggregatedNodes, aggregatedPositions);
-    computeDistances(aggregatedNodes);
-    mergeTelemetryIntoNodes(aggregatedNodes, aggregatedTelemetry);
-    normalizeNodeCollection(aggregatedNodes);
+    enrichNodes(aggregatedNodes, aggregatedPositions, aggregatedTelemetry);
     allNodes = aggregatedNodes;
+    // Full rebuild resyncs every Phase 8 index exactly against the current
+    // authoritative state, so a partial rebuild's next lookup is never stale.
+    resyncSnapshotIndexes();
     // Rebuild lookup maps so marker updates and message hydration always resolve
     // to the latest node objects.
     rebuildNodeIndex(allNodes);
@@ -5929,23 +6104,44 @@ export function initializeApp(config) {
       const recentWindowFloor = nowSeconds - CHAT_RECENT_WINDOW_SECONDS;
       const longWindowFloor = nowSeconds - TRACE_MAX_AGE_SECONDS;
       allNodes = useSince ? mergeById(allNodes, incomingNodes, 'node_id') : incomingNodes;
+      // mergeAndTrim (Phase 8, issue: frontend perf regression) folds the
+      // merge and the window-eviction scan into one traversal instead of a
+      // separate full re-scan of the merged result after mergeById; the
+      // empty-incoming eviction check is additionally throttled to once/60s
+      // per collection (trimFloorForTick) since a window floor only moves by
+      // the wall clock, so checking it every ~1s tick buys nothing.
       allPositionEntries = useSince
-        ? trimToWindow(mergeById(allPositionEntries, incomingPositions, 'id'), recentWindowFloor)
+        ? mergeAndTrim(allPositionEntries, incomingPositions, r => r.id, r => r.rx_time,
+            trimFloorForTick('positions', recentWindowFloor, incomingPositions.length > 0, nowSeconds))
         : incomingPositions;
       allTelemetryEntries = useSince
-        ? trimToWindow(mergeById(allTelemetryEntries, incomingTelemetry, 'id'), recentWindowFloor)
+        ? mergeAndTrim(allTelemetryEntries, incomingTelemetry, r => r.id, r => r.rx_time,
+            trimFloorForTick('telemetry', recentWindowFloor, incomingTelemetry.length > 0, nowSeconds))
         : incomingTelemetry;
+      // Position/telemetry snapshot indices (Phase 8) track the same rows
+      // per node id alongside the flat accumulators above, so a partial
+      // rebuildNodeDerivedState can fetch one touched node's history in O(1)
+      // instead of re-scanning the whole accumulator. Kept in sync here with
+      // just this tick's delta; a full rebuild (`!useSince`, see below)
+      // resyncs them exactly from the merged arrays instead.
+      if (useSince) {
+        positionSnapshotIndex.addRows(incomingPositions);
+        telemetrySnapshotIndex.addRows(incomingTelemetry);
+      }
       allNeighbors = useSince
-        ? trimToWindow(mergeByCompositeKey(allNeighbors, incomingNeighbors, ['node_id', 'neighbor_id']), longWindowFloor)
+        ? mergeAndTrim(allNeighbors, incomingNeighbors, r => `${r.node_id}|${r.neighbor_id}`, r => r.rx_time,
+            trimFloorForTick('neighbors', longWindowFloor, incomingNeighbors.length > 0, nowSeconds))
         : incomingNeighbors;
       allTraces = useSince
-        ? trimToWindow(mergeById(allTraces, incomingTraces, 'id'), longWindowFloor)
+        ? mergeAndTrim(allTraces, incomingTraces, r => r.id, r => r.rx_time,
+            trimFloorForTick('traces', longWindowFloor, incomingTraces.length > 0, nowSeconds))
         : incomingTraces;
       // Waypoints merge on the composite (id, protocol) — the server's upsert
       // key (SPEC W5) — so a re-broadcast replaces its row and same-id
       // waypoints from different protocols stay distinct.
       allWaypoints = useSince
-        ? trimToWindow(mergeByCompositeKey(allWaypoints, incomingWaypoints, ['id', 'protocol']), recentWindowFloor)
+        ? mergeAndTrim(allWaypoints, incomingWaypoints, r => `${r.protocol ?? ''}|${r.id}`, r => r.rx_time,
+            trimFloorForTick('waypoints', recentWindowFloor, incomingWaypoints.length > 0, nowSeconds))
         : incomingWaypoints;
       // Mark cache keys dirty from this tick's actual delta rows (issue:
       // frontend perf regression, Phase 7) — writeBackCache later writes only
@@ -5975,9 +6171,16 @@ export function initializeApp(config) {
       // node/position/telemetry-shaped arrived (stages.derive false) — nodesById
       // and the enriched allNodes are already correct from the previous tick, so
       // re-aggregating would just rebuild the same values (issue: frontend perf
-      // regression, Phase 2).
+      // regression, Phase 2). When it does run, `useSince` narrows it further
+      // (Phase 8) to just the nodes this tick's delta actually touched —
+      // collectNodeIds is the same id set the VF3 flash path below already
+      // computes from these same three delta arrays. A full (cold-load/
+      // resync) refresh passes no touchedNodeIds, so every node re-aggregates,
+      // matching pre-Phase-8 behaviour exactly.
       if (stages.derive) {
-        rebuildNodeDerivedState();
+        rebuildNodeDerivedState({
+          touchedNodeIds: useSince ? collectNodeIds(incomingNodes, incomingPositions, incomingTelemetry) : null,
+        });
       }
       // Hydrate only the incoming (delta) rows, not the whole retained
       // seven-day window — that was O(window size) on every tick even for a
@@ -6423,6 +6626,8 @@ export function initializeApp(config) {
       getLoadedMessageCount: () => allMessages.length,
       /** Number of node rows currently loaded into the table (test use only). */
       getLoadedNodeCount: () => allNodes.length,
+      /** Look up a node by canonical id (test use only, Phase 8 identity-reuse checks). */
+      getNodeById: id => nodesById.get(id),
       /** Waypoints currently loaded (SPEC W8 plumbing; test use only). */
       getLoadedWaypoints: () => allWaypoints,
       /** Waypoint keys faded by the most recent SSE-ping refresh (test hook). */

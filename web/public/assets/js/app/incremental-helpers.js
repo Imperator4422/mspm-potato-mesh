@@ -159,3 +159,71 @@ export function trimToWindow(records, floorSeconds, tsField = 'rx_time') {
     return !Number.isFinite(ts) || ts >= floorSeconds;
   });
 }
+
+/**
+ * Merge incremental rows into an existing window-bounded collection and drop
+ * anything below ``floor``, in a single pass — the combined, single-traversal
+ * form of {@link mergeById} followed by {@link trimToWindow} (issue: frontend
+ * perf regression, Phase 8). The two-call form merges (one pass over
+ * ``existing`` + ``incoming`` to build the deduped map) and then trims (a
+ * second, full pass re-scanning the *merged* result), even on a tick where
+ * ``incoming`` is empty and the merge was already a no-op — the trim pass
+ * still ran unconditionally. This folds eviction into the merge traversal
+ * instead, and skips all of it when there is nothing to do.
+ *
+ * @param {Array<Object>} existing Previous full dataset.
+ * @param {Array<Object>} incoming New incremental rows (a non-empty check
+ *   only — this does not require ``existing`` and ``incoming`` to already be
+ *   deduplicated against each other).
+ * @param {(record: Object) => *} keyOf Resolves a record's dedup key (return
+ *   ``null``/``undefined`` to drop a record with no usable key).
+ * @param {(record: Object) => *} tsOf Resolves a record's timestamp for the
+ *   ``floor`` comparison.
+ * @param {number} floor Minimum retained timestamp (unix seconds); a
+ *   non-finite or non-positive value disables trimming entirely (matching
+ *   {@link trimToWindow}'s convention).
+ * @returns {Array<Object>} Merged, trimmed array — the same ``existing``
+ *   reference when ``incoming`` is empty and nothing in ``existing`` falls
+ *   below ``floor`` (so a caller can cheaply tell whether anything changed).
+ */
+export function mergeAndTrim(existing, incoming, keyOf, tsOf, floor) {
+  const hasFloor = Number.isFinite(floor) && floor > 0;
+  const belowFloor = record => {
+    const ts = Number(tsOf(record));
+    return Number.isFinite(ts) && ts < floor;
+  };
+  const hasIncoming = Array.isArray(incoming) && incoming.length > 0;
+
+  if (!hasIncoming) {
+    if (!hasFloor || !Array.isArray(existing)) return existing;
+    // Single read-only scan: only allocate a new (filtered) array when
+    // something would actually be evicted.
+    let needsTrim = false;
+    for (const record of existing) {
+      if (belowFloor(record)) {
+        needsTrim = true;
+        break;
+      }
+    }
+    if (!needsTrim) return existing;
+    return existing.filter(record => !belowFloor(record));
+  }
+
+  // Merging real data anyway, so folding the floor check into the same
+  // traversal costs nothing extra — one pass over `existing`, one over
+  // `incoming`, exactly like mergeById, with no separate trim pass after.
+  const map = new Map();
+  if (Array.isArray(existing)) {
+    for (const record of existing) {
+      if (hasFloor && belowFloor(record)) continue;
+      const key = keyOf(record);
+      if (key != null) map.set(key, record);
+    }
+  }
+  for (const record of incoming) {
+    if (hasFloor && belowFloor(record)) continue;
+    const key = keyOf(record);
+    if (key != null) map.set(key, record);
+  }
+  return Array.from(map.values());
+}
