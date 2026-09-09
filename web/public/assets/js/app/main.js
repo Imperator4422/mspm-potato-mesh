@@ -3680,6 +3680,17 @@ export function initializeApp(config) {
    * }} params Render inputs.
    * @returns {void}
    */
+  /**
+   * Resolve a chat-model channel's stable tab/namespace id.
+   *
+   * @param {{ id?: string, index: number }} channel Channel model entry.
+   * @returns {string} Tab id, falling back to a positional id when the
+   *   channel carries none.
+   */
+  function channelTabId(channel) {
+    return channel.id || `channel-${channel.index}`;
+  }
+
   function renderChatLog({
     nodes = [],
     messages = [],
@@ -3739,7 +3750,26 @@ export function initializeApp(config) {
       filterQuery
     );
 
-    const logContent = buildChatFragment({
+    // Populate the message→tab map from the model directly, before any tab
+    // content is built (SPEC VF3 tab-header flash). This used to be a side
+    // effect of buildChatFragment, which ran for every channel on every
+    // render; lazy inactive panels (below) build only the active tab's
+    // content, so a hidden channel's tab header must still be able to flash
+    // even though its content is never materialised this tick.
+    for (const channel of filteredChannels) {
+      const tabId = channelTabId(channel);
+      for (const entry of channel.entries) {
+        const messageId = entryMessageId(entry);
+        if (messageId) messageTabId.set(messageId, tabId);
+      }
+    }
+
+    // Content is a factory, not a built fragment: renderChatTabs (chat-tabs.js)
+    // calls it only for the tab that resolves active, deferring every other
+    // tab until the reader actually switches to it (Phase 3b, issue: frontend
+    // perf regression) — a chat with many channels no longer builds every
+    // channel's DOM subtree on every render.
+    const logContent = () => buildChatFragment({
       namespace: 'log',
       entries: filteredLogEntries,
       renderParts: buildChatLogEntryParts,
@@ -3748,7 +3778,7 @@ export function initializeApp(config) {
     });
 
     const channelTabs = filteredChannels.map(channel => {
-      const tabId = channel.id || `channel-${channel.index}`;
+      const tabId = channelTabId(channel);
       return {
         id: tabId,
         label: `${channel.label} (${channel.messageCount})`,
@@ -3760,7 +3790,7 @@ export function initializeApp(config) {
         // Channel tabs are the chat proper: render the entire window (issue #796)
         // rather than only the newest CHAT_LIMIT.  The entry set is already bounded
         // by the seven-day window, so there is no count cap to apply here.
-        content: buildChatFragment({
+        content: () => buildChatFragment({
           namespace: tabId,
           entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
           renderParts: entry => buildMessageChatEntryParts(entry.item),
@@ -3856,13 +3886,14 @@ export function initializeApp(config) {
         continue;
       }
       const node = chatEntryCache.materialize(namespace, keyOf(entry), parts.className, parts.html);
-      // Tag message rows so a live update can flash them (SPEC VF3); for channel
-      // tabs (namespace is the tab id, not 'log') record the message→tab id so
-      // the channel's tab header can flash too.
+      // Tag message rows so a live update can flash them (SPEC VF3). The
+      // message→tab map itself is populated at the model level in
+      // renderChatLog (Phase 3a), not here — a channel tab whose content is
+      // deferred (Phase 3b) never reaches this loop, but its tab header must
+      // still be able to flash.
       const messageId = entryMessageId(entry);
       if (messageId) {
         node.dataset.messageId = messageId;
-        if (namespace !== 'log') messageTabId.set(messageId, namespace);
         // Stamp the sender's role colour so the live-update fade lands on it
         // (LV3). Falls back to the CSS default when the sender node is unknown.
         const flashMessage = entry.item || entry.message;

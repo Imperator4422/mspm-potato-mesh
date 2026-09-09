@@ -520,3 +520,91 @@ test('renderChatTabs renders a channel dropdown selector that jumps to a tab (LV
   tabSelect.dispatch('change');
   assert.equal(container.dataset.activeTab, 'c1');
 });
+
+test('renderChatTabs calls a factory tab content only for the tab that resolves active', () => {
+  const document = createMockDocument();
+  const container = new MockElement('div');
+  const calls = [];
+  const makeFactory = id => () => {
+    calls.push(id);
+    return new MockElement('div');
+  };
+  const tabs = [
+    { id: 'log', label: 'Log', content: makeFactory('log') },
+    { id: 'c0', label: 'Default', content: makeFactory('c0') },
+    { id: 'c1', label: 'Alt', content: makeFactory('c1') }
+  ];
+
+  renderChatTabs({ document, container, tabs, defaultActiveTabId: 'c0' });
+
+  assert.deepEqual(calls, ['c0'], 'only the active tab\'s factory runs at build time');
+});
+
+test('renderChatTabs materializes a lazy tab\'s content on first activation, and never again', () => {
+  const document = createMockDocument();
+  const container = new MockElement('div');
+  const calls = [];
+  const tabs = [
+    { id: 'log', label: 'Log', content: () => { calls.push('log'); return new MockElement('div'); } },
+    { id: 'c0', label: 'Default', content: () => { calls.push('c0'); return new MockElement('div'); } }
+  ];
+
+  renderChatTabs({ document, container, tabs, defaultActiveTabId: 'c0' });
+  assert.deepEqual(calls, ['c0']);
+
+  const tabListWrapper = container.children[0];
+  const tabList = tabListWrapper.children[1];
+  const panelWrapper = container.children[1];
+
+  // Switching to the inactive 'log' tab builds it exactly once, now.
+  tabList.children[0].dispatch('click');
+  assert.deepEqual(calls, ['c0', 'log']);
+  assert.equal(panelWrapper.children[0].children.length, 1, 'log panel now holds its built content');
+
+  // Switching back to c0, then to log again, must not rebuild either.
+  tabList.children[1].dispatch('click');
+  tabList.children[0].dispatch('click');
+  assert.deepEqual(calls, ['c0', 'log'], 're-activating a tab never re-runs its factory');
+});
+
+test('renderChatTabs appends a plain Node tab immediately regardless of which tab is active (backward compatible)', () => {
+  const document = createMockDocument();
+  const container = new MockElement('div');
+  const eagerContent = new MockElement('div');
+  const tabs = [
+    { id: 'log', label: 'Log', content: eagerContent },
+    { id: 'c0', label: 'Default', content: new MockElement('div') }
+  ];
+
+  renderChatTabs({ document, container, tabs, defaultActiveTabId: 'c0' });
+
+  const panelWrapper = container.children[1];
+  // The inactive 'log' panel already holds its (eagerly-appended) content,
+  // even though 'c0' is active — a plain Node has nothing to defer.
+  assert.equal(panelWrapper.children[0].children[0], eagerContent);
+});
+
+test('materializeTabContent is a no-op on an entry with no contentFactory, and idempotent once built', () => {
+  const { materializeTabContent } = __test__;
+  const panel = new MockElement('div');
+  const plainEntry = { panel, built: true, contentFactory: null };
+  assert.doesNotThrow(() => materializeTabContent(plainEntry));
+  assert.equal(panel.children.length, 0);
+
+  let calls = 0;
+  const lazyEntry = { panel, built: false, contentFactory: () => { calls += 1; return new MockElement('div'); } };
+  materializeTabContent(lazyEntry);
+  assert.equal(calls, 1);
+  assert.equal(lazyEntry.built, true);
+  materializeTabContent(lazyEntry);
+  assert.equal(calls, 1, 'already-built entries are left alone');
+});
+
+test('renderChatTabs treats an all-invalid-id tab list like an empty one', () => {
+  const document = createMockDocument();
+  const container = new MockElement('div');
+  const tabs = [{ id: '', label: 'No id', content: new MockElement('div') }];
+  const active = renderChatTabs({ document, container, tabs });
+  assert.equal(active, null);
+  assert.equal(container.dataset.activeTab, '');
+});
