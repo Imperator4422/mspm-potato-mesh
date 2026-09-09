@@ -116,6 +116,8 @@ import {
 import { normalizeNodeCollection } from './node-snapshot-normalizer.js';
 import { maxRecordTimestamp, minRecordTimestamp, mergeById, mergeByCompositeKey, trimToLimit, trimToWindow } from './incremental-helpers.js';
 import { buildTraceSegments } from './trace-paths.js';
+import { buildNeighborSegments } from './main/neighbor-segments.js';
+import { createNeighborLineCache } from './main/neighbor-line-cache.js';
 import {
   getRoleColor,
   getRoleFlashColor,
@@ -1229,6 +1231,22 @@ export function initializeApp(config) {
   const COLOCATED_HUB_MIN_ZOOM = 13;
   let neighborLinesLayer = null;
   let traceLinesLayer = null;
+  /**
+   * The one canvas renderer shared by every trace polyline (Phase 5). Created
+   * lazily on the first trace render and reused after that: Leaflet's
+   * `map.getRenderer` adds any renderer passed via a path's `renderer` option
+   * to the map as a layer and never removes it, so a fresh `L.canvas()` per
+   * render would leak one full-size canvas overlay per trace repaint.
+   * @type {?Object}
+   */
+  let traceLineRenderer = null;
+  /**
+   * Diffing cache for neighbor-line polylines (issue: frontend perf
+   * regression, Phase 5): persists across renders so `renderMap` can recreate
+   * only the directions whose segment actually changed instead of clearing
+   * and rebuilding the whole layer every time.
+   */
+  const neighborLineCache = createNeighborLineCache();
   let neighborLinesVisible = true;
   let traceLinesVisible = true;
   let neighborLinesToggleButton = null;
@@ -5063,9 +5081,10 @@ export function initializeApp(config) {
       return;
     }
     renderMapCount += 1;
-    if (stages.neighborLines && neighborLinesLayer) {
-      neighborLinesLayer.clearLayers();
-    }
+    // Neighbor lines are diffed (below, via neighborLineCache.sync), not
+    // cleared: a full clearLayers()+recreate on every map render was full
+    // SVG churn even when every segment was pixel-identical to the previous
+    // render (issue: frontend perf regression, Phase 5).
     if (stages.traceLines && traceLinesLayer) {
       traceLinesLayer.clearLayers();
     }
@@ -5106,84 +5125,22 @@ export function initializeApp(config) {
         })
       : [];
 
-    if (stages.neighborLines && neighborLinesLayer && Array.isArray(allNeighbors) && allNeighbors.length) {
-      const neighborSegments = [];
-      const seenDirections = new Set();
-      for (const entry of allNeighbors) {
-        if (!entry || typeof entry !== 'object') continue;
-        const sourceId = typeof entry.node_id === 'string' ? entry.node_id : null;
-        const targetId = typeof entry.neighbor_id === 'string' ? entry.neighbor_id : null;
-        if (!sourceId || !targetId) continue;
-        const directionKey = `${sourceId}→${targetId}`;
-        if (seenDirections.has(directionKey)) continue;
-        seenDirections.add(directionKey);
-
-        const sourceNode = nodesById.get(sourceId);
-        const targetNode = nodesById.get(targetId);
-        if (!sourceNode || !targetNode) continue;
-
-        const srcLatRaw = sourceNode.latitude;
-        const srcLonRaw = sourceNode.longitude;
-        const tgtLatRaw = targetNode.latitude;
-        const tgtLonRaw = targetNode.longitude;
-        if (
-          srcLatRaw == null || srcLatRaw === '' || srcLonRaw == null || srcLonRaw === '' ||
-          tgtLatRaw == null || tgtLatRaw === '' || tgtLonRaw == null || tgtLonRaw === ''
-        ) {
-          continue;
-        }
-        const srcLat = Number(srcLatRaw);
-        const srcLon = Number(srcLonRaw);
-        const tgtLat = Number(tgtLatRaw);
-        const tgtLon = Number(tgtLonRaw);
-        if (!Number.isFinite(srcLat) || !Number.isFinite(srcLon) || !Number.isFinite(tgtLat) || !Number.isFinite(tgtLon)) {
-          continue;
-        }
-        if (LIMIT_DISTANCE && sourceNode.distance_km != null && sourceNode.distance_km > MAX_DISTANCE_KM) continue;
-        if (LIMIT_DISTANCE && targetNode.distance_km != null && targetNode.distance_km > MAX_DISTANCE_KM) continue;
-
-        const priority = getRoleRenderPriority(sourceNode.role, sourceNode.protocol);
-        const rxTimeRaw = entry.rx_time;
-        let rxTime = 0;
-        if (typeof rxTimeRaw === 'number' && Number.isFinite(rxTimeRaw)) {
-          rxTime = rxTimeRaw;
-        } else if (typeof rxTimeRaw === 'string') {
-          const parsed = Number(rxTimeRaw);
-          rxTime = Number.isFinite(parsed) ? parsed : 0;
-        }
-
-        const snrValue = toFiniteNumber(entry.snr);
-        const sourceDisplayName = getNodeDisplayNameForOverlay(sourceNode);
-        const targetDisplayName = getNodeDisplayNameForOverlay(targetNode);
-        const sourceShortName = normalizeNodeNameValue(sourceNode.short_name ?? sourceNode.shortName);
-        const targetShortName = normalizeNodeNameValue(targetNode.short_name ?? targetNode.shortName);
-
-        neighborSegments.push({
-          latlngs: [[srcLat, srcLon], [tgtLat, tgtLon]],
-          color: getRoleColor(sourceNode.role, sourceNode.protocol),
-          priority,
-          rxTime,
-          sourceId,
-          targetId,
-          snr: snrValue,
-          sourceDisplayName,
-          targetDisplayName,
-          sourceShortName,
-          sourceRole: sourceNode.role,
-          targetShortName,
-          targetRole: targetNode.role
-        });
-      }
-
-      neighborSegments
-        .sort((a, b) => {
-          if (a.priority !== b.priority) return a.priority - b.priority;
-          if (a.rxTime !== b.rxTime) return b.rxTime - a.rxTime;
-          if (a.sourceId !== b.sourceId) return a.sourceId < b.sourceId ? -1 : 1;
-          if (a.targetId !== b.targetId) return a.targetId < b.targetId ? -1 : 1;
-          return 0;
-        })
-        .forEach(segment => {
+    if (stages.neighborLines && neighborLinesLayer) {
+      const neighborSegments = buildNeighborSegments(allNeighbors, nodesById, {
+        limitDistance: LIMIT_DISTANCE,
+        maxDistanceKm: MAX_DISTANCE_KM,
+        colorForNode: node => getRoleColor(node.role, node.protocol),
+        priorityForNode: node => getRoleRenderPriority(node.role, node.protocol),
+        displayNameForNode: node => getNodeDisplayNameForOverlay(node),
+        shortNameForNode: node => normalizeNodeNameValue(node.short_name ?? node.shortName),
+      });
+      // Diffed against the previous render (Phase 5): only a direction whose
+      // segment signature actually changed is torn down and recreated: an
+      // unchanged segment keeps its existing polyline (and bound click
+      // handler) untouched, instead of every segment being rebuilt on every
+      // render that touches the map.
+      neighborLineCache.sync(neighborSegments, {
+        create: segment => {
           const polyline = L.polyline(segment.latlngs, {
             color: segment.color,
             weight: 2,
@@ -5191,19 +5148,19 @@ export function initializeApp(config) {
             className: 'neighbor-connection-line'
           }).addTo(neighborLinesLayer);
           if (polyline && typeof polyline.bindTooltip === 'function') {
-            const tooltipHtml = buildNeighborTooltipHtml({
+            // Tooltip content is a function (Phase 5): Leaflet calls it lazily
+            // on hover/open, so the HTML string is never built for a segment
+            // that is never actually viewed.
+            polyline.bindTooltip(() => buildNeighborTooltipHtml({
               ...segment,
               sourceNode: nodesById.get(segment.sourceId),
               targetNode: nodesById.get(segment.targetId)
+            }), {
+              direction: 'center',
+              opacity: 0.92,
+              sticky: true,
+              className: 'trace-tooltip'
             });
-            if (tooltipHtml) {
-              polyline.bindTooltip(tooltipHtml, {
-                direction: 'center',
-                opacity: 0.92,
-                sticky: true,
-                className: 'trace-tooltip'
-              });
-            }
           }
           if (polyline && typeof polyline.on === 'function') {
             polyline.on('click', event => {
@@ -5237,10 +5194,28 @@ export function initializeApp(config) {
               openNeighborOverlay(anchorEl, segment);
             });
           }
-        });
+          return polyline;
+        },
+        remove: polyline => {
+          neighborLinesLayer.removeLayer(polyline);
+        },
+      });
     }
 
     if (traceLinesLayer && traceSegments.length) {
+      // Canvas renderer for trace lines only (Phase 5): traces can be dozens
+      // of long, many-point paths, and canvas draws them without one SVG
+      // element per segment. Feature-detected — the Leaflet test stub has no
+      // L.canvas, and a trace click never anchors on getElement() (unlike
+      // neighbor lines), so canvas's lack of a per-shape DOM element costs
+      // nothing here. Markers and neighbor lines stay SVG (overlays anchor on
+      // their element — main/marker-overlay-preservation.js). One renderer
+      // for the lifetime of the map (see `traceLineRenderer`), never one per
+      // render.
+      if (traceLineRenderer === null && typeof L.canvas === 'function') {
+        traceLineRenderer = L.canvas();
+      }
+      const traceRenderer = traceLineRenderer || undefined;
       traceSegments
         .sort((a, b) => {
           const rxA = Number.isFinite(a.rxTime) ? a.rxTime : -Infinity;
@@ -5254,7 +5229,8 @@ export function initializeApp(config) {
             weight: 2,
             opacity: 0.42,
             dashArray: '6 6',
-            className: 'neighbor-connection-line trace-connection-line'
+            className: 'neighbor-connection-line trace-connection-line',
+            renderer: traceRenderer
           }).addTo(traceLinesLayer);
           if (polyline && typeof polyline.bindTooltip === 'function') {
             const tooltipHtml = buildTraceTooltipHtml(segment.pathNodes);
