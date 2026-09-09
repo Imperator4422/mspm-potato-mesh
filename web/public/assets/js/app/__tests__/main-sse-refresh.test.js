@@ -112,6 +112,55 @@ test('no EventSource support falls back to the legacy poll cadence', async () =>
   });
 });
 
+test('a ping arriving mid-fetch does not start a second refresh before the first settles, then runs once more with the union', async () => {
+  await runLiveApp({}, async ({ testUtils, FakeEventSource, calls }) => {
+    const es = FakeEventSource.instances[0];
+    const wrappedFetch = globalThis.fetch;
+    let releaseMessages;
+    const gate = new Promise((resolve) => {
+      releaseMessages = resolve;
+    });
+    // Gate only the /api/messages response so the first (messages-only) run
+    // stays in flight while a second, different-collection ping arrives.
+    globalThis.fetch = (url, ...rest) => {
+      if (url.startsWith('/api/messages')) {
+        return gate.then(() => wrappedFetch(url, ...rest));
+      }
+      return wrappedFetch(url, ...rest);
+    };
+    try {
+      const before = calls.length;
+      es.dispatch('change', { data: JSON.stringify({ collection: 'messages' }) });
+      const flushPromise = testUtils.flushLiveRefresh();
+      // The mid-flight ping: the scheduler must record it, not fetch it yet.
+      es.dispatch('change', { data: JSON.stringify({ collection: 'positions' }) });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.ok(
+        !calls.slice(before).some((c) => c.url.startsWith('/api/positions?')),
+        'positions must not be fetched while the messages run is still in flight',
+      );
+      releaseMessages();
+      await flushPromise;
+      const after = calls.slice(before);
+      // The messages collection issues two requests per run (plain + encrypted,
+      // see fetchMessages call sites in refresh()); both belong to the first
+      // (messages-ping) run, none to the follow-up.
+      assert.equal(
+        after.filter((c) => c.url.startsWith('/api/messages?')).length,
+        2,
+        'messages fetched by the first run only (plain + encrypted)',
+      );
+      assert.equal(
+        after.filter((c) => c.url.startsWith('/api/positions?')).length,
+        1,
+        'positions fetched exactly once, by the follow-up run launched on settle',
+      );
+    } finally {
+      globalThis.fetch = wrappedFetch;
+    }
+  });
+});
+
 test('EVENTS disabled by config opens no stream and uses the legacy poll', async () => {
   await runLiveApp(
     { configOverrides: { liveUpdatesEnabled: false } },

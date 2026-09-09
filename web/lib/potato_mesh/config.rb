@@ -29,6 +29,10 @@ module PotatoMesh
     # active (PS5): the only timer-driven fetch path while pushes flow, a
     # fallback that converges the UI if events are missed.
     DEFAULT_LIVE_SAFETY_POLL_SECONDS = 300
+    # Client-side debounce window (ms) that coalesces a burst of same-window
+    # SSE change pings into a single delta fetch (PS4). Milliseconds, not
+    # seconds, because the window is sub-second by design.
+    DEFAULT_LIVE_DEBOUNCE_MS = 1_000
     # Interval at which the SSE route emits a heartbeat comment so dead
     # connections are detected and intermediaries do not buffer the stream.
     DEFAULT_SSE_HEARTBEAT_SECONDS = 15
@@ -357,6 +361,13 @@ module PotatoMesh
     # @return [Integer] positive interval, overridable via +LIVE_SAFETY_POLL_SECONDS+.
     def live_safety_poll_seconds
       fetch_positive_integer("LIVE_SAFETY_POLL_SECONDS", DEFAULT_LIVE_SAFETY_POLL_SECONDS)
+    end
+
+    # Client-side SSE ping debounce window (ms).
+    #
+    # @return [Integer] positive interval, overridable via +LIVE_DEBOUNCE_MS+.
+    def live_debounce_ms
+      fetch_positive_integer("LIVE_DEBOUNCE_MS", DEFAULT_LIVE_DEBOUNCE_MS)
     end
 
     # Heartbeat cadence (seconds) for the SSE stream.
