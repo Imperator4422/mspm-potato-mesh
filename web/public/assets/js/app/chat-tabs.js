@@ -73,6 +73,31 @@ function applyActivePanelScroll(panel, previous) {
 }
 
 /**
+ * Build a tab entry's content on first need, then never again.
+ *
+ * A tab's ``content`` is either an already-built ``Node`` (appended
+ * immediately, same as before lazy panels existed — a caller that has not
+ * adopted factories keeps the old eager behaviour) or a factory function
+ * (``() => Node``), deferred until the tab is actually activated. A chat with
+ * many channels used to build every channel's DOM subtree on every render
+ * even though the reader can only look at one at a time; a factory tab
+ * defers that cost to the tab the reader actually switches to (Phase 3b,
+ * issue: frontend perf regression).
+ *
+ * @param {{ panel: HTMLElement, built: boolean, contentFactory: ?Function }} entry
+ *   Tab entry to materialise; mutated in place (``built`` flips to ``true``).
+ * @returns {void}
+ */
+function materializeTabContent(entry) {
+  if (!entry || entry.built) return;
+  entry.built = true;
+  if (typeof entry.contentFactory === 'function') {
+    const node = entry.contentFactory();
+    if (node) entry.panel.appendChild(node);
+  }
+}
+
+/**
  * Render an accessible tab interface within ``container``.
  *
  * When a tab carries an ``iconSrc`` URL the icon is rendered as an
@@ -89,10 +114,13 @@ function applyActivePanelScroll(panel, previous) {
  * @param {{
  *   document: Document,
  *   container: HTMLElement,
- *   tabs: Array<{ id: string, label: string, iconSrc?: string|null, content: Node|null }>,
+ *   tabs: Array<{ id: string, label: string, iconSrc?: string|null, content: Node|(() => Node)|null }>,
  *   previousActiveTabId?: string|null,
  *   defaultActiveTabId?: string|null
- * }} options Rendering parameters.
+ * }} options Rendering parameters. A tab's ``content`` may be a plain
+ *   already-built ``Node`` (appended immediately) or a factory function
+ *   (``() => Node``); a factory is called only for the tab that resolves as
+ *   active, and for any other tab only on first activation (Phase 3b).
  * @returns {?string} Identifier of the active tab after rendering.
  */
 export function renderChatTabs({
@@ -183,9 +211,44 @@ export function renderChatTabs({
   // refresh restores it rather than snapping the reader to the bottom (bugfix B).
   const previousActivePanelScroll = capturePreviousActivePanelScroll(container);
   const activeCandidateOrder = [existingActive, previousActiveTabId, defaultActiveTabId];
-  let activeTabId = null;
 
+  // Resolve the active tab id from the deduped id set *before* building any
+  // panel content, so exactly one tab's content is materialised eagerly
+  // below and every other tab's factory (if it has one) is deferred until
+  // first activation (Phase 3b). This dedup pass mirrors the one the build
+  // loop performs below — kept separate (rather than reusing tabElements,
+  // which does not exist yet at this point) precisely so this resolution can
+  // happen first.
+  const dedupedIds = [];
   const idSet = new Set();
+  for (const tab of validTabs) {
+    if (!tab || typeof tab.id !== 'string' || tab.id.length === 0 || idSet.has(tab.id)) {
+      continue;
+    }
+    idSet.add(tab.id);
+    dedupedIds.push(tab.id);
+  }
+  if (dedupedIds.length === 0) {
+    if (typeof container.replaceChildren === 'function') {
+      container.replaceChildren();
+    } else {
+      container.innerHTML = '';
+    }
+    container.dataset.activeTab = '';
+    return null;
+  }
+  let activeTabId = null;
+  for (const candidate of activeCandidateOrder) {
+    if (candidate && idSet.has(candidate)) {
+      activeTabId = candidate;
+      break;
+    }
+  }
+  if (!activeTabId) {
+    activeTabId = dedupedIds[0];
+  }
+
+  idSet.clear();
   for (const tab of validTabs) {
     if (!tab || typeof tab.id !== 'string' || tab.id.length === 0) {
       continue;
@@ -228,8 +291,23 @@ export function renderChatTabs({
     panel.setAttribute('aria-labelledby', button.getAttribute('id'));
     panel.hidden = true;
 
-    if (tab.content) {
-      panel.appendChild(tab.content);
+    // A function is a lazy factory (Phase 3b): appended now only for the tab
+    // that resolves as active, deferred for every other tab until it is
+    // actually activated. A plain Node (or no content) keeps the pre-Phase-3b
+    // behaviour of being appended immediately regardless of which tab is
+    // active, so a caller that has not adopted factories is unaffected.
+    const isLazy = typeof tab.content === 'function';
+    const entry = {
+      id: uniqueId,
+      button,
+      panel,
+      built: !isLazy,
+      contentFactory: isLazy ? tab.content : null
+    };
+    if (!isLazy) {
+      if (tab.content) panel.appendChild(tab.content);
+    } else if (uniqueId === activeTabId) {
+      materializeTabContent(entry);
     }
 
     tabList.appendChild(button);
@@ -238,27 +316,7 @@ export function renderChatTabs({
     option.value = uniqueId;
     option.textContent = tab.label || uniqueId;
     tabSelect.appendChild(option);
-    tabElements.push({ id: uniqueId, button, panel });
-  }
-
-  if (tabElements.length === 0) {
-    if (typeof container.replaceChildren === 'function') {
-      container.replaceChildren();
-    } else {
-      container.innerHTML = '';
-    }
-    container.dataset.activeTab = '';
-    return null;
-  }
-
-  for (const candidate of activeCandidateOrder) {
-    if (candidate && tabElements.some(entry => entry.id === candidate)) {
-      activeTabId = candidate;
-      break;
-    }
-  }
-  if (!activeTabId) {
-    activeTabId = tabElements[0].id;
+    tabElements.push(entry);
   }
 
   if (typeof container.replaceChildren === 'function') {
@@ -312,6 +370,10 @@ export function renderChatTabs({
       entry.button.setAttribute('aria-selected', isActive ? 'true' : 'false');
       entry.button.setAttribute('tabindex', isActive ? '0' : '-1');
       if (isActive) {
+        // A no-op for a tab already materialised (eagerly, at build time, or
+        // by an earlier activation); builds a lazy tab's content the first
+        // time it is actually switched to (Phase 3b).
+        materializeTabContent(entry);
         entry.button.classList.add('is-active');
         entry.panel.hidden = false;
         matched = true;
@@ -404,5 +466,6 @@ export const __test__ = {
   createFragment,
   SCROLL_PIN_TOLERANCE_PX,
   capturePreviousActivePanelScroll,
-  applyActivePanelScroll
+  applyActivePanelScroll,
+  materializeTabContent
 };
