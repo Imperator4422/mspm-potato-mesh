@@ -83,7 +83,7 @@ import {
   fmtVoltage,
 } from './short-info-telemetry.js';
 import { renderSatsInViewBadge } from './short-info-satellites.js';
-import { createMessageNodeHydrator } from './message-node-hydrator.js';
+import { createMessageNodeHydrator, relinkMessageNodes } from './message-node-hydrator.js';
 import {
   extractChatMessageMetadata,
   formatChatMessagePrefix,
@@ -102,6 +102,7 @@ import { createIndexedDbBackend } from './main/data-cache-idb.js';
 import { isExpired as isCacheEntryExpired, isStale as isCacheEntryStale } from './main/cache-lifetime.js';
 import { cacheKeyFor } from './main/cache-keys.js';
 import { createLiveRefreshScheduler } from './main/live-refresh-scheduler.js';
+import { stagesForChanges, hasNodeDisplayChange, ALL_RENDER_STAGES } from './main/render-stages.js';
 import { formatPositionHighlights, formatTelemetryHighlights } from './chat-log-highlights.js';
 import { filterChatModel, normaliseChatFilterQuery } from './chat-search.js';
 import { buildMessageIndex } from './message-replies.js';
@@ -459,6 +460,8 @@ export function initializeApp(config) {
   let renderTableCount = 0;
   let renderMapCount = 0;
   let renderChatCount = 0;
+  /** Count of times {@link applyFilter} passed its stats gate and fetched `/api/stats`. */
+  let renderStatsCount = 0;
   /**
    * True once the user clicked "show all" to lift the node-table render cap
    * ({@link NODE_TABLE_RENDER_CAP}); persists for the session so subsequent
@@ -727,6 +730,18 @@ export function initializeApp(config) {
   let refreshTimer = null;
   let autorefreshPaused = false;
   let activeStatsRequestId = 0;
+  /** Wall-clock ms of the last `/api/stats`-driven render; throttles `applyFilter`'s
+   * stats stage (Phase 2 issue: frontend perf regression) independently of the
+   * fetch's own 30s response cache — a nodes-only ping still lands on every SSE
+   * debounce tick, and re-running updateTitleCount/updateLegendProtocolCounts/etc.
+   * every tick is wasted DOM work even when the fetch itself is a cache hit. */
+  let lastStatsRenderMs = 0;
+  const STATS_RENDER_THROTTLE_MS = 10_000;
+  /** Wall-clock ms of the last activity-series fetch; independent throttle from
+   * the stats one above, since the mesh-activity card's 24h sparkline is much
+   * slower-moving than the stats/title counts (its own response cache is 5 min). */
+  let lastActivitySeriesFetchMs = 0;
+  const ACTIVITY_SERIES_THROTTLE_MS = 60_000;
   // --- Live-update (SSE) state ---
   /** @type {?ReturnType<typeof createEventStream>} */
   let liveStream = null;
@@ -4644,17 +4659,31 @@ export function initializeApp(config) {
    *
    * @param {Array<Object>} nodes Node payloads.
    * @param {number} nowSec Reference timestamp.
+   * @param {{ markers: boolean, neighborLines: boolean, traceLines: boolean, waypoints: boolean }} [stages]
+   *   Which map sections need to run this tick (see `main/render-stages.js`).
+   *   Defaults to every section (full render), matching pre-Phase-2 behaviour
+   *   for any caller that does not yet pass stages. The marker section itself
+   *   is not independently gated — a full rebuild runs whenever this function
+   *   doesn't early-return (diffing it is Phase 5); `neighborLines`,
+   *   `traceLines`, and `waypoints` each gate their own section.
    * @returns {void}
    */
-  function renderMap(nodes, nowSec) {
-    renderMapCount += 1;
+  function renderMap(nodes, nowSec, stages = ALL_RENDER_STAGES) {
     if (!map || !markersLayer || !hasLeaflet) {
       return;
     }
-    if (neighborLinesLayer) {
+    // A messages-only (or any non-map) delta touches none of these — skip the
+    // whole render, including the marker rebuild, instead of re-clearing and
+    // redrawing an unchanged map on every chat ping (issue: frontend perf
+    // regression).
+    if (!stages.markers && !stages.neighborLines && !stages.traceLines && !stages.waypoints) {
+      return;
+    }
+    renderMapCount += 1;
+    if (stages.neighborLines && neighborLinesLayer) {
       neighborLinesLayer.clearLayers();
     }
-    if (traceLinesLayer) {
+    if (stages.traceLines && traceLinesLayer) {
       traceLinesLayer.clearLayers();
     }
     if (spiderLinesLayer) {
@@ -4686,7 +4715,7 @@ export function initializeApp(config) {
       if (typeof nodeId !== 'string' || nodeId.length === 0) continue;
       nodesById.set(nodeId, node);
     }
-    const traceSegments = traceLinesLayer
+    const traceSegments = stages.traceLines && traceLinesLayer
       ? buildTraceSegments(allTraces, nodes, {
           limitDistance: LIMIT_DISTANCE,
           maxDistanceKm: MAX_DISTANCE_KM,
@@ -4694,7 +4723,7 @@ export function initializeApp(config) {
         })
       : [];
 
-    if (neighborLinesLayer && Array.isArray(allNeighbors) && allNeighbors.length) {
+    if (stages.neighborLines && neighborLinesLayer && Array.isArray(allNeighbors) && allNeighbors.length) {
       const neighborSegments = [];
       const seenDirections = new Set();
       for (const entry of allNeighbors) {
@@ -5058,7 +5087,7 @@ export function initializeApp(config) {
     // protocol filter (a hidden protocol drops its waypoints along with its
     // nodes — the toggle lives in that protocol's legend column, 1e-A) and the
     // expiry ladder inside the layer module. The count feeds the legend toggle.
-    if (waypointsLayer) {
+    if (stages.waypoints && waypointsLayer) {
       const filteredWaypoints = hiddenProtocols.size > 0
         ? allWaypoints.filter(waypoint => !hiddenProtocols.has(normalizeFilterProtocol(waypoint && waypoint.protocol)))
         : allWaypoints;
@@ -5237,41 +5266,73 @@ export function initializeApp(config) {
    *
    * @param {string} [filterQuery] Raw filter text for substring highlighting;
    *   defaults to the current filter input value.
+   * @param {Object} [stages] Which render stages need to run this tick (see
+   *   `main/render-stages.js`); defaults to every stage (full render).
    * @returns {void}
    */
-  function renderFilteredOutputs(filterQuery = filterInput ? filterInput.value : '') {
+  function renderFilteredOutputs(filterQuery = filterInput ? filterInput.value : '', stages = ALL_RENDER_STAGES) {
     // Instrumentation for the backfill de-jank guard (see
     // {@link renderFilteredOutputsCount}); a plain increment, no behaviour change.
     renderFilteredOutputsCount += 1;
     // Text and role filters apply only to the node table and map; the chat log
     // always receives the full node collection so reply-thread lookups succeed
     // even for nodes that are currently hidden by the active filter.
-    const sortedNodes = getFilteredSortedNodes();
+    // Sorting the node list is itself real work on a busy instance — skip it
+    // entirely on a tick that touches none of the node-list consumers (e.g. a
+    // messages-only SSE ping), rather than computing it and then discarding it
+    // (issue: frontend perf regression, Phase 2).
+    const needsNodeList = stages.table || stages.markers || stages.neighborLines
+      || stages.traceLines || stages.waypoints;
+    const sortedNodes = needsNodeList ? getFilteredSortedNodes() : [];
     const nowSec = Date.now() / 1000;
-    renderTable(sortedNodes, nowSec);
-    renderMap(sortedNodes, nowSec);
+    if (stages.table) renderTable(sortedNodes, nowSec);
+    renderMap(sortedNodes, nowSec, stages);
     updateSortIndicators();
     // Pass the raw filterQuery (not the normalised form) so the chat log can
-    // highlight matching substrings in their original case.
-    rerenderChatLog(filterQuery);
+    // highlight matching substrings in their original case. A tick that
+    // touches neither the per-channel chat model nor the mixed Log tab (e.g. a
+    // nodes-only ping with no display-field change) skips the chat rebuild
+    // entirely.
+    if (stages.chatChannels || stages.log) {
+      rerenderChatLog(filterQuery);
+    }
   }
 
   /**
    * Apply text and role filters to the node list and re-render outputs.
    *
+   * @param {Object} [stages] Which render stages need to run this tick (see
+   *   `main/render-stages.js`); defaults to every stage (full render). User-
+   *   driven callers (the filter input, the clear button, a legend toggle)
+   *   always pass the default — only a live-driven refresh narrows this.
    * @returns {void}
    */
-  function applyFilter() {
+  function applyFilter(stages = ALL_RENDER_STAGES) {
     updateFilterClearVisibility();
     const filterQuery = filterInput ? filterInput.value : '';
-    renderFilteredOutputs(filterQuery);
+    renderFilteredOutputs(filterQuery, stages);
     // Show an immediate local estimate for the title so it doesn't flicker
     // to (0) while waiting for the async /api/stats response.
     const nowSec = Date.now() / 1000;
     const localStats = computeLocalActiveNodeStats(allNodes, nowSec);
     updateTitleCount(adjustStatsForHiddenProtocols(localStats));
     // Title, legend, footer, and visibility are then corrected by /api/stats
-    // which provides the authoritative, uncapped counts.
+    // which provides the authoritative, uncapped counts — but only when this
+    // tick's stage routing calls for it, and rate-limited beyond that: the
+    // fetch itself has a 30s response cache (stats.js), yet the DOM update
+    // chain below still ran on every single tick before this gate existed
+    // (issue: frontend perf regression, Phase 2). The throttle applies only
+    // to live-driven ticks (a narrowed `stages` object): a user-driven call
+    // (filter input, legend/protocol toggle — always the full default) must
+    // re-run the legend/footer/visibility chain immediately, since those
+    // read the hidden-protocol set the user just changed.
+    const nowMs = Date.now();
+    const liveDriven = stages !== ALL_RENDER_STAGES;
+    if (!stages.stats || (liveDriven && nowMs - lastStatsRenderMs < STATS_RENDER_THROTTLE_MS)) {
+      return;
+    }
+    lastStatsRenderMs = nowMs;
+    renderStatsCount += 1;
     const statsRequestId = ++activeStatsRequestId;
     void fetchActiveNodeStats({ nodes: allNodes, nowSeconds: nowSec }).then(stats => {
       if (statsRequestId !== activeStatsRequestId) return;
@@ -5286,12 +5347,17 @@ export function initializeApp(config) {
       // applyFilter, so this refreshes the card on both data and toggle changes.
       if (meshActivityCard) {
         meshActivityCard.render({ packets: stats && stats.packets, hiddenProtocols });
-        // The 24h sparkline series is fetched separately (cached ~5 min, F2-4);
-        // setSeries repaints the card when it resolves, and null on failure just
-        // omits the sparkline.
-        void fetchActivitySeries({}).then(series => {
-          if (meshActivityCard) meshActivityCard.setSeries(series);
-        });
+        // The 24h sparkline series is fetched separately (cached ~5 min, F2-4)
+        // and throttled independently here (its own cadence, slower-moving
+        // than the stats/title counts above); setSeries repaints the card
+        // when it resolves, and null on failure just omits the sparkline.
+        const seriesNowMs = Date.now();
+        if (seriesNowMs - lastActivitySeriesFetchMs >= ACTIVITY_SERIES_THROTTLE_MS) {
+          lastActivitySeriesFetchMs = seriesNowMs;
+          void fetchActivitySeries({}).then(series => {
+            if (meshActivityCard) meshActivityCard.setSeries(series);
+          });
+        }
       }
     });
   }
@@ -5464,6 +5530,29 @@ export function initializeApp(config) {
         };
       }
 
+      // Route this tick to only the render stages the collections that
+      // actually returned rows touch (issue: frontend perf regression, Phase
+      // 2). A collection counts as changed only when it was fetched
+      // (want(name)) and returned at least one row — an empty delta (the
+      // common SSE-ping case once the debounce coalesces a burst down to one
+      // fetch set) must render nothing. nodeDisplayChanged must be computed
+      // now, against the *pre-merge* nodesById (this tick's rebuildNodeDerivedState,
+      // if it runs at all, happens further down) — it is what lets a
+      // renamed/re-roled sender relabel their already-rendered chat entries
+      // even when no new message rows arrived this tick.
+      const changed = new Set();
+      if (want('nodes') && incomingNodes.length > 0) changed.add('nodes');
+      if (want('positions') && incomingPositions.length > 0) changed.add('positions');
+      if (want('telemetry') && incomingTelemetry.length > 0) changed.add('telemetry');
+      if (want('neighbors') && incomingNeighbors.length > 0) changed.add('neighbors');
+      if (want('traces') && incomingTraces.length > 0) changed.add('traces');
+      if (want('waypoints') && incomingWaypoints.length > 0) changed.add('waypoints');
+      if (want('messages') && (incomingMessages.length > 0 || incomingEncryptedMessages.length > 0)) {
+        changed.add('messages');
+      }
+      const nodeDisplayChanged = useSince ? hasNodeDisplayChange(incomingNodes, nodesById) : false;
+      const stages = useSince ? stagesForChanges(changed, { nodeDisplayChanged }) : ALL_RENDER_STAGES;
+
       // Merge incremental results into the module-level collections.  On first
       // load the existing arrays are empty so the merge is effectively a no-op.
       // The per-packet collections (positions/telemetry/neighbors/traces) are
@@ -5494,33 +5583,32 @@ export function initializeApp(config) {
       allWaypoints = useSince
         ? trimToWindow(mergeByCompositeKey(allWaypoints, incomingWaypoints, ['id', 'protocol']), recentWindowFloor)
         : incomingWaypoints;
-      // Encrypted blobs only feed the mixed Log tab (itself capped), so a count
-      // cap is the right memory bound for them.
-      const encryptedMessages = useSince
-        ? trimToLimit(mergeById(allEncryptedMessages, incomingEncryptedMessages, 'id'), MESSAGE_LIMIT)
-        : incomingEncryptedMessages;
-      // Plaintext chat is shown for the full seven-day window (issue #796), so
-      // bound the retained set by that window rather than a row count — a count
-      // cap would silently drop older-but-in-window messages on the next merge.
-      const messages = useSince
-        ? trimToWindow(mergeById(allMessages, incomingMessages, 'id'), messageWindowFloor)
-        : incomingMessages;
-
       // Aggregate per-source snapshots into locals and enrich the node collection
       // from the merged sources.  Shared with the background backfill so a streamed
       // page re-derives identically (issue #832).  The per-packet accumulators
       // (allPositionEntries/allTelemetryEntries/allNeighbors) are left RAW so the
       // Log keeps a stable entry per packet — re-storing the aggregated form would
-      // erode history on the next tick (bugfix A1).
-      rebuildNodeDerivedState();
-      // Hydrate messages with node metadata in parallel; the node index has just
-      // been rebuilt (inside rebuildNodeDerivedState) so lookups find the freshly
-      // merged records.
-      const [chatMessages, encryptedChatMessages] = await Promise.all([
-        messageNodeHydrator.hydrate(messages, nodesById),
-        messageNodeHydrator.hydrate(encryptedMessages, nodesById)
+      // erode history on the next tick (bugfix A1). Skipped entirely when nothing
+      // node/position/telemetry-shaped arrived (stages.derive false) — nodesById
+      // and the enriched allNodes are already correct from the previous tick, so
+      // re-aggregating would just rebuild the same values (issue: frontend perf
+      // regression, Phase 2).
+      if (stages.derive) {
+        rebuildNodeDerivedState();
+      }
+      // Hydrate only the incoming (delta) rows, not the whole retained
+      // seven-day window — that was O(window size) on every tick even for a
+      // single new message (Phase 2). Already-hydrated messages keep their
+      // `.node` reference across the mergeById below; relinkMessageNodes
+      // (further down) re-points them when derive ran, since
+      // rebuildNodeDerivedState hands back new node object identities even
+      // when nothing about the node actually changed.
+      const [hydratedIncomingMessages, hydratedIncomingEncrypted] = await Promise.all([
+        messageNodeHydrator.hydrate(incomingMessages, nodesById),
+        messageNodeHydrator.hydrate(incomingEncryptedMessages, nodesById)
       ]);
-      const hydratedChat = Array.isArray(chatMessages) ? chatMessages : [];
+      const hydratedChat = Array.isArray(hydratedIncomingMessages) ? hydratedIncomingMessages : [];
+      const hydratedEncryptedChat = Array.isArray(hydratedIncomingEncrypted) ? hydratedIncomingEncrypted : [];
       // Re-merge into the *current* allMessages rather than replacing it: the
       // background history backfill (issue #802) may have appended older pages
       // while we awaited hydration, and a blind assignment would clobber them.
@@ -5530,9 +5618,23 @@ export function initializeApp(config) {
       allMessages = useSince
         ? trimToWindow(mergeById(allMessages, hydratedChat, 'id'), messageWindowFloor)
         : hydratedChat;
-      allEncryptedMessages = Array.isArray(encryptedChatMessages) ? encryptedChatMessages : [];
+      // Encrypted blobs only feed the mixed Log tab (itself capped), so a count
+      // cap is the right memory bound for them.
+      allEncryptedMessages = useSince
+        ? trimToLimit(mergeById(allEncryptedMessages, hydratedEncryptedChat, 'id'), MESSAGE_LIMIT)
+        : hydratedEncryptedChat;
+      // A derive tick hands back fresh node object identities for every node
+      // (rebuildNodeDerivedState always re-aggregates from scratch), so any
+      // message hydrated on an earlier tick now points at an object no longer
+      // in nodesById. Relink the full retained arrays (not just this tick's
+      // delta, which is already fresh) so a later display change is never
+      // silently missed by an already-rendered entry.
+      if (stages.derive) {
+        relinkMessageNodes(allMessages, nodesById);
+        relinkMessageNodes(allEncryptedMessages, nodesById);
+      }
       initialFetchDone = true;
-      applyFilter();
+      applyFilter(stages);
       // SPEC VF2/VF3/VF4: only an SSE-ping refresh flashes (refreshOptions.flash),
       // and only after the table + map have rendered (applyFilter above), so the
       // highlight lands on the final, placed element. useSince excludes the
@@ -5948,19 +6050,23 @@ export function initializeApp(config) {
        * Snapshot of per-stage render counters (test use only) — asserts a given
        * SSE delta only re-ran the render stages its changed collections touch.
        *
-       * @returns {{ table: number, map: number, chat: number }} Counter snapshot.
+       * @returns {{ table: number, map: number, chat: number, stats: number }} Counter snapshot.
        */
       getStageRenderCounts: () => ({
         table: renderTableCount,
         map: renderMapCount,
         chat: renderChatCount,
+        stats: renderStatsCount,
       }),
       /** Reset all per-stage render counters to zero (test use only). */
       resetStageRenderCounts: () => {
         renderTableCount = 0;
         renderMapCount = 0;
         renderChatCount = 0;
+        renderStatsCount = 0;
       },
+      /** Run a user-driven (un-narrowed) filter pass, as the filter input does (test use only). */
+      applyFilter: () => applyFilter(),
       /**
        * Resolve the lazily-imported, memoized node-detail overlay manager (test
        * use only) — the same loader the ``.node-long-link`` click path uses.

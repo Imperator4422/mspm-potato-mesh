@@ -17,7 +17,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createMessageNodeHydrator, MESSAGE_HYDRATION_CONCURRENCY } from '../message-node-hydrator.js';
+import { createMessageNodeHydrator, MESSAGE_HYDRATION_CONCURRENCY, relinkMessageNodes } from '../message-node-hydrator.js';
 
 /**
  * Build a fetch double that records the maximum number of simultaneously
@@ -437,4 +437,36 @@ test('hydrate dedupes duplicate senders without exceeding the cap', async () => 
 
   assert.equal(probe.totalCalls(), senders.length);
   assert.ok(probe.maxInFlight() <= 2);
+});
+
+test('relinkMessageNodes re-points .node to the current nodesById entry', () => {
+  const staleNode = { node_id: '!a', short_name: 'Old' };
+  const freshNode = { node_id: '!a', short_name: 'New' };
+  const message = { node_id: '!a', node: staleNode };
+  relinkMessageNodes([message], new Map([['!a', freshNode]]));
+  assert.equal(message.node, freshNode);
+});
+
+test('relinkMessageNodes leaves a message untouched when its sender is not in nodesById', () => {
+  const staleNode = { node_id: '!a', short_name: 'Old' };
+  const message = { node_id: '!a', node: staleNode };
+  relinkMessageNodes([message], new Map());
+  assert.equal(message.node, staleNode);
+});
+
+test('relinkMessageNodes skips non-object entries and messages without node_id', () => {
+  const withoutId = { node: { node_id: '!x' } };
+  const messages = [null, 'not-an-object', withoutId];
+  const nodesById = new Map([['!a', { node_id: '!a' }]]);
+  assert.doesNotThrow(() => relinkMessageNodes(messages, nodesById));
+  assert.equal(withoutId.node.node_id, '!x', 'a message with no node_id is left as-is');
+});
+
+test('relinkMessageNodes is a no-op for non-Array messages or a non-Map nodesById', () => {
+  assert.doesNotThrow(() => relinkMessageNodes(null, new Map()));
+  assert.doesNotThrow(() => relinkMessageNodes(undefined, new Map()));
+  const message = { node_id: '!a', node: { node_id: '!a' } };
+  const original = message.node;
+  relinkMessageNodes([message], null);
+  assert.equal(message.node, original, 'a non-Map nodesById leaves messages untouched');
 });
