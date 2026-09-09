@@ -179,6 +179,7 @@ import {
   BOOT_CACHE_FLAG,
 } from './main/constants.js';
 import { capNodesForRender, buildShowAllRow, SHOW_ALL_BUTTON_CLASS } from './main/nodes-table-cap.js';
+import { capChatEntries, buildShowOlderRow, CHAT_CHANNEL_RENDER_CAP, SHOW_OLDER_BUTTON_CLASS } from './main/chat-render-cap.js';
 import {
   fetchNeighbors,
   fetchNodes,
@@ -470,6 +471,24 @@ export function initializeApp(config) {
   let nodeTableExpanded = false;
   /** Number of node rows the last {@link renderTable} actually rendered (test hook). */
   let lastRenderedNodeCount = 0;
+  /**
+   * Channel-tab ids for which the user clicked "show older" to lift the
+   * per-channel render cap ({@link CHAT_CHANNEL_RENDER_CAP}); persists for the
+   * session, mirroring {@link nodeTableExpanded} but keyed per tab since each
+   * channel has its own independent window.
+   * @type {Set<string>}
+   */
+  const expandedChatTabs = new Set();
+  /**
+   * Each channel tab's content factory from the most recent
+   * {@link renderChatLog} call, keyed by tab id. Retained so the "show older"
+   * click handler ({@link expandChatTab}) can rebuild just that one tab in
+   * place — re-running the whole chat render would rebuild every tab's DOM
+   * and reset every reader's scroll position, defeating both the lazy-panel
+   * (Phase 3b) and scroll-preservation invariants.
+   * @type {Map<string, () => DocumentFragment>}
+   */
+  let lastChannelContentFactories = new Map();
 
   // Persistent read-side cache (SPEC FC1–FC7). The IndexedDB backend is null
   // when storage is unavailable, and PRIVATE mode disables + wipes the cache —
@@ -2253,6 +2272,14 @@ export function initializeApp(config) {
       expandNodeTable();
       return;
     }
+    // "Show N older messages" control lifts one channel tab's render cap
+    // (frontend perf, Phase 3c).
+    const showOlderButton = event.target.closest(`.${SHOW_OLDER_BUTTON_CLASS}`);
+    if (showOlderButton) {
+      event.preventDefault();
+      expandChatTab(showOlderButton.dataset.tabId);
+      return;
+    }
     const longNameLink = event.target.closest('.node-long-link');
     if (
       longNameLink &&
@@ -3777,31 +3804,46 @@ export function initializeApp(config) {
       emptyLabel: 'No recent mesh activity.'
     });
 
+    // Replaced (not mutated) each render: a stale entry for a channel that
+    // dropped out of the window would otherwise linger and let a late click
+    // on an since-removed tab resurrect it.
+    const nextChannelContentFactories = new Map();
     const channelTabs = filteredChannels.map(channel => {
       const tabId = channelTabId(channel);
+      // Channel tabs are the chat proper: render the entire window (issue #796,
+      // amended — load the whole window, render on demand) rather than only the
+      // newest CHAT_LIMIT. CHAT_CHANNEL_RENDER_CAP bounds the *initial* paint;
+      // "show older" (expandChatTab) lifts it per tab, mirroring the node
+      // table's "show all" (issue: frontend perf regression, Phase 3c).
+      const contentFactory = () => buildChatFragment({
+        namespace: tabId,
+        entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
+        renderParts: entry => buildMessageChatEntryParts(entry.item),
+        keyOf: entry => chatMessageEntryKey(entry.item),
+        emptyLabel: 'No messages on this channel.',
+        limit: Infinity,
+        cap: CHAT_CHANNEL_RENDER_CAP,
+        expanded: expandedChatTabs.has(tabId),
+        tabId
+      });
+      nextChannelContentFactories.set(tabId, contentFactory);
       return {
         id: tabId,
+        // The tab label always shows the full window's count, regardless of
+        // the render cap — only what's painted is capped, not what the reader
+        // is told is there.
         label: `${channel.label} (${channel.messageCount})`,
         iconSrc: isMeshtasticProtocol(channel.protocol)
           ? MESHTASTIC_ICON_SRC
           : isMeshcoreProtocol(channel.protocol)
             ? MESHCORE_ICON_SRC
             : null,
-        // Channel tabs are the chat proper: render the entire window (issue #796)
-        // rather than only the newest CHAT_LIMIT.  The entry set is already bounded
-        // by the seven-day window, so there is no count cap to apply here.
-        content: () => buildChatFragment({
-          namespace: tabId,
-          entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
-          renderParts: entry => buildMessageChatEntryParts(entry.item),
-          keyOf: entry => chatMessageEntryKey(entry.item),
-          emptyLabel: 'No messages on this channel.',
-          limit: Infinity
-        }),
+        content: contentFactory,
         index: channel.index,
         isPrimaryFallback: Boolean(channel.isPrimaryFallback)
       };
     });
+    lastChannelContentFactories = nextChannelContentFactories;
 
     const tabs = [
       { id: 'log', label: 'Log', content: logContent },
@@ -3860,19 +3902,46 @@ export function initializeApp(config) {
    *   renderParts: Function,
    *   keyOf: Function,
    *   emptyLabel?: string,
-   *   limit?: number
+   *   limit?: number,
+   *   cap?: ?number,
+   *   expanded?: boolean,
+   *   tabId?: ?string
    * }} params Fragment construction parameters.  ``namespace`` scopes the entry
    *   cache to a single tab; ``limit`` caps how many of the newest entries are
    *   rendered (pass ``Infinity`` to render them all — the Log firehose defaults
-   *   to {@link CHAT_LIMIT}, chat channel tabs opt out).
+   *   to {@link CHAT_LIMIT}, chat channel tabs opt out). ``cap`` is the separate,
+   *   user-liftable per-channel render cap ({@link CHAT_CHANNEL_RENDER_CAP}):
+   *   when finite and not ``expanded``, only the newest ``cap`` entries render
+   *   and a "show older" control (stamped with ``tabId``) is prepended above
+   *   them; the Log tab passes no ``cap`` and is unaffected.
    * @returns {DocumentFragment} Populated fragment.
    */
-  function buildChatFragment({ namespace, entries = [], renderParts, keyOf, emptyLabel, limit = CHAT_LIMIT }) {
+  function buildChatFragment({
+    namespace,
+    entries = [],
+    renderParts,
+    keyOf,
+    emptyLabel,
+    limit = CHAT_LIMIT,
+    cap = null,
+    expanded = false,
+    tabId = null
+  }) {
     const fragment = document.createDocumentFragment();
+    // The per-channel render cap (Phase 3c) is independent of — and applied
+    // before — ``limit``: channel tabs pass ``limit: Infinity`` (issue #796,
+    // amended: load the whole window, render on demand) but still want a
+    // bounded initial paint, with "show older" as the on-demand escape hatch.
+    const { rendered: capEntries, hiddenCount } = Number.isFinite(cap)
+      ? capChatEntries(entries, cap, expanded)
+      : { rendered: entries, hiddenCount: 0 };
+    if (hiddenCount > 0) {
+      fragment.appendChild(buildShowOlderRow(document, hiddenCount, tabId));
+    }
     const getDivider = createDateDividerFactory();
     const limitedEntries = Number.isFinite(limit)
-      ? entries.slice(Math.max(entries.length - limit, 0))
-      : entries;
+      ? capEntries.slice(Math.max(capEntries.length - limit, 0))
+      : capEntries;
     let renderedEntries = 0;
     for (const entry of limitedEntries) {
       if (!entry || typeof entry.ts !== 'number') {
@@ -3917,6 +3986,43 @@ export function initializeApp(config) {
       fragment.appendChild(empty);
     }
     return fragment;
+  }
+
+  /**
+   * Lift a single channel tab's render cap and rebuild just that tab's panel
+   * in place. Wired to the "show older" control appended by
+   * {@link buildChatFragment}. Rebuilds only the one panel — not the whole
+   * chat subtree ({@link rerenderChatLog}/`renderChatTabs`) — so every other
+   * tab's lazy (Phase 3b) or already-built state, and every other reader's
+   * scroll position, is left untouched. The reader's own scroll position is
+   * explicitly kept anchored to their current read position: the newly
+   * revealed older entries are prepended above it, so the panel grows upward
+   * and the scroll offset must grow by exactly that amount to hold the
+   * visible content still.
+   *
+   * @param {?string} tabId Channel tab id to expand.
+   * @returns {void}
+   */
+  function expandChatTab(tabId) {
+    if (!tabId || expandedChatTabs.has(tabId)) return;
+    const factory = lastChannelContentFactories.get(tabId);
+    if (typeof factory !== 'function') return;
+    const panel = document.getElementById(`chat-panel-${tabId}`);
+    if (!panel) return;
+    expandedChatTabs.add(tabId);
+    const hasScrollMetrics = typeof panel.scrollHeight === 'number' && typeof panel.scrollTop === 'number';
+    const previousScrollTop = hasScrollMetrics ? panel.scrollTop : 0;
+    const previousScrollHeight = hasScrollMetrics ? panel.scrollHeight : 0;
+    const newContent = factory();
+    if (typeof panel.replaceChildren === 'function') {
+      panel.replaceChildren(newContent);
+    } else {
+      panel.innerHTML = '';
+      panel.appendChild(newContent);
+    }
+    if (hasScrollMetrics) {
+      panel.scrollTop = previousScrollTop + (panel.scrollHeight - previousScrollHeight);
+    }
   }
 
   /**
@@ -6067,6 +6173,10 @@ export function initializeApp(config) {
       getRenderedNodeCount: () => lastRenderedNodeCount,
       /** Whether the node-table render cap has been lifted (test use only). */
       isNodeTableExpanded: () => nodeTableExpanded,
+      /** Whether a channel tab's render cap has been lifted (test use only). */
+      isChatTabExpanded: tabId => expandedChatTabs.has(tabId),
+      /** Directly invoke the "show older" expansion for a channel tab (test use only). */
+      expandChatTab: tabId => expandChatTab(tabId),
       /**
        * Cumulative count of full {@link renderFilteredOutputs} repaints (test
        * use only) — the backfill de-jank guard resets this after first paint and
