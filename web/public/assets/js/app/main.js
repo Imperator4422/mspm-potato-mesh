@@ -101,6 +101,7 @@ import { createDataCache, CACHE_SCHEMA_VERSION } from './main/data-cache.js';
 import { createIndexedDbBackend } from './main/data-cache-idb.js';
 import { isExpired as isCacheEntryExpired, isStale as isCacheEntryStale } from './main/cache-lifetime.js';
 import { cacheKeyFor } from './main/cache-keys.js';
+import { createLiveRefreshScheduler } from './main/live-refresh-scheduler.js';
 import { formatPositionHighlights, formatTelemetryHighlights } from './chat-log-highlights.js';
 import { filterChatModel, normaliseChatFilterQuery } from './chat-search.js';
 import { buildMessageIndex } from './message-replies.js';
@@ -449,6 +450,16 @@ export function initializeApp(config) {
    */
   let renderFilteredOutputsCount = 0;
   /**
+   * Per-stage render counters (issue: frontend perf regression). Incremented at
+   * the top of {@link renderTable}, {@link renderMap}, and {@link renderChatLog}
+   * respectively so tests can assert a given SSE delta only re-ran the stages its
+   * changed collections actually touch, without depending on DOM introspection.
+   * Exposed via ``_testUtils.getStageRenderCounts`` / ``resetStageRenderCounts``.
+   */
+  let renderTableCount = 0;
+  let renderMapCount = 0;
+  let renderChatCount = 0;
+  /**
    * True once the user clicked "show all" to lift the node-table render cap
    * ({@link NODE_TABLE_RENDER_CAP}); persists for the session so subsequent
    * refreshes keep showing every row.
@@ -696,7 +707,9 @@ export function initializeApp(config) {
     : REFRESH_MS;
   // Coalesce a burst of SSE pings into one delta fetch (client-side throttle,
   // complementing the server-side coalescing, SPEC PS4).
-  const LIVE_DEBOUNCE_MS = 250;
+  const LIVE_DEBOUNCE_MS = Number.isFinite(config.liveDebounceMs) && config.liveDebounceMs > 0
+    ? config.liveDebounceMs
+    : 1000;
   const CHAT_ENABLED = Boolean(config.chatEnabled);
   const instanceSelectorEnabled = Boolean(config.instancesFeatureEnabled);
 
@@ -721,12 +734,6 @@ export function initializeApp(config) {
   let liveActive = false;
   /** The auto-refresh timer cadence last armed (ms); exposed for tests. */
   let autoRefreshIntervalMs = 0;
-  /** Collections flagged dirty by SSE pings, fetched on the next debounced refresh. */
-  const dirtyCollections = new Set();
-  /** @type {ReturnType<typeof setTimeout>|null} */
-  let liveRefreshTimer = null;
-  /** Promise of the most recent live-driven refresh (test hook). */
-  let liveRefreshPromise = Promise.resolve();
   /** Count of flash rounds triggered by SSE pings (VF2 gating; test hook). */
   let liveFlashCount = 0;
   /** Node ids flashed by the most recent SSE-ping refresh (test hook). */
@@ -892,22 +899,22 @@ export function initializeApp(config) {
   }
 
   /**
-   * Fetch only the collections flagged dirty by SSE pings, then clear the
-   * pending set. Targeted delta fetch (SPEC PS3): a `messages` ping fetches only
-   * `/api/messages`, not the whole dataset.
-   *
-   * @returns {Promise<void>} resolves once the targeted refresh completes.
+   * Coalescing scheduler for live-driven refreshes (issue: frontend perf
+   * regression). Collapses a burst of same-window SSE pings into one delta
+   * fetch (SPEC PS4), and guards every live-driven call site — SSE pings, the
+   * resync handler, the safety/legacy poll timer, and the unpause control —
+   * behind a single in-flight run so they can never race a second `refresh()`
+   * against the same mutable state (CR-A1). `run` forwards straight to
+   * {@link refresh}, whose own `flash`/`collections` handling is untouched;
+   * the scheduler only decides *when* to call it and with which pending
+   * request. `refresh` is a hoisted function declaration, so it is safe to
+   * reference here even though its own definition appears later in this
+   * closure.
    */
-  function runLiveRefresh() {
-    liveRefreshTimer = null;
-    const collections = new Set(dirtyCollections);
-    dirtyCollections.clear();
-    // flash: true marks this as the SSE-ping path, the only refresh that
-    // flashes changed rows (SPEC VF2). Resync / safety poll / initial load
-    // call refresh() without it, so they never flash.
-    liveRefreshPromise = refresh({ collections, flash: true });
-    return liveRefreshPromise;
-  }
+  const liveRefreshScheduler = createLiveRefreshScheduler({
+    run: (opts) => refresh(opts),
+    debounceMs: LIVE_DEBOUNCE_MS,
+  });
 
   /**
    * Flash each changed node's table row(s) and map marker white (SPEC VF3).
@@ -980,32 +987,26 @@ export function initializeApp(config) {
   }
 
   /**
-   * Flag a collection dirty in response to an SSE change ping and arm the
-   * debounce timer so a burst of pings collapses into one delta fetch.
+   * Flag a collection dirty in response to an SSE change ping. The scheduler
+   * debounces a burst of pings into one delta fetch and defers to any run
+   * already in flight (SPEC PS4).
    *
    * @param {string} collection Changed collection name.
    * @returns {void}
    */
   function scheduleLiveRefresh(collection) {
-    dirtyCollections.add(collection);
-    if (!liveRefreshTimer) {
-      liveRefreshTimer = setTimeout(runLiveRefresh, LIVE_DEBOUNCE_MS);
-    }
+    liveRefreshScheduler.mark(collection);
   }
 
   /**
    * Run a full delta refresh on every SSE (re)connect so any change missed
-   * while the stream was down is recovered (SPEC PS5).
+   * while the stream was down is recovered (SPEC PS5). Never flashes (the
+   * scheduler reserves flashing for the SSE-ping path).
    *
    * @returns {void}
    */
   function handleLiveResync() {
-    if (liveRefreshTimer) {
-      clearTimeout(liveRefreshTimer);
-      liveRefreshTimer = null;
-    }
-    dirtyCollections.clear();
-    liveRefreshPromise = refresh();
+    liveRefreshScheduler.requestFull();
   }
 
   /**
@@ -1036,11 +1037,7 @@ export function initializeApp(config) {
   function stopLiveUpdates() {
     if (liveStream) liveStream.stop();
     liveActive = false;
-    if (liveRefreshTimer) {
-      clearTimeout(liveRefreshTimer);
-      liveRefreshTimer = null;
-    }
-    dirtyCollections.clear();
+    liveRefreshScheduler.cancel();
   }
 
   /**
@@ -1074,7 +1071,10 @@ export function initializeApp(config) {
     // negative value means auto-refresh is intentionally disabled.
     if (intervalMs > 0) {
       autoRefreshIntervalMs = intervalMs;
-      refreshTimer = setInterval(refresh, intervalMs);
+      // Routed through the scheduler (not called directly) so this timer can
+      // never overlap an SSE-driven refresh still in flight, whether it is
+      // ticking as the SSE safety poll or as the legacy no-SSE poll.
+      refreshTimer = setInterval(() => liveRefreshScheduler.requestFull(), intervalMs);
     }
   }
 
@@ -3677,6 +3677,7 @@ export function initializeApp(config) {
     filterQuery = ''
   }) {
     if (!CHAT_ENABLED || !chatEl) return;
+    renderChatCount += 1;
     // Reset the message→tab map for this render; buildChatFragment repopulates it
     // as it materialises each channel tab's entries (SPEC VF3 tab flash).
     messageTabId = new Map();
@@ -4310,6 +4311,7 @@ export function initializeApp(config) {
    * @returns {void}
    */
   function renderTable(nodes, nowSec) {
+    renderTableCount += 1;
     const tb = document.querySelector('#nodes tbody');
     if (!tb) {
       overlayStack.cleanupOrphans();
@@ -4645,6 +4647,7 @@ export function initializeApp(config) {
    * @returns {void}
    */
   function renderMap(nodes, nowSec) {
+    renderMapCount += 1;
     if (!map || !markersLayer || !hasLeaflet) {
       return;
     }
@@ -5617,7 +5620,7 @@ export function initializeApp(config) {
         );
       } else {
         applyAutorefreshControlState(autorefreshToggle, autorefreshControlState(false, null));
-        refresh();
+        liveRefreshScheduler.requestFull();
         restartAutoRefresh();
       }
     });
@@ -5845,17 +5848,21 @@ export function initializeApp(config) {
       /** Message ids flashed by the most recent SSE-ping refresh (test hook). */
       getLastFlashedMessageIds: () => lastFlashedMessageIds,
       /**
-       * Flush any pending debounced live refresh and await the latest
-       * live-driven refresh (test hook).
+       * Flush any pending debounced live refresh and await every run it
+       * triggers, including follow-up runs launched by requests that arrived
+       * while the flushed run was still in flight (test hook).
        *
        * @returns {Promise<void>}
        */
       flushLiveRefresh: async () => {
-        if (liveRefreshTimer) {
-          clearTimeout(liveRefreshTimer);
-          runLiveRefresh();
+        liveRefreshScheduler.flush();
+        await liveRefreshScheduler.inFlight();
+        // A request that arrived while the flushed run was in flight launches
+        // a follow-up on settle (no extra debounce wait); drain those too so
+        // callers observe the fully-settled state, not just the first run.
+        while (liveRefreshScheduler.pending()) {
+          await liveRefreshScheduler.inFlight();
         }
-        await liveRefreshPromise;
       },
       /** Stop the auto-refresh timer, live stream, and relative-time ticker (test teardown). */
       stopAutoRefresh: () => {
@@ -5936,6 +5943,23 @@ export function initializeApp(config) {
       /** Reset the repaint counter (test use only). */
       resetRenderCount: () => {
         renderFilteredOutputsCount = 0;
+      },
+      /**
+       * Snapshot of per-stage render counters (test use only) — asserts a given
+       * SSE delta only re-ran the render stages its changed collections touch.
+       *
+       * @returns {{ table: number, map: number, chat: number }} Counter snapshot.
+       */
+      getStageRenderCounts: () => ({
+        table: renderTableCount,
+        map: renderMapCount,
+        chat: renderChatCount,
+      }),
+      /** Reset all per-stage render counters to zero (test use only). */
+      resetStageRenderCounts: () => {
+        renderTableCount = 0;
+        renderMapCount = 0;
+        renderChatCount = 0;
       },
       /**
        * Resolve the lazily-imported, memoized node-detail overlay manager (test
