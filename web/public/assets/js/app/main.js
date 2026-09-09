@@ -4158,13 +4158,19 @@ export function initializeApp(config) {
   }
 
   /**
-   * Hydrate one page of older messages and merge it into the live chat state,
-   * then re-render the chat log.  The read-modify-write of ``allMessages`` is
-   * synchronous (no ``await`` between the merge and the assignment) so a
-   * concurrent incremental {@link refresh} cannot clobber the history this adds.
+   * Hydrate one page of older messages and merge it into the live chat state.
+   * The read-modify-write of ``allMessages`` is synchronous (no ``await``
+   * between the merge and the assignment) so a concurrent incremental
+   * {@link refresh} cannot clobber the history this adds.
+   *
+   * Repainting is deferred, not immediate: a 7-day chat backfill can stream
+   * dozens of pages, and rebuilding the whole chat log after each one janks
+   * the cold load (issue: frontend perf regression, Phase 6) — the same
+   * coalescing {@link scheduleBackfillRepaint}/{@link flushBackfillRepaint}
+   * already use for the bulk-collection backfill (issue #832).
    *
    * @param {Array<Object>} batch Raw older message rows from the backfill pager.
-   * @returns {Promise<void>} Resolves once the page is merged and rendered.
+   * @returns {Promise<void>} Resolves once the page is merged (not yet painted).
    */
   async function commitHistoricalMessages(batch) {
     if (!Array.isArray(batch) || batch.length === 0) return;
@@ -4173,7 +4179,8 @@ export function initializeApp(config) {
     if (rows.length === 0) return;
     const floor = Math.floor(Date.now() / 1000) - CHAT_RECENT_WINDOW_SECONDS;
     allMessages = trimToWindow(mergeById(allMessages, rows, 'id'), floor);
-    rerenderChatLog();
+    backfillChatDirty = true;
+    scheduleBackfillRepaint();
   }
 
   /**
@@ -4212,6 +4219,10 @@ export function initializeApp(config) {
       console.warn('chat history backfill failed; showing the most recent page only', err);
     } finally {
       chatBackfillRunning = false;
+      // The whole window is now merged; paint the final coalesced state at
+      // once instead of waiting on the trailing idle callback (mirrors
+      // backfillAllCollections's matching call).
+      flushBackfillRepaint();
     }
   }
 
@@ -4369,6 +4380,22 @@ export function initializeApp(config) {
   const pendingBackfillRefines = new Set();
   /** True when merged-but-not-yet-repainted backfill rows are waiting. */
   let backfillRepaintDirty = false;
+  /**
+   * Collection names touched by not-yet-repainted backfill pages since the
+   * last flush (Phase 2/6: routes the coalesced repaint to only the render
+   * stages those collections touch, instead of a full `renderFilteredOutputs`
+   * on every flush).
+   * @type {Set<string>}
+   */
+  const pendingBackfillCollections = new Set();
+  /**
+   * True when a chat-history page (issue #802) merged but not yet
+   * re-rendered is waiting. Repainted via {@link rerenderChatLog} rather
+   * than folded into `pendingBackfillCollections`/`stagesForChanges` — chat
+   * pages merge into `allMessages` directly, not through a
+   * {@link COLLECTION_BACKFILLS} spec.
+   */
+  let backfillChatDirty = false;
   /** Scheduled idle-callback handle, or ``null`` when none is pending. */
   let backfillRepaintHandle = null;
 
@@ -4406,6 +4433,19 @@ export function initializeApp(config) {
    * pending state. Idempotent: a no-op when nothing is pending, so calling it
    * again after a flush (or after the trailing idle callback) is harmless.
    *
+   * A collection-backfill repaint is routed to only the render stages the
+   * touched collections feed ({@link stagesForChanges}, Phase 2) instead of
+   * the full `renderFilteredOutputs()` this used unconditionally before — a
+   * `positions`-only page no longer also rebuilds the chat log. A page from
+   * the chat backfill is repainted separately via {@link rerenderChatLog}
+   * (it merges into `allMessages` directly, not through a
+   * {@link COLLECTION_BACKFILLS} spec, so it has no collection-shaped stages
+   * to route through). When a flush finds both kinds of page waiting, the
+   * collection repaint takes this pass and the chat repaint waits for the
+   * next flush (typically only a beat later, since backfillAllCollections
+   * and backfillChatHistory each force one final flush themselves) rather
+   * than every flush doing two full repaints.
+   *
    * @returns {void}
    */
   function flushBackfillRepaint() {
@@ -4422,7 +4462,22 @@ export function initializeApp(config) {
     }
     if (backfillRepaintDirty) {
       backfillRepaintDirty = false;
-      renderFilteredOutputs();
+      const stages = stagesForChanges(pendingBackfillCollections);
+      pendingBackfillCollections.clear();
+      // A chat-history page waiting alongside collection pages rides this
+      // same pass: the collection stages never include `chatChannels` (no
+      // COLLECTION_BACKFILLS spec is `messages`), and this flush has just
+      // cancelled the idle callback that would otherwise have painted it —
+      // leaving it for "the next flush" strands it when this is the last one.
+      if (backfillChatDirty) {
+        backfillChatDirty = false;
+        stages.chatChannels = true;
+        stages.log = true;
+      }
+      renderFilteredOutputs(undefined, stages);
+    } else if (backfillChatDirty) {
+      backfillChatDirty = false;
+      rerenderChatLog();
     }
   }
 
@@ -4457,6 +4512,7 @@ export function initializeApp(config) {
    */
   function commitBackfillPage(spec, batch) {
     spec.merge(batch);
+    pendingBackfillCollections.add(spec.name);
     pendingBackfillRefines.add(spec.refine);
     backfillRepaintDirty = true;
     scheduleBackfillRepaint();
@@ -6393,6 +6449,15 @@ export function initializeApp(config) {
         await collectionBackfillPromise;
         flushBackfillRepaint();
       },
+      /** Merge one chat-history page as the backfill pager would (test use only). */
+      commitHistoricalMessages: batch => commitHistoricalMessages(batch),
+      /** Merge one collection backfill page by collection name (test use only). */
+      commitBackfillPage: (name, batch) =>
+        commitBackfillPage(COLLECTION_BACKFILLS.find(spec => spec.name === name), batch),
+      /** Run the coalesced backfill repaint immediately (test use only). */
+      flushBackfillRepaint: () => flushBackfillRepaint(),
+      /** Whether a merged chat-history page is still waiting to be painted (test use only). */
+      isBackfillChatDirty: () => backfillChatDirty,
       /** Empty the persistent cache — the "clear cached data" control (FC4). */
       clearDataCache,
       /** Project an original lat/lon + pixel offset into a display LatLng. */
