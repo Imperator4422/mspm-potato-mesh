@@ -39,9 +39,10 @@
  *   ambient ``document`` is used when omitted. Primarily for unit tests.
  * @returns {{
  *   materialize: (namespace: string, key: string, className: string, html: string) => Object,
+ *   materializeLazy: (namespace: string, key: string, signature: *, buildParts: () => ?{ className: string, html: string }) => ?Object,
  *   prune: (namespace: string) => void,
  *   retainNamespaces: (activeNamespaces: Iterable<string>) => void,
- *   stats: () => { materialized: number },
+ *   stats: () => { materialized: number, built: number },
  *   resetStats: () => void,
  *   size: (namespace?: string) => number
  * }} Cache API.
@@ -52,11 +53,20 @@ export function createChatEntryCache({ documentRef } = {}) {
     throw new TypeError('createChatEntryCache requires a document with createElement');
   }
 
-  /** @type {Map<string, Map<string, { html: string, node: Object }>>} */
+  /** @type {Map<string, Map<string, { html: string, node: Object, signature?: * }>>} */
   const namespaces = new Map();
   /** @type {Map<string, Set<string>>} keys touched in the current build cycle. */
   const seen = new Map();
   let materialized = 0;
+  /**
+   * Cumulative count of {@link materializeLazy} ``buildParts`` invocations —
+   * distinct from {@link materialized}, which only counts an actual DOM
+   * ``innerHTML`` (re)parse. A signature hit skips ``buildParts`` (and so
+   * never increments this) without needing the caller's HTML-string builder
+   * to have run at all — the cost {@link materialize} alone could not avoid
+   * (issue: frontend perf regression, Phase 3d).
+   */
+  let built = 0;
 
   /**
    * Resolve (creating if needed) the entry map for a namespace.
@@ -115,6 +125,56 @@ export function createChatEntryCache({ documentRef } = {}) {
   }
 
   /**
+   * Like {@link materialize}, but skips calling ``buildParts`` — the
+   * expensive HTML-string construction step — entirely when a cheap
+   * ``signature`` matches the previous build. ``materialize`` still had to
+   * build the HTML string every call just to find out it was unchanged;
+   * ``signature`` lets the caller answer that question from data it already
+   * has (an id, a timestamp, a sender's display fields) without touching the
+   * renderer at all (issue: frontend perf regression, Phase 3d).
+   *
+   * A signature mismatch (or no prior entry) falls back to calling
+   * ``buildParts`` and, exactly as {@link materialize} does, still reuses the
+   * cached node when the resulting HTML happens to be identical — a
+   * changed signature is a *reason to check*, not proof the HTML differs.
+   *
+   * @param {string} namespace Tab identifier.
+   * @param {string} key Stable per-entry identity.
+   * @param {*} signature Cheap, comparable (``===``) proxy for whether this
+   *   entry's rendered HTML would differ from last time. Typically a string
+   *   joining the fields the render actually depends on.
+   * @param {() => ?{ className: string, html: string }} buildParts Builds the
+   *   entry's class name + HTML; called only on a signature mismatch. May
+   *   return ``null`` (entry should not render at all — e.g. a hidden
+   *   encrypted blob), in which case this returns ``null`` and nothing is
+   *   cached.
+   * @returns {?Object} The cached or freshly-built entry node, or ``null``.
+   */
+  function materializeLazy(namespace, key, signature, buildParts) {
+    const cache = nsMap(namespace);
+    seenSet(namespace).add(key);
+    const existing = cache.get(key);
+    if (existing && existing.signature === signature) {
+      return existing.node;
+    }
+    built += 1;
+    const parts = typeof buildParts === 'function' ? buildParts() : null;
+    if (!parts) {
+      return null;
+    }
+    if (existing && existing.html === parts.html) {
+      existing.signature = signature;
+      return existing.node;
+    }
+    const node = doc.createElement('div');
+    node.className = parts.className;
+    node.innerHTML = parts.html;
+    cache.set(key, { html: parts.html, node, signature });
+    materialized += 1;
+    return node;
+  }
+
+  /**
    * Drop cached entries in ``namespace`` that were not seen during the current
    * build cycle (messages that aged out of the window), then clear the cycle's
    * seen set so the next build starts fresh.
@@ -162,21 +222,26 @@ export function createChatEntryCache({ documentRef } = {}) {
   }
 
   /**
-   * Cumulative count of entries materialised (parsed) since the last reset.
+   * Cumulative counts since the last reset: entries materialised (an actual
+   * DOM ``innerHTML`` parse) and, separately, {@link materializeLazy}
+   * ``buildParts`` invocations (the HTML-string construction step, which a
+   * signature hit skips even when the DOM parse itself would also have been
+   * skipped).
    *
-   * @returns {{ materialized: number }} Render statistics.
+   * @returns {{ materialized: number, built: number }} Render statistics.
    */
   function stats() {
-    return { materialized };
+    return { materialized, built };
   }
 
   /**
-   * Reset the materialisation counter (does not evict cached nodes).
+   * Reset both counters (does not evict cached nodes).
    *
    * @returns {void}
    */
   function resetStats() {
     materialized = 0;
+    built = 0;
   }
 
   /**
@@ -197,5 +262,5 @@ export function createChatEntryCache({ documentRef } = {}) {
     return map ? map.size : 0;
   }
 
-  return { materialize, prune, retainNamespaces, stats, resetStats, size };
+  return { materialize, materializeLazy, prune, retainNamespaces, stats, resetStats, size };
 }

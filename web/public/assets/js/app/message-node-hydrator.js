@@ -245,3 +245,38 @@ export function createMessageNodeHydrator({
 
   return { hydrate };
 }
+
+/**
+ * Re-point already-hydrated messages' `.node` reference at the current
+ * `nodesById` entry, without touching anything else on the message.
+ *
+ * `rebuildNodeDerivedState()` (main.js) produces a brand-new node object on
+ * every call — even when nothing about a node actually changed — so a
+ * message hydrated on an earlier tick holds a `.node` reference to an object
+ * that is no longer in `nodesById` (issue: frontend perf regression, Phase
+ * 2). Delta-only hydration (`hydrate()` above called on just the incoming
+ * rows, not the whole retained window) means most messages are never
+ * re-hydrated, so without this relink they would carry a stale, GC-pinned
+ * node snapshot forever — silently missing a later name/role change. Call
+ * this once per tick that ran `rebuildNodeDerivedState()`, after it, over
+ * the full retained message array(s).
+ *
+ * A message whose sender is not found in `nodesById` (already an `!id`
+ * placeholder, or a sender that dropped out of the bulk node collection) is
+ * left untouched — relinking only ever replaces a hit with a fresher hit,
+ * never manufactures one.
+ *
+ * @param {Array<Object>|null|undefined} messages Previously hydrated messages.
+ * @param {Map<string, object>} nodesById Current node lookup table.
+ * @returns {void}
+ */
+export function relinkMessageNodes(messages, nodesById) {
+  if (!Array.isArray(messages) || !(nodesById instanceof Map)) return;
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const id = typeof message.node_id === 'string' ? message.node_id : null;
+    if (!id) continue;
+    const node = nodesById.get(id);
+    if (node) message.node = node;
+  }
+}

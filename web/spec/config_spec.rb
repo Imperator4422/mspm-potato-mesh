@@ -494,6 +494,30 @@ RSpec.describe PotatoMesh::Config do
     end
   end
 
+  describe ".live_debounce_ms" do
+    it "returns the baked-in debounce window when unset" do
+      within_env("LIVE_DEBOUNCE_MS" => nil) do
+        expect(described_class.live_debounce_ms).to eq(
+          PotatoMesh::Config::DEFAULT_LIVE_DEBOUNCE_MS,
+        )
+      end
+    end
+
+    it "accepts positive overrides" do
+      within_env("LIVE_DEBOUNCE_MS" => "500") do
+        expect(described_class.live_debounce_ms).to eq(500)
+      end
+    end
+
+    it "rejects non-positive overrides" do
+      within_env("LIVE_DEBOUNCE_MS" => "0") do
+        expect(described_class.live_debounce_ms).to eq(
+          PotatoMesh::Config::DEFAULT_LIVE_DEBOUNCE_MS,
+        )
+      end
+    end
+  end
+
   describe ".sse_heartbeat_seconds" do
     it "returns the baked-in heartbeat when unset" do
       within_env("SSE_HEARTBEAT_SECONDS" => nil) do

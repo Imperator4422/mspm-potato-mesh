@@ -145,6 +145,51 @@ test('FIX 1: an idle chat re-render materialises no entries', async () => {
   });
 });
 
+test('Phase 3d: an idle chat re-render builds 0 parts (skips renderParts entirely, not just the DOM parse)', async () => {
+  await withChatApp({ '/api/messages': makeMessages(5), '/api/nodes': KNOWN_NODES }, async ({ testUtils }) => {
+    const initial = testUtils.getChatRenderStats().built;
+    assert.ok(initial > 0, `initial render should call buildParts (saw ${initial})`);
+
+    // Re-render with the exact same state — nothing new arrived, and no
+    // sender's display fields changed, so every entry's signature matches.
+    testUtils.resetChatRenderStats();
+    testUtils.rerenderChatLog();
+    const stats = testUtils.getChatRenderStats();
+
+    assert.equal(
+      stats.built, 0,
+      `an idle re-render must skip renderParts via the signature check, but built ${stats.built}`,
+    );
+    assert.equal(stats.materialized, 0, 'a signature hit never reaches the DOM-parse step either');
+  });
+});
+
+test('Phase 3e: a log-only render (stages.log && !stages.chatChannels) reuses the channel tabs by reference', async () => {
+  await withChatApp({ '/api/messages': makeMessages(5), '/api/nodes': KNOWN_NODES }, async ({ testUtils }) => {
+    const before = testUtils.getLastChannelTabs();
+    assert.ok(before.length > 0, 'the primary channel tab exists');
+    const beforeContentFactory = before[0].content;
+
+    // Simulate a tick where something other than messages/node-display
+    // changed (e.g. a telemetry-only delta): stages.log is set (the Log tab
+    // mixes every collection) but stages.chatChannels is not.
+    testUtils.rerenderChatLog(undefined, { log: true, chatChannels: false });
+
+    const after = testUtils.getLastChannelTabs();
+    assert.strictEqual(after, before, 'the channel tab array itself is reused, not rebuilt');
+    assert.strictEqual(after[0].content, beforeContentFactory, 'the content factory closure is reused, not recreated');
+  });
+});
+
+test('Phase 3e: a chatChannels render still rebuilds the channel tabs fresh', async () => {
+  await withChatApp({ '/api/messages': makeMessages(5), '/api/nodes': KNOWN_NODES }, async ({ testUtils }) => {
+    const before = testUtils.getLastChannelTabs();
+    testUtils.rerenderChatLog(undefined, { log: true, chatChannels: true });
+    const after = testUtils.getLastChannelTabs();
+    assert.notStrictEqual(after, before, 'a chatChannels tick rebuilds the channel tab array');
+  });
+});
+
 test('FIX 1: an idle re-render preserves rendered chat content', async () => {
   await withChatApp({ '/api/messages': makeMessages(3), '/api/nodes': KNOWN_NODES }, async ({ testUtils, env }) => {
     testUtils.rerenderChatLog();
