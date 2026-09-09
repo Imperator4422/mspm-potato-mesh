@@ -51,6 +51,7 @@ module PotatoMesh
           liveUpdatesEnabled: PotatoMesh::Config.live_updates_enabled?,
           liveUpdatesPath: "/api/events",
           safetyPollMs: PotatoMesh::Config.live_safety_poll_seconds * 1000,
+          liveDebounceMs: PotatoMesh::Config.live_debounce_ms,
           chatEnabled: !private_mode?,
           channel: sanitized_channel,
           frequency: sanitized_frequency,

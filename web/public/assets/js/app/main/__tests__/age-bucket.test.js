@@ -114,6 +114,53 @@ test('updateAgeBucketElements tolerates a missing document', () => {
   assert.equal(updateAgeBucketElements({}, NOW), 0);
 });
 
+test('updateAgeBucketElements(roots) limits the scan to the given roots, not the whole document', () => {
+  const scanned = elementStub({
+    [AGE_BUCKET_TS_ATTRIBUTE]: String(NOW - 4 * 3600),
+    [AGE_BUCKET_ATTRIBUTE]: 'live',
+  });
+  const unscanned = elementStub({
+    [AGE_BUCKET_TS_ATTRIBUTE]: String(NOW - 4 * 3600),
+    [AGE_BUCKET_ATTRIBUTE]: 'live',
+  });
+  const scannedRoot = { querySelectorAll: () => [scanned] };
+  // A second root exists but is never passed in — proof of scoping, not a
+  // whole-document fallback (Phase 4, issue: frontend perf regression).
+
+  const written = updateAgeBucketElements([scannedRoot], NOW);
+
+  assert.equal(written, 1);
+  assert.equal(scanned.attrs[AGE_BUCKET_ATTRIBUTE], 'today');
+  assert.equal(unscanned.attrs[AGE_BUCKET_ATTRIBUTE], 'live', 'a root not passed in is never scanned');
+});
+
+test('updateAgeBucketElements dedupes an element reachable through two overlapping roots, writing it once', () => {
+  const element = elementStub({
+    [AGE_BUCKET_TS_ATTRIBUTE]: String(NOW - 4 * 3600),
+    [AGE_BUCKET_ATTRIBUTE]: 'live',
+  });
+  const rootA = { querySelectorAll: () => [element] };
+  const rootB = { querySelectorAll: () => [element] };
+
+  const written = updateAgeBucketElements([rootA, rootB], NOW);
+
+  assert.equal(written, 1, 'the overlapping element is written once, not twice');
+});
+
+test('updateAgeBucketElements treats a single root (not wrapped in an array) exactly like [root] (backward compatible)', () => {
+  const element = elementStub({
+    [AGE_BUCKET_TS_ATTRIBUTE]: String(NOW - 60),
+  });
+  const root = { querySelectorAll: () => [element] };
+  assert.equal(updateAgeBucketElements(root, NOW), 1);
+  assert.equal(element.attrs[AGE_BUCKET_ATTRIBUTE], 'live');
+});
+
+test('updateAgeBucketElements tolerates an empty roots iterable and a non-iterable, non-root value', () => {
+  assert.equal(updateAgeBucketElements([], NOW), 0);
+  assert.equal(updateAgeBucketElements(42, NOW), 0);
+});
+
 test('marker fill opacity maps buckets to .85/.55/.30', () => {
   assert.equal(markerFillOpacityForBucket('live'), 0.85);
   assert.equal(markerFillOpacityForBucket('today'), 0.55);

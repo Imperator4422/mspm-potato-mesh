@@ -114,30 +114,62 @@ export function tickAttributes(unixSec, formatName = TICK_FORMAT_AGO) {
 }
 
 /**
- * Run one tick pass: rescan the document for opted-in fields, recompute each
- * age, and write `textContent` only where the string changed (RT2).
+ * Normalise a ``root`` argument into an iterable of scannable roots.
+ *
+ * A single root-like value (anything with a ``querySelectorAll`` method —
+ * the whole `document`, or one element) is wrapped in a one-element array,
+ * so every existing caller passing a bare `document`/root is unaffected. A
+ * value that is itself iterable (an `Array`/`Set` of roots) is used as-is,
+ * for a scoped ticker scanning several specific roots instead of the whole
+ * document (Phase 4, issue: frontend perf regression — a 1s document-wide
+ * `querySelectorAll` sweep on a busy dashboard's thousands of stamped rows).
+ *
+ * @param {*} rootsOrRoot A single root, or an iterable of roots.
+ * @returns {Iterable<*>} Iterable of candidate roots (not yet validated).
+ */
+function normalizeRoots(rootsOrRoot) {
+  if (rootsOrRoot && typeof rootsOrRoot.querySelectorAll === 'function') {
+    return [rootsOrRoot];
+  }
+  if (rootsOrRoot && typeof rootsOrRoot[Symbol.iterator] === 'function') {
+    return rootsOrRoot;
+  }
+  return [];
+}
+
+/**
+ * Run one tick pass: rescan the given root(s) for opted-in fields, recompute
+ * each age, and write `textContent` only where the string changed (RT2).
  *
  * Comparing against the element's current text (rather than a cached value)
  * is self-correcting: a row re-rendered by a data refresh is simply observed
  * at its new text on the next pass.
  *
- * @param {?{querySelectorAll: Function}} documentRef Document (or root) to scan.
+ * @param {?{querySelectorAll: Function}|Iterable<{querySelectorAll: Function}>} roots
+ *   A single document/root to scan, or an iterable of several — overlapping
+ *   roots (e.g. a root nested inside another passed root) are deduped by
+ *   element identity, not just by root, so an element is never double-counted
+ *   or double-written.
  * @param {number} [nowSec] Reference "now" in seconds; defaults to wall clock.
  * @returns {number} Count of fields whose text was rewritten.
  */
-export function updateTickingElements(documentRef, nowSec = Date.now() / 1000) {
-  if (!documentRef || typeof documentRef.querySelectorAll !== 'function') return 0;
+export function updateTickingElements(roots, nowSec = Date.now() / 1000) {
   let written = 0;
-  for (const element of documentRef.querySelectorAll(TICK_SELECTOR)) {
-    if (!element || typeof element.getAttribute !== 'function') continue;
-    const next = formatTickingAge(
-      element.getAttribute(TICK_TIMESTAMP_ATTRIBUTE),
-      element.getAttribute(TICK_FORMAT_ATTRIBUTE),
-      nowSec,
-    );
-    if (element.textContent !== next) {
-      element.textContent = next;
-      written += 1;
+  const seen = new Set();
+  for (const root of normalizeRoots(roots)) {
+    if (!root || typeof root.querySelectorAll !== 'function') continue;
+    for (const element of root.querySelectorAll(TICK_SELECTOR)) {
+      if (!element || typeof element.getAttribute !== 'function' || seen.has(element)) continue;
+      seen.add(element);
+      const next = formatTickingAge(
+        element.getAttribute(TICK_TIMESTAMP_ATTRIBUTE),
+        element.getAttribute(TICK_FORMAT_ATTRIBUTE),
+        nowSec,
+      );
+      if (element.textContent !== next) {
+        element.textContent = next;
+        written += 1;
+      }
     }
   }
   return written;
@@ -184,6 +216,14 @@ function defaultClearInterval(handle) {
  * @param {Function} [options.now] Clock returning seconds since the epoch.
  * @param {Function} [options.setIntervalFn] Interval scheduler (tests inject this).
  * @param {Function} [options.clearIntervalFn] Interval canceller (tests inject this).
+ * @param {(documentRef: Object) => Iterable<Object>} [options.resolveRoots]
+ *   Compute the roots to scan *this* tick, given `documentRef`. Defaults to
+ *   `doc => [doc]` (the whole document, unchanged behaviour) — the dashboard
+ *   passes a function scoping the scan to only the currently-visible roots
+ *   (the node table body, the open chat panel, the map, open overlays, the
+ *   header) instead of sweeping the whole document every ~1s (Phase 4, issue:
+ *   frontend perf regression). Called fresh each tick since which roots are
+ *   relevant (e.g. which chat panel is visible) changes over time.
  * @returns {{tick: Function, stop: Function, running: Function}} Handle:
  *   `tick()` forces one pass (returns the write count), `stop()` tears the
  *   ticker down (idempotent), `running()` reports whether an interval is armed.
@@ -199,6 +239,7 @@ export function startRelativeTimeTicker(options = {}) {
   const now = typeof options.now === 'function' ? options.now : () => Date.now() / 1000;
   const schedule = typeof options.setIntervalFn === 'function' ? options.setIntervalFn : defaultSetInterval;
   const cancel = typeof options.clearIntervalFn === 'function' ? options.clearIntervalFn : defaultClearInterval;
+  const resolveRoots = typeof options.resolveRoots === 'function' ? options.resolveRoots : doc => [doc];
   // No document (e.g. a non-browser context): return an inert, safe handle.
   if (!documentRef || typeof documentRef.querySelectorAll !== 'function') {
     return { tick: () => 0, stop: () => {}, running: () => false };
@@ -210,10 +251,13 @@ export function startRelativeTimeTicker(options = {}) {
   // One shared pass per tick: the text fields (RT2), then the freshness
   // buckets (SPEC UX5 — an explicit RT2 extension: an *attribute* rewrite,
   // still write-on-change, never a re-render). The returned count stays the
-  // text-write count so RT-era instrumentation keeps its meaning.
+  // text-write count so RT-era instrumentation keeps its meaning. Roots are
+  // resolved fresh each call (not once at start-up) since which roots matter
+  // changes as the reader switches chat tabs, opens overlays, etc.
   const tick = () => {
-    const written = updateTickingElements(documentRef, now());
-    updateAgeBucketElements(documentRef, now());
+    const roots = resolveRoots(documentRef);
+    const written = updateTickingElements(roots, now());
+    updateAgeBucketElements(roots, now());
     return written;
   };
   const hidden = () => documentRef.hidden === true;

@@ -208,6 +208,91 @@ test('updateTickingElements defaults its clock to the wall clock', () => {
   assert.equal(field.textContent, '1d 1h');
 });
 
+test('updateTickingElements(resolveRoots) limits the scan to the given roots, not the whole document', () => {
+  const now = 1_000_000;
+  const scannedField = fakeField(now - 4);
+  const unscannedField = fakeField(now - 4);
+  // Two independent roots (Phase 4): only one is passed in, so only its
+  // field is scanned/written — proof the module never falls back to a
+  // whole-document sweep when it is handed specific roots.
+  const scannedRoot = fakeDocument([scannedField]);
+  fakeDocument([unscannedField]); // never passed to updateTickingElements
+
+  const written = updateTickingElements([scannedRoot], now);
+
+  assert.equal(written, 1);
+  assert.equal(scannedField.textContent, '4s');
+  assert.equal(unscannedField.textContent, '', 'a root not passed in is never scanned');
+});
+
+test('updateTickingElements dedupes an element reachable through two overlapping roots, writing it once', () => {
+  const now = 1_000_000;
+  const field = fakeField(now - 4);
+  // The same element reachable from two different "roots" — e.g. a root
+  // nested inside another root the caller also passed — must still be
+  // written exactly once, not once per root that finds it (Phase 4).
+  const rootA = fakeDocument([field]);
+  const rootB = fakeDocument([field]);
+
+  const written = updateTickingElements([rootA, rootB], now);
+
+  assert.equal(written, 1, 'the overlapping element is written once, not twice');
+  assert.equal(field.writes, 1);
+});
+
+test('updateTickingElements treats a single root (not wrapped in an array) exactly like [root] (backward compatible)', () => {
+  const now = 1_000_000;
+  const field = fakeField(now - 4);
+  const doc = fakeDocument([field]);
+  assert.equal(updateTickingElements(doc, now), 1);
+});
+
+test('updateTickingElements tolerates an empty roots iterable and a non-iterable, non-root value', () => {
+  assert.equal(updateTickingElements([], 1_000_000), 0);
+  assert.equal(updateTickingElements(42, 1_000_000), 0);
+});
+
+test('startRelativeTimeTicker(resolveRoots) scans only the resolved roots, called fresh each tick', () => {
+  const now = 5_000_000;
+  const visibleField = fakeField(now - 4);
+  const hiddenField = fakeField(now - 4);
+  const documentRef = fakeDocument([visibleField, hiddenField]); // whole-document root, unused directly
+  let activeRoot = fakeDocument([visibleField]);
+  const resolveCalls = [];
+  const ticker = startRelativeTimeTicker({
+    documentRef,
+    now: () => now,
+    resolveRoots: doc => {
+      resolveCalls.push(doc);
+      return [activeRoot];
+    },
+  });
+
+  // Initial snap resolved roots once and only wrote the visible field.
+  assert.equal(resolveCalls.length, 1);
+  assert.equal(resolveCalls[0], documentRef, 'resolveRoots is handed the ticker\'s documentRef');
+  assert.equal(visibleField.textContent, '4s');
+  assert.equal(hiddenField.textContent, '', 'a root resolveRoots did not return is never scanned');
+
+  // Switch which root is "active" (e.g. the reader changed chat tabs) and
+  // force another pass: resolveRoots is called fresh, not cached from start-up.
+  activeRoot = fakeDocument([hiddenField]);
+  ticker.tick();
+  assert.equal(resolveCalls.length, 2);
+  assert.equal(hiddenField.textContent, '4s', 'the newly-resolved root is now scanned');
+
+  ticker.stop();
+});
+
+test('startRelativeTimeTicker defaults resolveRoots to the whole document (backward compatible)', () => {
+  const now = 6_000_000;
+  const field = fakeField(now - 4);
+  const doc = fakeDocument([field]);
+  const ticker = startRelativeTimeTicker({ documentRef: doc, now: () => now });
+  assert.equal(field.textContent, '4s');
+  ticker.stop();
+});
+
 test('startRelativeTimeTicker snaps immediately, then ticks on the interval (RT1/RT2)', () => {
   let nowValue = 3_000_000;
   const field = fakeField(nowValue - 4);

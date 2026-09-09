@@ -85,22 +85,48 @@ export function ageBucketAttributes(unixSec, nowSec) {
 }
 
 /**
+ * Normalise a ``root`` argument into an iterable of scannable roots. Mirrors
+ * `main/relative-time-ticker.js`'s helper of the same shape — kept as a
+ * private copy here rather than a shared import so this module stays
+ * dependency-free (its only prior imports were none at all).
+ *
+ * @param {*} rootsOrRoot A single root, or an iterable of roots.
+ * @returns {Iterable<*>} Iterable of candidate roots (not yet validated).
+ */
+function normalizeRoots(rootsOrRoot) {
+  if (rootsOrRoot && typeof rootsOrRoot.querySelectorAll === 'function') {
+    return [rootsOrRoot];
+  }
+  if (rootsOrRoot && typeof rootsOrRoot[Symbol.iterator] === 'function') {
+    return rootsOrRoot;
+  }
+  return [];
+}
+
+/**
  * Re-classify every stamped element and rewrite its bucket attribute only
  * where the bucket changed (the RT2 write-on-change discipline).
  *
- * @param {?{querySelectorAll: Function}} documentRef Document (or root) to scan.
+ * @param {?{querySelectorAll: Function}|Iterable<{querySelectorAll: Function}>} roots
+ *   A single document/root to scan, or an iterable of several (Phase 4,
+ *   issue: frontend perf regression); overlapping roots are deduped by
+ *   element identity.
  * @param {number} nowSec Reference "now" in seconds since the epoch.
  * @returns {number} Count of elements whose bucket was rewritten.
  */
-export function updateAgeBucketElements(documentRef, nowSec) {
-  if (!documentRef || typeof documentRef.querySelectorAll !== 'function') return 0;
+export function updateAgeBucketElements(roots, nowSec) {
   let written = 0;
-  for (const element of documentRef.querySelectorAll(`[${AGE_BUCKET_TS_ATTRIBUTE}]`)) {
-    if (!element || typeof element.getAttribute !== 'function') continue;
-    const next = nodeAgeBucket(element.getAttribute(AGE_BUCKET_TS_ATTRIBUTE), nowSec);
-    if (element.getAttribute(AGE_BUCKET_ATTRIBUTE) !== next) {
-      element.setAttribute(AGE_BUCKET_ATTRIBUTE, next);
-      written += 1;
+  const seen = new Set();
+  for (const root of normalizeRoots(roots)) {
+    if (!root || typeof root.querySelectorAll !== 'function') continue;
+    for (const element of root.querySelectorAll(`[${AGE_BUCKET_TS_ATTRIBUTE}]`)) {
+      if (!element || typeof element.getAttribute !== 'function' || seen.has(element)) continue;
+      seen.add(element);
+      const next = nodeAgeBucket(element.getAttribute(AGE_BUCKET_TS_ATTRIBUTE), nowSec);
+      if (element.getAttribute(AGE_BUCKET_ATTRIBUTE) !== next) {
+        element.setAttribute(AGE_BUCKET_ATTRIBUTE, next);
+        written += 1;
+      }
     }
   }
   return written;
