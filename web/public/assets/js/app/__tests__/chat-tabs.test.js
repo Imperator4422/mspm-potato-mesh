@@ -608,3 +608,43 @@ test('renderChatTabs treats an all-invalid-id tab list like an empty one', () =>
   assert.equal(active, null);
   assert.equal(container.dataset.activeTab, '');
 });
+
+test('renderChatTabs calls onActivate with the resolved tab id on initial render', () => {
+  const document = createMockDocument();
+  const container = new MockElement('div');
+  const activations = [];
+  const tabs = [
+    { id: 'log', label: 'Log', content: new MockElement('div') },
+    { id: 'c0', label: 'Default', content: new MockElement('div') }
+  ];
+  renderChatTabs({
+    document, container, tabs, defaultActiveTabId: 'c0',
+    onActivate: id => activations.push(id),
+  });
+  assert.deepEqual(activations, ['c0']);
+});
+
+test('renderChatTabs calls onActivate again on every explicit tab switch', () => {
+  const document = createMockDocument();
+  const container = new MockElement('div');
+  const activations = [];
+  const tabs = [
+    { id: 'log', label: 'Log', content: new MockElement('div') },
+    { id: 'c0', label: 'Default', content: new MockElement('div') }
+  ];
+  renderChatTabs({
+    document, container, tabs, defaultActiveTabId: 'c0',
+    onActivate: id => activations.push(id),
+  });
+  const tabListWrapper = container.children[0];
+  const tabList = tabListWrapper.children[1];
+  tabList.children[0].dispatch('click'); // switch to 'log'
+  assert.deepEqual(activations, ['c0', 'log']);
+});
+
+test('renderChatTabs tolerates a missing onActivate (defaults to null)', () => {
+  const document = createMockDocument();
+  const container = new MockElement('div');
+  const tabs = [{ id: 'log', label: 'Log', content: new MockElement('div') }];
+  assert.doesNotThrow(() => renderChatTabs({ document, container, tabs }));
+});

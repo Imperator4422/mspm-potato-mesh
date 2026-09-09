@@ -116,11 +116,17 @@ function materializeTabContent(entry) {
  *   container: HTMLElement,
  *   tabs: Array<{ id: string, label: string, iconSrc?: string|null, content: Node|(() => Node)|null }>,
  *   previousActiveTabId?: string|null,
- *   defaultActiveTabId?: string|null
+ *   defaultActiveTabId?: string|null,
+ *   onActivate?: ?(tabId: string) => void
  * }} options Rendering parameters. A tab's ``content`` may be a plain
  *   already-built ``Node`` (appended immediately) or a factory function
  *   (``() => Node``); a factory is called only for the tab that resolves as
  *   active, and for any other tab only on first activation (Phase 3b).
+ *   ``onActivate`` fires every time a tab becomes the active one — the
+ *   initial resolution, a passive re-render, and an explicit click/dropdown
+ *   switch alike — so a caller can, for example, snap a shared relative-time
+ *   ticker immediately for a panel that was hidden (and so unscanned) until
+ *   just now (Phase 4).
  * @returns {?string} Identifier of the active tab after rendering.
  */
 export function renderChatTabs({
@@ -128,7 +134,8 @@ export function renderChatTabs({
   container,
   tabs,
   previousActiveTabId = null,
-  defaultActiveTabId = null
+  defaultActiveTabId = null,
+  onActivate = null
 }) {
   if (!container || !document) {
     return null;
@@ -379,6 +386,11 @@ export function renderChatTabs({
         matched = true;
         container.dataset.activeTab = newId;
         tabSelect.value = newId;
+        // The panel may have just been hidden (and so unscanned by a
+        // root-scoped ticker) until this very activation — snap its
+        // relative-time fields now rather than waiting up to ~1s for the
+        // next tick (Phase 4).
+        if (typeof onActivate === 'function') onActivate(newId);
         // An explicit tab switch (click / dropdown) jumps to the newest entry and
         // scrolls the chosen tab into view. A passive re-render does NEITHER: the
         // reader's vertical scroll is restored by the caller below, and the

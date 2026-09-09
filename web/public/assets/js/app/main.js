@@ -3959,7 +3959,11 @@ export function initializeApp(config) {
       container: chatEl,
       tabs,
       previousActiveTabId: previousActive,
-      defaultActiveTabId: defaultActive
+      defaultActiveTabId: defaultActive,
+      // A tab that was hidden (and so unscanned by the root-scoped ticker,
+      // above) may show a stale relative time the instant it becomes
+      // visible; snap it immediately rather than waiting up to ~1s (Phase 4).
+      onActivate: () => relativeTimeTicker.tick()
     });
     // renderChatTabs now owns chat-panel scroll: it pins to the bottom on the
     // initial render and tail-follows a bottom-pinned reader, but preserves the
@@ -6135,11 +6139,39 @@ export function initializeApp(config) {
     });
   }
 
+  /**
+   * Resolve the roots the shared ticker actually needs to scan this tick,
+   * instead of sweeping the whole document every ~1s (Phase 4, issue:
+   * frontend perf regression — a busy instance's node table alone can carry
+   * thousands of stamped rows). Only currently-visible/relevant surfaces
+   * carry ticking fields worth updating: the node table body, whichever
+   * chat panel is currently shown (a hidden panel is snapped instead on its
+   * own activation — see the `onActivate` wiring on `renderChatTabs` below),
+   * the map (marker popups/tooltips), any open short-info/node-detail
+   * overlay, and the header (title/footer stats).
+   *
+   * @returns {Array<Element>} Roots to scan this tick.
+   */
+  function tickerRoots() {
+    const roots = [];
+    const nodesTbody = document.querySelector('#nodes tbody');
+    if (nodesTbody) roots.push(nodesTbody);
+    const visibleChatPanel = chatEl ? chatEl.querySelector('.chat-tabpanel:not([hidden])') : null;
+    if (visibleChatPanel) roots.push(visibleChatPanel);
+    if (mapContainer) roots.push(mapContainer);
+    for (const overlay of overlayStack.getOpenOverlays()) {
+      if (overlay && overlay.element) roots.push(overlay.element);
+    }
+    if (headerEl) roots.push(headerEl);
+    return roots;
+  }
+
   // One shared presentation clock keeps every data-ts-ago field counting up
   // between data refreshes (SPEC RT1/RT2): no fetch, no refresh-cadence change,
   // in-place text writes only. It ignores the play/pause toggle and idles
-  // while the tab is hidden (RT3).
-  const relativeTimeTicker = startRelativeTimeTicker({ documentRef: document });
+  // while the tab is hidden (RT3). Scoped to `tickerRoots()` rather than the
+  // whole document (Phase 4).
+  const relativeTimeTicker = startRelativeTimeTicker({ documentRef: document, resolveRoots: tickerRoots });
 
   /**
    * Inner closures exposed for unit tests. Production callers should ignore
