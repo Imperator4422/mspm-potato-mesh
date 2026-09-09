@@ -83,7 +83,7 @@ import {
   fmtVoltage,
 } from './short-info-telemetry.js';
 import { renderSatsInViewBadge } from './short-info-satellites.js';
-import { createMessageNodeHydrator } from './message-node-hydrator.js';
+import { createMessageNodeHydrator, relinkMessageNodes } from './message-node-hydrator.js';
 import {
   extractChatMessageMetadata,
   formatChatMessagePrefix,
@@ -101,6 +101,8 @@ import { createDataCache, CACHE_SCHEMA_VERSION } from './main/data-cache.js';
 import { createIndexedDbBackend } from './main/data-cache-idb.js';
 import { isExpired as isCacheEntryExpired, isStale as isCacheEntryStale } from './main/cache-lifetime.js';
 import { cacheKeyFor } from './main/cache-keys.js';
+import { createLiveRefreshScheduler } from './main/live-refresh-scheduler.js';
+import { stagesForChanges, hasNodeDisplayChange, ALL_RENDER_STAGES } from './main/render-stages.js';
 import { formatPositionHighlights, formatTelemetryHighlights } from './chat-log-highlights.js';
 import { filterChatModel, normaliseChatFilterQuery } from './chat-search.js';
 import { buildMessageIndex } from './message-replies.js';
@@ -449,6 +451,18 @@ export function initializeApp(config) {
    */
   let renderFilteredOutputsCount = 0;
   /**
+   * Per-stage render counters (issue: frontend perf regression). Incremented at
+   * the top of {@link renderTable}, {@link renderMap}, and {@link renderChatLog}
+   * respectively so tests can assert a given SSE delta only re-ran the stages its
+   * changed collections actually touch, without depending on DOM introspection.
+   * Exposed via ``_testUtils.getStageRenderCounts`` / ``resetStageRenderCounts``.
+   */
+  let renderTableCount = 0;
+  let renderMapCount = 0;
+  let renderChatCount = 0;
+  /** Count of times {@link applyFilter} passed its stats gate and fetched `/api/stats`. */
+  let renderStatsCount = 0;
+  /**
    * True once the user clicked "show all" to lift the node-table render cap
    * ({@link NODE_TABLE_RENDER_CAP}); persists for the session so subsequent
    * refreshes keep showing every row.
@@ -696,7 +710,9 @@ export function initializeApp(config) {
     : REFRESH_MS;
   // Coalesce a burst of SSE pings into one delta fetch (client-side throttle,
   // complementing the server-side coalescing, SPEC PS4).
-  const LIVE_DEBOUNCE_MS = 250;
+  const LIVE_DEBOUNCE_MS = Number.isFinite(config.liveDebounceMs) && config.liveDebounceMs > 0
+    ? config.liveDebounceMs
+    : 1000;
   const CHAT_ENABLED = Boolean(config.chatEnabled);
   const instanceSelectorEnabled = Boolean(config.instancesFeatureEnabled);
 
@@ -714,6 +730,18 @@ export function initializeApp(config) {
   let refreshTimer = null;
   let autorefreshPaused = false;
   let activeStatsRequestId = 0;
+  /** Wall-clock ms of the last `/api/stats`-driven render; throttles `applyFilter`'s
+   * stats stage (Phase 2 issue: frontend perf regression) independently of the
+   * fetch's own 30s response cache — a nodes-only ping still lands on every SSE
+   * debounce tick, and re-running updateTitleCount/updateLegendProtocolCounts/etc.
+   * every tick is wasted DOM work even when the fetch itself is a cache hit. */
+  let lastStatsRenderMs = 0;
+  const STATS_RENDER_THROTTLE_MS = 10_000;
+  /** Wall-clock ms of the last activity-series fetch; independent throttle from
+   * the stats one above, since the mesh-activity card's 24h sparkline is much
+   * slower-moving than the stats/title counts (its own response cache is 5 min). */
+  let lastActivitySeriesFetchMs = 0;
+  const ACTIVITY_SERIES_THROTTLE_MS = 60_000;
   // --- Live-update (SSE) state ---
   /** @type {?ReturnType<typeof createEventStream>} */
   let liveStream = null;
@@ -721,12 +749,6 @@ export function initializeApp(config) {
   let liveActive = false;
   /** The auto-refresh timer cadence last armed (ms); exposed for tests. */
   let autoRefreshIntervalMs = 0;
-  /** Collections flagged dirty by SSE pings, fetched on the next debounced refresh. */
-  const dirtyCollections = new Set();
-  /** @type {ReturnType<typeof setTimeout>|null} */
-  let liveRefreshTimer = null;
-  /** Promise of the most recent live-driven refresh (test hook). */
-  let liveRefreshPromise = Promise.resolve();
   /** Count of flash rounds triggered by SSE pings (VF2 gating; test hook). */
   let liveFlashCount = 0;
   /** Node ids flashed by the most recent SSE-ping refresh (test hook). */
@@ -892,22 +914,22 @@ export function initializeApp(config) {
   }
 
   /**
-   * Fetch only the collections flagged dirty by SSE pings, then clear the
-   * pending set. Targeted delta fetch (SPEC PS3): a `messages` ping fetches only
-   * `/api/messages`, not the whole dataset.
-   *
-   * @returns {Promise<void>} resolves once the targeted refresh completes.
+   * Coalescing scheduler for live-driven refreshes (issue: frontend perf
+   * regression). Collapses a burst of same-window SSE pings into one delta
+   * fetch (SPEC PS4), and guards every live-driven call site — SSE pings, the
+   * resync handler, the safety/legacy poll timer, and the unpause control —
+   * behind a single in-flight run so they can never race a second `refresh()`
+   * against the same mutable state (CR-A1). `run` forwards straight to
+   * {@link refresh}, whose own `flash`/`collections` handling is untouched;
+   * the scheduler only decides *when* to call it and with which pending
+   * request. `refresh` is a hoisted function declaration, so it is safe to
+   * reference here even though its own definition appears later in this
+   * closure.
    */
-  function runLiveRefresh() {
-    liveRefreshTimer = null;
-    const collections = new Set(dirtyCollections);
-    dirtyCollections.clear();
-    // flash: true marks this as the SSE-ping path, the only refresh that
-    // flashes changed rows (SPEC VF2). Resync / safety poll / initial load
-    // call refresh() without it, so they never flash.
-    liveRefreshPromise = refresh({ collections, flash: true });
-    return liveRefreshPromise;
-  }
+  const liveRefreshScheduler = createLiveRefreshScheduler({
+    run: (opts) => refresh(opts),
+    debounceMs: LIVE_DEBOUNCE_MS,
+  });
 
   /**
    * Flash each changed node's table row(s) and map marker white (SPEC VF3).
@@ -980,32 +1002,26 @@ export function initializeApp(config) {
   }
 
   /**
-   * Flag a collection dirty in response to an SSE change ping and arm the
-   * debounce timer so a burst of pings collapses into one delta fetch.
+   * Flag a collection dirty in response to an SSE change ping. The scheduler
+   * debounces a burst of pings into one delta fetch and defers to any run
+   * already in flight (SPEC PS4).
    *
    * @param {string} collection Changed collection name.
    * @returns {void}
    */
   function scheduleLiveRefresh(collection) {
-    dirtyCollections.add(collection);
-    if (!liveRefreshTimer) {
-      liveRefreshTimer = setTimeout(runLiveRefresh, LIVE_DEBOUNCE_MS);
-    }
+    liveRefreshScheduler.mark(collection);
   }
 
   /**
    * Run a full delta refresh on every SSE (re)connect so any change missed
-   * while the stream was down is recovered (SPEC PS5).
+   * while the stream was down is recovered (SPEC PS5). Never flashes (the
+   * scheduler reserves flashing for the SSE-ping path).
    *
    * @returns {void}
    */
   function handleLiveResync() {
-    if (liveRefreshTimer) {
-      clearTimeout(liveRefreshTimer);
-      liveRefreshTimer = null;
-    }
-    dirtyCollections.clear();
-    liveRefreshPromise = refresh();
+    liveRefreshScheduler.requestFull();
   }
 
   /**
@@ -1036,11 +1052,7 @@ export function initializeApp(config) {
   function stopLiveUpdates() {
     if (liveStream) liveStream.stop();
     liveActive = false;
-    if (liveRefreshTimer) {
-      clearTimeout(liveRefreshTimer);
-      liveRefreshTimer = null;
-    }
-    dirtyCollections.clear();
+    liveRefreshScheduler.cancel();
   }
 
   /**
@@ -1074,7 +1086,10 @@ export function initializeApp(config) {
     // negative value means auto-refresh is intentionally disabled.
     if (intervalMs > 0) {
       autoRefreshIntervalMs = intervalMs;
-      refreshTimer = setInterval(refresh, intervalMs);
+      // Routed through the scheduler (not called directly) so this timer can
+      // never overlap an SSE-driven refresh still in flight, whether it is
+      // ticking as the SSE safety poll or as the legacy no-SSE poll.
+      refreshTimer = setInterval(() => liveRefreshScheduler.requestFull(), intervalMs);
     }
   }
 
@@ -3677,6 +3692,7 @@ export function initializeApp(config) {
     filterQuery = ''
   }) {
     if (!CHAT_ENABLED || !chatEl) return;
+    renderChatCount += 1;
     // Reset the message→tab map for this render; buildChatFragment repopulates it
     // as it materialises each channel tab's entries (SPEC VF3 tab flash).
     messageTabId = new Map();
@@ -3894,13 +3910,19 @@ export function initializeApp(config) {
   }
 
   /**
-   * Hydrate one page of older messages and merge it into the live chat state,
-   * then re-render the chat log.  The read-modify-write of ``allMessages`` is
-   * synchronous (no ``await`` between the merge and the assignment) so a
-   * concurrent incremental {@link refresh} cannot clobber the history this adds.
+   * Hydrate one page of older messages and merge it into the live chat state.
+   * The read-modify-write of ``allMessages`` is synchronous (no ``await``
+   * between the merge and the assignment) so a concurrent incremental
+   * {@link refresh} cannot clobber the history this adds.
+   *
+   * Repainting is deferred, not immediate: a 7-day chat backfill can stream
+   * dozens of pages, and rebuilding the whole chat log after each one janks
+   * the cold load (issue: frontend perf regression, Phase 6) — the same
+   * coalescing {@link scheduleBackfillRepaint}/{@link flushBackfillRepaint}
+   * already use for the bulk-collection backfill (issue #832).
    *
    * @param {Array<Object>} batch Raw older message rows from the backfill pager.
-   * @returns {Promise<void>} Resolves once the page is merged and rendered.
+   * @returns {Promise<void>} Resolves once the page is merged (not yet painted).
    */
   async function commitHistoricalMessages(batch) {
     if (!Array.isArray(batch) || batch.length === 0) return;
@@ -3909,7 +3931,8 @@ export function initializeApp(config) {
     if (rows.length === 0) return;
     const floor = Math.floor(Date.now() / 1000) - CHAT_RECENT_WINDOW_SECONDS;
     allMessages = trimToWindow(mergeById(allMessages, rows, 'id'), floor);
-    rerenderChatLog();
+    backfillChatDirty = true;
+    scheduleBackfillRepaint();
   }
 
   /**
@@ -3948,6 +3971,10 @@ export function initializeApp(config) {
       console.warn('chat history backfill failed; showing the most recent page only', err);
     } finally {
       chatBackfillRunning = false;
+      // The whole window is now merged; paint the final coalesced state at
+      // once instead of waiting on the trailing idle callback (mirrors
+      // backfillAllCollections's matching call).
+      flushBackfillRepaint();
     }
   }
 
@@ -4105,6 +4132,22 @@ export function initializeApp(config) {
   const pendingBackfillRefines = new Set();
   /** True when merged-but-not-yet-repainted backfill rows are waiting. */
   let backfillRepaintDirty = false;
+  /**
+   * Collection names touched by not-yet-repainted backfill pages since the
+   * last flush (Phase 2/6: routes the coalesced repaint to only the render
+   * stages those collections touch, instead of a full `renderFilteredOutputs`
+   * on every flush).
+   * @type {Set<string>}
+   */
+  const pendingBackfillCollections = new Set();
+  /**
+   * True when a chat-history page (issue #802) merged but not yet
+   * re-rendered is waiting. Repainted via {@link rerenderChatLog} rather
+   * than folded into `pendingBackfillCollections`/`stagesForChanges` — chat
+   * pages merge into `allMessages` directly, not through a
+   * {@link COLLECTION_BACKFILLS} spec.
+   */
+  let backfillChatDirty = false;
   /** Scheduled idle-callback handle, or ``null`` when none is pending. */
   let backfillRepaintHandle = null;
 
@@ -4142,6 +4185,19 @@ export function initializeApp(config) {
    * pending state. Idempotent: a no-op when nothing is pending, so calling it
    * again after a flush (or after the trailing idle callback) is harmless.
    *
+   * A collection-backfill repaint is routed to only the render stages the
+   * touched collections feed ({@link stagesForChanges}, Phase 2) instead of
+   * the full `renderFilteredOutputs()` this used unconditionally before — a
+   * `positions`-only page no longer also rebuilds the chat log. A page from
+   * the chat backfill is repainted separately via {@link rerenderChatLog}
+   * (it merges into `allMessages` directly, not through a
+   * {@link COLLECTION_BACKFILLS} spec, so it has no collection-shaped stages
+   * to route through). When a flush finds both kinds of page waiting, the
+   * collection repaint takes this pass and the chat repaint waits for the
+   * next flush (typically only a beat later, since backfillAllCollections
+   * and backfillChatHistory each force one final flush themselves) rather
+   * than every flush doing two full repaints.
+   *
    * @returns {void}
    */
   function flushBackfillRepaint() {
@@ -4158,7 +4214,22 @@ export function initializeApp(config) {
     }
     if (backfillRepaintDirty) {
       backfillRepaintDirty = false;
-      renderFilteredOutputs();
+      const stages = stagesForChanges(pendingBackfillCollections);
+      pendingBackfillCollections.clear();
+      // A chat-history page waiting alongside collection pages rides this
+      // same pass: the collection stages never include `chatChannels` (no
+      // COLLECTION_BACKFILLS spec is `messages`), and this flush has just
+      // cancelled the idle callback that would otherwise have painted it —
+      // leaving it for "the next flush" strands it when this is the last one.
+      if (backfillChatDirty) {
+        backfillChatDirty = false;
+        stages.chatChannels = true;
+        stages.log = true;
+      }
+      renderFilteredOutputs(undefined, stages);
+    } else if (backfillChatDirty) {
+      backfillChatDirty = false;
+      rerenderChatLog();
     }
   }
 
@@ -4193,6 +4264,7 @@ export function initializeApp(config) {
    */
   function commitBackfillPage(spec, batch) {
     spec.merge(batch);
+    pendingBackfillCollections.add(spec.name);
     pendingBackfillRefines.add(spec.refine);
     backfillRepaintDirty = true;
     scheduleBackfillRepaint();
@@ -4310,6 +4382,7 @@ export function initializeApp(config) {
    * @returns {void}
    */
   function renderTable(nodes, nowSec) {
+    renderTableCount += 1;
     const tb = document.querySelector('#nodes tbody');
     if (!tb) {
       overlayStack.cleanupOrphans();
@@ -4642,16 +4715,31 @@ export function initializeApp(config) {
    *
    * @param {Array<Object>} nodes Node payloads.
    * @param {number} nowSec Reference timestamp.
+   * @param {{ markers: boolean, neighborLines: boolean, traceLines: boolean, waypoints: boolean }} [stages]
+   *   Which map sections need to run this tick (see `main/render-stages.js`).
+   *   Defaults to every section (full render), matching pre-Phase-2 behaviour
+   *   for any caller that does not yet pass stages. The marker section itself
+   *   is not independently gated — a full rebuild runs whenever this function
+   *   doesn't early-return (diffing it is Phase 5); `neighborLines`,
+   *   `traceLines`, and `waypoints` each gate their own section.
    * @returns {void}
    */
-  function renderMap(nodes, nowSec) {
+  function renderMap(nodes, nowSec, stages = ALL_RENDER_STAGES) {
     if (!map || !markersLayer || !hasLeaflet) {
       return;
     }
-    if (neighborLinesLayer) {
+    // A messages-only (or any non-map) delta touches none of these — skip the
+    // whole render, including the marker rebuild, instead of re-clearing and
+    // redrawing an unchanged map on every chat ping (issue: frontend perf
+    // regression).
+    if (!stages.markers && !stages.neighborLines && !stages.traceLines && !stages.waypoints) {
+      return;
+    }
+    renderMapCount += 1;
+    if (stages.neighborLines && neighborLinesLayer) {
       neighborLinesLayer.clearLayers();
     }
-    if (traceLinesLayer) {
+    if (stages.traceLines && traceLinesLayer) {
       traceLinesLayer.clearLayers();
     }
     if (spiderLinesLayer) {
@@ -4683,7 +4771,7 @@ export function initializeApp(config) {
       if (typeof nodeId !== 'string' || nodeId.length === 0) continue;
       nodesById.set(nodeId, node);
     }
-    const traceSegments = traceLinesLayer
+    const traceSegments = stages.traceLines && traceLinesLayer
       ? buildTraceSegments(allTraces, nodes, {
           limitDistance: LIMIT_DISTANCE,
           maxDistanceKm: MAX_DISTANCE_KM,
@@ -4691,7 +4779,7 @@ export function initializeApp(config) {
         })
       : [];
 
-    if (neighborLinesLayer && Array.isArray(allNeighbors) && allNeighbors.length) {
+    if (stages.neighborLines && neighborLinesLayer && Array.isArray(allNeighbors) && allNeighbors.length) {
       const neighborSegments = [];
       const seenDirections = new Set();
       for (const entry of allNeighbors) {
@@ -5055,7 +5143,7 @@ export function initializeApp(config) {
     // protocol filter (a hidden protocol drops its waypoints along with its
     // nodes — the toggle lives in that protocol's legend column, 1e-A) and the
     // expiry ladder inside the layer module. The count feeds the legend toggle.
-    if (waypointsLayer) {
+    if (stages.waypoints && waypointsLayer) {
       const filteredWaypoints = hiddenProtocols.size > 0
         ? allWaypoints.filter(waypoint => !hiddenProtocols.has(normalizeFilterProtocol(waypoint && waypoint.protocol)))
         : allWaypoints;
@@ -5234,41 +5322,73 @@ export function initializeApp(config) {
    *
    * @param {string} [filterQuery] Raw filter text for substring highlighting;
    *   defaults to the current filter input value.
+   * @param {Object} [stages] Which render stages need to run this tick (see
+   *   `main/render-stages.js`); defaults to every stage (full render).
    * @returns {void}
    */
-  function renderFilteredOutputs(filterQuery = filterInput ? filterInput.value : '') {
+  function renderFilteredOutputs(filterQuery = filterInput ? filterInput.value : '', stages = ALL_RENDER_STAGES) {
     // Instrumentation for the backfill de-jank guard (see
     // {@link renderFilteredOutputsCount}); a plain increment, no behaviour change.
     renderFilteredOutputsCount += 1;
     // Text and role filters apply only to the node table and map; the chat log
     // always receives the full node collection so reply-thread lookups succeed
     // even for nodes that are currently hidden by the active filter.
-    const sortedNodes = getFilteredSortedNodes();
+    // Sorting the node list is itself real work on a busy instance — skip it
+    // entirely on a tick that touches none of the node-list consumers (e.g. a
+    // messages-only SSE ping), rather than computing it and then discarding it
+    // (issue: frontend perf regression, Phase 2).
+    const needsNodeList = stages.table || stages.markers || stages.neighborLines
+      || stages.traceLines || stages.waypoints;
+    const sortedNodes = needsNodeList ? getFilteredSortedNodes() : [];
     const nowSec = Date.now() / 1000;
-    renderTable(sortedNodes, nowSec);
-    renderMap(sortedNodes, nowSec);
+    if (stages.table) renderTable(sortedNodes, nowSec);
+    renderMap(sortedNodes, nowSec, stages);
     updateSortIndicators();
     // Pass the raw filterQuery (not the normalised form) so the chat log can
-    // highlight matching substrings in their original case.
-    rerenderChatLog(filterQuery);
+    // highlight matching substrings in their original case. A tick that
+    // touches neither the per-channel chat model nor the mixed Log tab (e.g. a
+    // nodes-only ping with no display-field change) skips the chat rebuild
+    // entirely.
+    if (stages.chatChannels || stages.log) {
+      rerenderChatLog(filterQuery);
+    }
   }
 
   /**
    * Apply text and role filters to the node list and re-render outputs.
    *
+   * @param {Object} [stages] Which render stages need to run this tick (see
+   *   `main/render-stages.js`); defaults to every stage (full render). User-
+   *   driven callers (the filter input, the clear button, a legend toggle)
+   *   always pass the default — only a live-driven refresh narrows this.
    * @returns {void}
    */
-  function applyFilter() {
+  function applyFilter(stages = ALL_RENDER_STAGES) {
     updateFilterClearVisibility();
     const filterQuery = filterInput ? filterInput.value : '';
-    renderFilteredOutputs(filterQuery);
+    renderFilteredOutputs(filterQuery, stages);
     // Show an immediate local estimate for the title so it doesn't flicker
     // to (0) while waiting for the async /api/stats response.
     const nowSec = Date.now() / 1000;
     const localStats = computeLocalActiveNodeStats(allNodes, nowSec);
     updateTitleCount(adjustStatsForHiddenProtocols(localStats));
     // Title, legend, footer, and visibility are then corrected by /api/stats
-    // which provides the authoritative, uncapped counts.
+    // which provides the authoritative, uncapped counts — but only when this
+    // tick's stage routing calls for it, and rate-limited beyond that: the
+    // fetch itself has a 30s response cache (stats.js), yet the DOM update
+    // chain below still ran on every single tick before this gate existed
+    // (issue: frontend perf regression, Phase 2). The throttle applies only
+    // to live-driven ticks (a narrowed `stages` object): a user-driven call
+    // (filter input, legend/protocol toggle — always the full default) must
+    // re-run the legend/footer/visibility chain immediately, since those
+    // read the hidden-protocol set the user just changed.
+    const nowMs = Date.now();
+    const liveDriven = stages !== ALL_RENDER_STAGES;
+    if (!stages.stats || (liveDriven && nowMs - lastStatsRenderMs < STATS_RENDER_THROTTLE_MS)) {
+      return;
+    }
+    lastStatsRenderMs = nowMs;
+    renderStatsCount += 1;
     const statsRequestId = ++activeStatsRequestId;
     void fetchActiveNodeStats({ nodes: allNodes, nowSeconds: nowSec }).then(stats => {
       if (statsRequestId !== activeStatsRequestId) return;
@@ -5283,12 +5403,17 @@ export function initializeApp(config) {
       // applyFilter, so this refreshes the card on both data and toggle changes.
       if (meshActivityCard) {
         meshActivityCard.render({ packets: stats && stats.packets, hiddenProtocols });
-        // The 24h sparkline series is fetched separately (cached ~5 min, F2-4);
-        // setSeries repaints the card when it resolves, and null on failure just
-        // omits the sparkline.
-        void fetchActivitySeries({}).then(series => {
-          if (meshActivityCard) meshActivityCard.setSeries(series);
-        });
+        // The 24h sparkline series is fetched separately (cached ~5 min, F2-4)
+        // and throttled independently here (its own cadence, slower-moving
+        // than the stats/title counts above); setSeries repaints the card
+        // when it resolves, and null on failure just omits the sparkline.
+        const seriesNowMs = Date.now();
+        if (seriesNowMs - lastActivitySeriesFetchMs >= ACTIVITY_SERIES_THROTTLE_MS) {
+          lastActivitySeriesFetchMs = seriesNowMs;
+          void fetchActivitySeries({}).then(series => {
+            if (meshActivityCard) meshActivityCard.setSeries(series);
+          });
+        }
       }
     });
   }
@@ -5461,6 +5586,29 @@ export function initializeApp(config) {
         };
       }
 
+      // Route this tick to only the render stages the collections that
+      // actually returned rows touch (issue: frontend perf regression, Phase
+      // 2). A collection counts as changed only when it was fetched
+      // (want(name)) and returned at least one row — an empty delta (the
+      // common SSE-ping case once the debounce coalesces a burst down to one
+      // fetch set) must render nothing. nodeDisplayChanged must be computed
+      // now, against the *pre-merge* nodesById (this tick's rebuildNodeDerivedState,
+      // if it runs at all, happens further down) — it is what lets a
+      // renamed/re-roled sender relabel their already-rendered chat entries
+      // even when no new message rows arrived this tick.
+      const changed = new Set();
+      if (want('nodes') && incomingNodes.length > 0) changed.add('nodes');
+      if (want('positions') && incomingPositions.length > 0) changed.add('positions');
+      if (want('telemetry') && incomingTelemetry.length > 0) changed.add('telemetry');
+      if (want('neighbors') && incomingNeighbors.length > 0) changed.add('neighbors');
+      if (want('traces') && incomingTraces.length > 0) changed.add('traces');
+      if (want('waypoints') && incomingWaypoints.length > 0) changed.add('waypoints');
+      if (want('messages') && (incomingMessages.length > 0 || incomingEncryptedMessages.length > 0)) {
+        changed.add('messages');
+      }
+      const nodeDisplayChanged = useSince ? hasNodeDisplayChange(incomingNodes, nodesById) : false;
+      const stages = useSince ? stagesForChanges(changed, { nodeDisplayChanged }) : ALL_RENDER_STAGES;
+
       // Merge incremental results into the module-level collections.  On first
       // load the existing arrays are empty so the merge is effectively a no-op.
       // The per-packet collections (positions/telemetry/neighbors/traces) are
@@ -5491,33 +5639,32 @@ export function initializeApp(config) {
       allWaypoints = useSince
         ? trimToWindow(mergeByCompositeKey(allWaypoints, incomingWaypoints, ['id', 'protocol']), recentWindowFloor)
         : incomingWaypoints;
-      // Encrypted blobs only feed the mixed Log tab (itself capped), so a count
-      // cap is the right memory bound for them.
-      const encryptedMessages = useSince
-        ? trimToLimit(mergeById(allEncryptedMessages, incomingEncryptedMessages, 'id'), MESSAGE_LIMIT)
-        : incomingEncryptedMessages;
-      // Plaintext chat is shown for the full seven-day window (issue #796), so
-      // bound the retained set by that window rather than a row count — a count
-      // cap would silently drop older-but-in-window messages on the next merge.
-      const messages = useSince
-        ? trimToWindow(mergeById(allMessages, incomingMessages, 'id'), messageWindowFloor)
-        : incomingMessages;
-
       // Aggregate per-source snapshots into locals and enrich the node collection
       // from the merged sources.  Shared with the background backfill so a streamed
       // page re-derives identically (issue #832).  The per-packet accumulators
       // (allPositionEntries/allTelemetryEntries/allNeighbors) are left RAW so the
       // Log keeps a stable entry per packet — re-storing the aggregated form would
-      // erode history on the next tick (bugfix A1).
-      rebuildNodeDerivedState();
-      // Hydrate messages with node metadata in parallel; the node index has just
-      // been rebuilt (inside rebuildNodeDerivedState) so lookups find the freshly
-      // merged records.
-      const [chatMessages, encryptedChatMessages] = await Promise.all([
-        messageNodeHydrator.hydrate(messages, nodesById),
-        messageNodeHydrator.hydrate(encryptedMessages, nodesById)
+      // erode history on the next tick (bugfix A1). Skipped entirely when nothing
+      // node/position/telemetry-shaped arrived (stages.derive false) — nodesById
+      // and the enriched allNodes are already correct from the previous tick, so
+      // re-aggregating would just rebuild the same values (issue: frontend perf
+      // regression, Phase 2).
+      if (stages.derive) {
+        rebuildNodeDerivedState();
+      }
+      // Hydrate only the incoming (delta) rows, not the whole retained
+      // seven-day window — that was O(window size) on every tick even for a
+      // single new message (Phase 2). Already-hydrated messages keep their
+      // `.node` reference across the mergeById below; relinkMessageNodes
+      // (further down) re-points them when derive ran, since
+      // rebuildNodeDerivedState hands back new node object identities even
+      // when nothing about the node actually changed.
+      const [hydratedIncomingMessages, hydratedIncomingEncrypted] = await Promise.all([
+        messageNodeHydrator.hydrate(incomingMessages, nodesById),
+        messageNodeHydrator.hydrate(incomingEncryptedMessages, nodesById)
       ]);
-      const hydratedChat = Array.isArray(chatMessages) ? chatMessages : [];
+      const hydratedChat = Array.isArray(hydratedIncomingMessages) ? hydratedIncomingMessages : [];
+      const hydratedEncryptedChat = Array.isArray(hydratedIncomingEncrypted) ? hydratedIncomingEncrypted : [];
       // Re-merge into the *current* allMessages rather than replacing it: the
       // background history backfill (issue #802) may have appended older pages
       // while we awaited hydration, and a blind assignment would clobber them.
@@ -5527,9 +5674,23 @@ export function initializeApp(config) {
       allMessages = useSince
         ? trimToWindow(mergeById(allMessages, hydratedChat, 'id'), messageWindowFloor)
         : hydratedChat;
-      allEncryptedMessages = Array.isArray(encryptedChatMessages) ? encryptedChatMessages : [];
+      // Encrypted blobs only feed the mixed Log tab (itself capped), so a count
+      // cap is the right memory bound for them.
+      allEncryptedMessages = useSince
+        ? trimToLimit(mergeById(allEncryptedMessages, hydratedEncryptedChat, 'id'), MESSAGE_LIMIT)
+        : hydratedEncryptedChat;
+      // A derive tick hands back fresh node object identities for every node
+      // (rebuildNodeDerivedState always re-aggregates from scratch), so any
+      // message hydrated on an earlier tick now points at an object no longer
+      // in nodesById. Relink the full retained arrays (not just this tick's
+      // delta, which is already fresh) so a later display change is never
+      // silently missed by an already-rendered entry.
+      if (stages.derive) {
+        relinkMessageNodes(allMessages, nodesById);
+        relinkMessageNodes(allEncryptedMessages, nodesById);
+      }
       initialFetchDone = true;
-      applyFilter();
+      applyFilter(stages);
       // SPEC VF2/VF3/VF4: only an SSE-ping refresh flashes (refreshOptions.flash),
       // and only after the table + map have rendered (applyFilter above), so the
       // highlight lands on the final, placed element. useSince excludes the
@@ -5617,7 +5778,7 @@ export function initializeApp(config) {
         );
       } else {
         applyAutorefreshControlState(autorefreshToggle, autorefreshControlState(false, null));
-        refresh();
+        liveRefreshScheduler.requestFull();
         restartAutoRefresh();
       }
     });
@@ -5845,17 +6006,21 @@ export function initializeApp(config) {
       /** Message ids flashed by the most recent SSE-ping refresh (test hook). */
       getLastFlashedMessageIds: () => lastFlashedMessageIds,
       /**
-       * Flush any pending debounced live refresh and await the latest
-       * live-driven refresh (test hook).
+       * Flush any pending debounced live refresh and await every run it
+       * triggers, including follow-up runs launched by requests that arrived
+       * while the flushed run was still in flight (test hook).
        *
        * @returns {Promise<void>}
        */
       flushLiveRefresh: async () => {
-        if (liveRefreshTimer) {
-          clearTimeout(liveRefreshTimer);
-          runLiveRefresh();
+        liveRefreshScheduler.flush();
+        await liveRefreshScheduler.inFlight();
+        // A request that arrived while the flushed run was in flight launches
+        // a follow-up on settle (no extra debounce wait); drain those too so
+        // callers observe the fully-settled state, not just the first run.
+        while (liveRefreshScheduler.pending()) {
+          await liveRefreshScheduler.inFlight();
         }
-        await liveRefreshPromise;
       },
       /** Stop the auto-refresh timer, live stream, and relative-time ticker (test teardown). */
       stopAutoRefresh: () => {
@@ -5938,6 +6103,27 @@ export function initializeApp(config) {
         renderFilteredOutputsCount = 0;
       },
       /**
+       * Snapshot of per-stage render counters (test use only) — asserts a given
+       * SSE delta only re-ran the render stages its changed collections touch.
+       *
+       * @returns {{ table: number, map: number, chat: number, stats: number }} Counter snapshot.
+       */
+      getStageRenderCounts: () => ({
+        table: renderTableCount,
+        map: renderMapCount,
+        chat: renderChatCount,
+        stats: renderStatsCount,
+      }),
+      /** Reset all per-stage render counters to zero (test use only). */
+      resetStageRenderCounts: () => {
+        renderTableCount = 0;
+        renderMapCount = 0;
+        renderChatCount = 0;
+        renderStatsCount = 0;
+      },
+      /** Run a user-driven (un-narrowed) filter pass, as the filter input does (test use only). */
+      applyFilter: () => applyFilter(),
+      /**
        * Resolve the lazily-imported, memoized node-detail overlay manager (test
        * use only) — the same loader the ``.node-long-link`` click path uses.
        */
@@ -5971,6 +6157,15 @@ export function initializeApp(config) {
         await collectionBackfillPromise;
         flushBackfillRepaint();
       },
+      /** Merge one chat-history page as the backfill pager would (test use only). */
+      commitHistoricalMessages: batch => commitHistoricalMessages(batch),
+      /** Merge one collection backfill page by collection name (test use only). */
+      commitBackfillPage: (name, batch) =>
+        commitBackfillPage(COLLECTION_BACKFILLS.find(spec => spec.name === name), batch),
+      /** Run the coalesced backfill repaint immediately (test use only). */
+      flushBackfillRepaint: () => flushBackfillRepaint(),
+      /** Whether a merged chat-history page is still waiting to be painted (test use only). */
+      isBackfillChatDirty: () => backfillChatDirty,
       /** Empty the persistent cache — the "clear cached data" control (FC4). */
       clearDataCache,
       /** Project an original lat/lon + pixel offset into a display LatLng. */

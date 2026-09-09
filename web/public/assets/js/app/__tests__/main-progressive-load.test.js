@@ -160,6 +160,140 @@ test('initial chat load renders the newest page without blocking on the full win
   }
 });
 
+test('a 3-page chat backfill renders the chat log at most twice (Phase 6 coalescing)', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  // Full newest page so the backfill walks backward through more pages.
+  const firstPage = Array.from({ length: MESSAGE_LIMIT }, (_, i) => ({
+    id: 400000 + i,
+    rx_time: now - i,
+    from_id: '!aabb',
+    text: `hello ${i}`,
+    channel: 0,
+    channel_name: 'Primary',
+    portnum: 1,
+  }));
+  /**
+   * Build one backward page; a full page continues pagination, a short one
+   * ends it. Timestamps sit well before `firstPage`'s range but still safely
+   * inside the 7-day retention window (unlike `firstPage`'s ~11+-day-old
+   * would-be equivalent) — this exercises the backfill's normal case (older
+   * rows *within* the window that a short newest page missed), not the
+   * window-trim path.
+   */
+  const backfillPage = (pageIndex, count) => Array.from({ length: count }, (_, i) => ({
+    id: 500000 + pageIndex * 10000 + i,
+    rx_time: now - 100000 - pageIndex * 1000 - i,
+    from_id: '!aabb',
+    text: `hist ${pageIndex}-${i}`,
+    channel: 0,
+    channel_name: 'Primary',
+    portnum: 1,
+  }));
+  let backfillCallCount = 0;
+
+  function stubFetch(url) {
+    if (url.startsWith('/api/messages')) {
+      if (url.includes('encrypted=true')) return jsonResponse([]);
+      if (url.includes('before=')) {
+        backfillCallCount += 1;
+        // Pages 1-2 are full (continue pagination); page 3 is short (stop).
+        return jsonResponse(backfillPage(backfillCallCount, backfillCallCount <= 2 ? MESSAGE_LIMIT : 1));
+      }
+      return jsonResponse(firstPage);
+    }
+    if (url.startsWith('/api/nodes/')) {
+      return jsonResponse({ node_id: '!aabb', short_name: 'AB', role: 'CLIENT' });
+    }
+    if (url.startsWith('/api/nodes')) {
+      return jsonResponse([{ node_id: '!aabb', last_heard: now, short_name: 'AB', role: 'CLIENT' }]);
+    }
+    return jsonResponse([]);
+  }
+
+  const env = createDomEnvironment({ includeBody: true });
+  // A registered #chat container so renderChatLog actually runs (and
+  // increments the stage counter this test asserts on) instead of no-op'ing.
+  env.registerElement('chat', env.createElement('div', 'chat'));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = url => stubFetch(url);
+  try {
+    const { _testUtils } = initializeApp(BASE_CONFIG);
+    await _testUtils.initialLoad;
+    // Reset immediately after the (already-settled) cold-load render, before
+    // any backfill page has had a chance to run — backfillChatHistory is
+    // fired void (fire-and-forget) from inside refresh(), so its pages land
+    // in later microtask/timer ticks, not before initialLoad resolves.
+    _testUtils.resetStageRenderCounts();
+
+    await settle(150); // let all 3 backward pages + the coalesced repaint(s) settle
+
+    assert.equal(backfillCallCount, 3, 'three backward pages were requested');
+    assert.equal(
+      _testUtils.getLoadedMessageCount(),
+      MESSAGE_LIMIT * 3 + 1,
+      'every backfilled page is merged in regardless of how the repaints coalesce',
+    );
+    const chatRenders = _testUtils.getStageRenderCounts().chat;
+    assert.ok(
+      chatRenders >= 1 && chatRenders <= 2,
+      `a 3-page chat backfill should render the chat log 1-2 times (coalesced), saw ${chatRenders}`,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.cleanup();
+  }
+});
+
+test('a chat-history page waiting alongside a collection page is painted by the same flush (Phase 6)', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const message = (id, text) => ({
+    id, rx_time: now - (500000 - id), from_id: '!aabb', text, channel: 0, channel_name: 'Primary', portnum: 1,
+  });
+  function stubFetch(url) {
+    if (url.startsWith('/api/messages')) {
+      if (url.includes('encrypted=true') || url.includes('before=')) return jsonResponse([]);
+      return jsonResponse([message(499999, 'newest')]);
+    }
+    if (url.startsWith('/api/nodes/')) {
+      return jsonResponse({ node_id: '!aabb', short_name: 'AB', role: 'CLIENT' });
+    }
+    if (url.startsWith('/api/nodes')) {
+      return jsonResponse([{ node_id: '!aabb', last_heard: now, short_name: 'AB', role: 'CLIENT' }]);
+    }
+    return jsonResponse([]);
+  }
+  const env = createDomEnvironment({ includeBody: true });
+  const chat = env.createElement('div', 'chat');
+  env.registerElement('chat', chat);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = url => stubFetch(url);
+  try {
+    const { _testUtils } = initializeApp(BASE_CONFIG);
+    await _testUtils.initialLoad;
+    await _testUtils.flushBackfill();
+    await _testUtils.flushCollectionBackfills();
+    const tabLabel = () => chat.querySelectorAll('.chat-tab')
+      .map(tab => tab.textContent)
+      .find(text => text.includes('Primary')) || '';
+    assert.ok(tabLabel().includes('(1)'), `one message painted before the pages land: ${tabLabel()}`);
+
+    // Both kinds of page merge before the coalesced repaint runs — the shape
+    // the cold load produces when the chat and collection backfills overlap.
+    await _testUtils.commitHistoricalMessages([message(499990, 'older')]);
+    _testUtils.commitBackfillPage('nodes', [{ node_id: '!ccdd', last_heard: now - 100, short_name: 'CD', role: 'CLIENT' }]);
+    assert.equal(_testUtils.isBackfillChatDirty(), true, 'the history page is waiting to be painted');
+    _testUtils.flushBackfillRepaint();
+
+    assert.equal(_testUtils.isBackfillChatDirty(), false, 'a flush that paints collection pages must paint the chat page too');
+    assert.equal(_testUtils.getLoadedMessageCount(), 2, 'the history page merged');
+    assert.equal(_testUtils.getLoadedNodeCount(), 2, 'the nodes page merged');
+    assert.ok(tabLabel().includes('(2)'), `the same flush must paint the history page: ${tabLabel()}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+    env.cleanup();
+  }
+});
+
 test('a failed background backfill is swallowed and leaves the newest page intact (#802)', async () => {
   const now = Math.floor(Date.now() / 1000);
   // Full newest page so the backfill attempts a second (older) page, which here
