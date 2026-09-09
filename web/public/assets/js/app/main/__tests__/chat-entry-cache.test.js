@@ -48,7 +48,7 @@ test('materialize builds a node on first sight and applies class + html', () => 
   assert.equal(node.className, 'chat-entry-msg');
   assert.equal(node.innerHTML, '<b>hi</b>');
   assert.equal(doc.created(), 1);
-  assert.deepEqual(cache.stats(), { materialized: 1 });
+  assert.deepEqual(cache.stats(), { materialized: 1, built: 0 });
 });
 
 test('materialize reuses the cached node when the html is unchanged', () => {
@@ -137,15 +137,115 @@ test('retainNamespaces accepts a plain iterable, not only a Set', () => {
   assert.equal(cache.size('channel-0'), 0);
 });
 
-test('resetStats clears the counter without evicting cached nodes', () => {
+test('resetStats clears both counters without evicting cached nodes', () => {
   const doc = makeDoc();
   const cache = createChatEntryCache({ documentRef: doc });
   const node = cache.materialize('log', 'a', 'c', 'A');
+  cache.materializeLazy('log', 'b', 'sig', () => ({ className: 'c', html: 'B' }));
   cache.resetStats();
-  assert.equal(cache.stats().materialized, 0);
+  assert.deepEqual(cache.stats(), { materialized: 0, built: 0 });
   // Still cached: re-materialising the same html returns the same node.
   assert.strictEqual(cache.materialize('log', 'a', 'c', 'A'), node);
   assert.equal(cache.stats().materialized, 0);
+});
+
+test('materializeLazy skips buildParts entirely on a signature hit', () => {
+  const doc = makeDoc();
+  const cache = createChatEntryCache({ documentRef: doc });
+  let buildCalls = 0;
+  const buildParts = () => {
+    buildCalls += 1;
+    return { className: 'chat-entry-msg', html: '<b>hi</b>' };
+  };
+
+  const first = cache.materializeLazy('channel-0', 'msg:1', 'sig-v1', buildParts);
+  assert.equal(buildCalls, 1, 'first sight always calls buildParts');
+  assert.equal(doc.created(), 1);
+  assert.deepEqual(cache.stats(), { materialized: 1, built: 1 });
+
+  const second = cache.materializeLazy('channel-0', 'msg:1', 'sig-v1', buildParts);
+  assert.strictEqual(second, first, 'a signature hit reuses the same node');
+  assert.equal(buildCalls, 1, 'a signature hit never calls buildParts');
+  assert.deepEqual(cache.stats(), { materialized: 1, built: 1 }, 'neither counter advances on a signature hit');
+});
+
+test('materializeLazy calls buildParts on a signature mismatch, and rebuilds the DOM node when the html actually differs', () => {
+  const doc = makeDoc();
+  const cache = createChatEntryCache({ documentRef: doc });
+  const first = cache.materializeLazy('log', 'k1', 'sig-v1', () => ({ className: 'c', html: 'old' }));
+  const second = cache.materializeLazy('log', 'k1', 'sig-v2', () => ({ className: 'c', html: 'new' }));
+  assert.notStrictEqual(second, first);
+  assert.equal(second.innerHTML, 'new');
+  assert.deepEqual(cache.stats(), { materialized: 2, built: 2 });
+});
+
+test('materializeLazy on a signature mismatch that yields identical html reuses the node but adopts the new signature', () => {
+  const doc = makeDoc();
+  const cache = createChatEntryCache({ documentRef: doc });
+  const first = cache.materializeLazy('log', 'k1', 'sig-v1', () => ({ className: 'c', html: 'same' }));
+  // A sender rename changes the signature, but this particular entry's HTML
+  // happens not to depend on the changed field, so the html comes back
+  // identical — the node is still reused (only the DOM parse is memoised
+  // against html, not against signature), while the stored signature is
+  // still updated so a *later* unrelated check does not re-flag it.
+  const second = cache.materializeLazy('log', 'k1', 'sig-v2', () => ({ className: 'c', html: 'same' }));
+  assert.strictEqual(second, first);
+  assert.deepEqual(cache.stats(), { materialized: 1, built: 2 }, 'buildParts still ran (signature changed) but no re-parse');
+
+  // The adopted signature is now sig-v2 — reusing it is a hit, no further build.
+  const third = cache.materializeLazy('log', 'k1', 'sig-v2', () => {
+    throw new Error('must not be called');
+  });
+  assert.strictEqual(third, first);
+  assert.deepEqual(cache.stats(), { materialized: 1, built: 2 });
+});
+
+test('materializeLazy returns null and caches nothing when buildParts yields null', () => {
+  const doc = makeDoc();
+  const cache = createChatEntryCache({ documentRef: doc });
+  let calls = 0;
+  const result = cache.materializeLazy('log', 'hidden-1', 'sig', () => {
+    calls += 1;
+    return null;
+  });
+  assert.equal(result, null);
+  assert.equal(cache.size('log'), 0);
+  assert.deepEqual(cache.stats(), { materialized: 0, built: 1 });
+
+  // Every subsequent call is treated as a fresh miss (nothing was cached),
+  // so buildParts runs again each time, even with the same signature.
+  cache.materializeLazy('log', 'hidden-1', 'sig', () => {
+    calls += 1;
+    return null;
+  });
+  assert.equal(calls, 2);
+});
+
+test('materializeLazy tolerates a non-function buildParts', () => {
+  const cache = createChatEntryCache({ documentRef: makeDoc() });
+  assert.equal(cache.materializeLazy('log', 'k1', 'sig', null), null);
+});
+
+test('materializeLazy keeps namespaces independent, same as materialize', () => {
+  const doc = makeDoc();
+  const cache = createChatEntryCache({ documentRef: doc });
+  const build = () => ({ className: 'c', html: 'h' });
+  const logNode = cache.materializeLazy('log', 'msg:1', 'sig', build);
+  const chanNode = cache.materializeLazy('channel-0', 'msg:1', 'sig', build);
+  assert.notStrictEqual(logNode, chanNode);
+  assert.equal(cache.size('log'), 1);
+  assert.equal(cache.size('channel-0'), 1);
+});
+
+test('prune and retainNamespaces treat materializeLazy entries the same as materialize entries', () => {
+  const doc = makeDoc();
+  const cache = createChatEntryCache({ documentRef: doc });
+  cache.materializeLazy('log', 'a', 'sig', () => ({ className: 'c', html: 'A' }));
+  cache.prune('log');
+  assert.equal(cache.size('log'), 1);
+  // 'a' not seen this cycle → pruned.
+  cache.prune('log');
+  assert.equal(cache.size('log'), 0);
 });
 
 test('size of an unknown namespace is zero', () => {

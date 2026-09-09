@@ -489,6 +489,15 @@ export function initializeApp(config) {
    * @type {Map<string, () => DocumentFragment>}
    */
   let lastChannelContentFactories = new Map();
+  /**
+   * The most recent full render's channel tab descriptors ({@link
+   * renderChatTabs}-shaped: id/label/iconSrc/content/index/isPrimaryFallback),
+   * reused wholesale on a Log-only tick (Phase 3e: `stages.log &&
+   * !stages.chatChannels`) so that tick skips rebuilding every channel's
+   * descriptor and content-factory closure.
+   * @type {Array<Object>}
+   */
+  let lastChannelTabs = [];
 
   // Persistent read-side cache (SPEC FC1–FC7). The IndexedDB backend is null
   // when storage is unavailable, and PRIVATE mode disables + wipes the cache —
@@ -3180,6 +3189,73 @@ export function initializeApp(config) {
   }
 
   /**
+   * Join a node's display-relevant fields into a cheap, comparable string.
+   * Shared by {@link messageEntrySignature} and {@link logEntrySignature} —
+   * both need this same "did the sender's badge change" proxy.
+   *
+   * @param {?Object} node Resolved sender/subject node, or null.
+   * @returns {string} Joined display-field signature (empty when node is null).
+   */
+  function nodeDisplaySignature(node) {
+    if (!node || typeof node !== 'object') return '';
+    return `${node.short_name ?? ''}|${node.long_name ?? ''}|${node.role ?? ''}|${node.protocol ?? ''}`;
+  }
+
+  /**
+   * Cheap, comparable proxy for whether a message's rendered chat-entry HTML
+   * could have changed since it was last built (Phase 3d, issue: frontend
+   * perf regression). Covers the message's own identity/edit-relevant fields
+   * and its *own* sender's display fields (``message.node``, kept current by
+   * {@link relinkMessageNodes} on every derive tick) plus the active filter
+   * (highlighting depends on it). Deliberately does **not** track a mentioned
+   * or quoted-reply sender's display fields — those are read from live
+   * ``nodesById``/``messagesById`` lookups inside {@link renderChatEntryContent}
+   * and a rename there is a rare, low-severity staleness (it self-corrects the
+   * next time this message's own fields, or the filter, change).
+   *
+   * @param {?Object} message Raw message payload (may carry ``.node`` from
+   *   hydration/relink).
+   * @param {string} filterQuery Active chat filter (affects highlighting).
+   * @returns {string} Signature string.
+   */
+  function messageEntrySignature(message, filterQuery) {
+    if (!message || typeof message !== 'object') {
+      return `msg||||${filterQuery}`;
+    }
+    const id = message.id ?? message.message_id ?? message.messageId ?? '';
+    const rxTime = message.rx_time ?? message.rxTime ?? '';
+    const replyId = message.reply_id ?? message.replyId ?? '';
+    return `msg|${id}|${rxTime}|${replyId}|${nodeDisplaySignature(message.node)}|${filterQuery}`;
+  }
+
+  /**
+   * Cheap, comparable proxy for whether a mixed-feed (Log tab) entry's
+   * rendered HTML could have changed since it was last built (Phase 3d). Log
+   * entries are append-only historical events — one packet, one row, never
+   * mutated in place — so the only thing that can legitimately still change
+   * for an already-cached entry is its resolved subject node's display
+   * fields (a rename after the packet was logged) and the active filter.
+   * Message/encrypted-message entries delegate to
+   * {@link messageEntrySignature} for the richer per-message signature.
+   *
+   * @param {?Object} entry Structured chat-log entry (already carries
+   *   ``.node``/``.neighborNode`` from ``attachNodeContextToLogEntries`` when
+   *   resolvable).
+   * @param {string} filterQuery Active chat filter.
+   * @returns {string} Signature string.
+   */
+  function logEntrySignature(entry, filterQuery) {
+    if (!entry || typeof entry !== 'object') {
+      return `log|||${filterQuery}`;
+    }
+    if (entry.type === CHAT_LOG_ENTRY_TYPES.MESSAGE || entry.type === CHAT_LOG_ENTRY_TYPES.MESSAGE_ENCRYPTED) {
+      return messageEntrySignature(entry.message, filterQuery);
+    }
+    const node = entry.node ?? null;
+    return `log|${entry.type}|${entry.ts}|${nodeDisplaySignature(node)}|${filterQuery}`;
+  }
+
+  /**
    * Compute the class name and HTML for a mixed-feed (Log tab) chat entry,
    * dispatching on the entry type, without touching the DOM. Returns ``null``
    * for entries that should not render. Used by the memoising render path.
@@ -3727,13 +3803,11 @@ export function initializeApp(config) {
     neighborEntries = [],
     traceEntries = [],
     waypointEntries = [],
-    filterQuery = ''
+    filterQuery = '',
+    stages = ALL_RENDER_STAGES
   }) {
     if (!CHAT_ENABLED || !chatEl) return;
     renderChatCount += 1;
-    // Reset the message→tab map for this render; buildChatFragment repopulates it
-    // as it materialises each channel tab's entries (SPEC VF3 tab flash).
-    messageTabId = new Map();
     const combinedMessages = Array.isArray(messages) ? [...messages] : [];
     if (Array.isArray(encryptedMessages) && encryptedMessages.length > 0) {
       combinedMessages.push(...encryptedMessages);
@@ -3777,18 +3851,79 @@ export function initializeApp(config) {
       filterQuery
     );
 
-    // Populate the message→tab map from the model directly, before any tab
-    // content is built (SPEC VF3 tab-header flash). This used to be a side
-    // effect of buildChatFragment, which ran for every channel on every
-    // render; lazy inactive panels (below) build only the active tab's
-    // content, so a hidden channel's tab header must still be able to flash
-    // even though its content is never materialised this tick.
-    for (const channel of filteredChannels) {
-      const tabId = channelTabId(channel);
-      for (const entry of channel.entries) {
-        const messageId = entryMessageId(entry);
-        if (messageId) messageTabId.set(messageId, tabId);
+    // Phase 3e: a tick where the Log tab needs new content but nothing
+    // message/display-related changed (stages.log && !stages.chatChannels —
+    // e.g. a positions/telemetry/neighbors/traces/waypoints-only delta) skips
+    // rebuilding every channel tab's descriptor and content-factory closure,
+    // and skips rebuilding the message→tab flash map — reusing the previous
+    // tick's, which are still correct since nothing they depend on moved.
+    // (buildChatTabModel/filterChatModel above still recompute `channels`
+    // regardless; memoising that call is a follow-up, not this phase.)
+    const reuseChannels = Boolean(
+      stages && stages.log && !stages.chatChannels && lastChannelTabs.length > 0
+    );
+    let channelTabs;
+    if (reuseChannels) {
+      channelTabs = lastChannelTabs;
+    } else {
+      // Reset the message→tab map for this render; the loop below repopulates
+      // it from the model directly, before any tab content is built (SPEC
+      // VF3 tab-header flash) — a side effect of buildChatFragment previously,
+      // which ran for every channel on every render; lazy inactive panels
+      // (Phase 3b) build only the active tab's content, so a hidden channel's
+      // tab header must still be able to flash even though its content is
+      // never materialised this tick.
+      messageTabId = new Map();
+      for (const channel of filteredChannels) {
+        const tabId = channelTabId(channel);
+        for (const entry of channel.entries) {
+          const messageId = entryMessageId(entry);
+          if (messageId) messageTabId.set(messageId, tabId);
+        }
       }
+
+      // Replaced (not mutated) each render: a stale entry for a channel that
+      // dropped out of the window would otherwise linger and let a late click
+      // on an since-removed tab resurrect it.
+      const nextChannelContentFactories = new Map();
+      channelTabs = filteredChannels.map(channel => {
+        const tabId = channelTabId(channel);
+        // Channel tabs are the chat proper: render the entire window (issue
+        // #796, amended — load the whole window, render on demand) rather
+        // than only the newest CHAT_LIMIT. CHAT_CHANNEL_RENDER_CAP bounds the
+        // *initial* paint; "show older" (expandChatTab) lifts it per tab,
+        // mirroring the node table's "show all" (Phase 3c).
+        const contentFactory = () => buildChatFragment({
+          namespace: tabId,
+          entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
+          renderParts: entry => buildMessageChatEntryParts(entry.item),
+          keyOf: entry => chatMessageEntryKey(entry.item),
+          signatureOf: entry => messageEntrySignature(entry.item, filterQuery),
+          emptyLabel: 'No messages on this channel.',
+          limit: Infinity,
+          cap: CHAT_CHANNEL_RENDER_CAP,
+          expanded: expandedChatTabs.has(tabId),
+          tabId
+        });
+        nextChannelContentFactories.set(tabId, contentFactory);
+        return {
+          id: tabId,
+          // The tab label always shows the full window's count, regardless of
+          // the render cap — only what's painted is capped, not what the
+          // reader is told is there.
+          label: `${channel.label} (${channel.messageCount})`,
+          iconSrc: isMeshtasticProtocol(channel.protocol)
+            ? MESHTASTIC_ICON_SRC
+            : isMeshcoreProtocol(channel.protocol)
+              ? MESHCORE_ICON_SRC
+              : null,
+          content: contentFactory,
+          index: channel.index,
+          isPrimaryFallback: Boolean(channel.isPrimaryFallback)
+        };
+      });
+      lastChannelContentFactories = nextChannelContentFactories;
+      lastChannelTabs = channelTabs;
     }
 
     // Content is a factory, not a built fragment: renderChatTabs (chat-tabs.js)
@@ -3801,49 +3936,9 @@ export function initializeApp(config) {
       entries: filteredLogEntries,
       renderParts: buildChatLogEntryParts,
       keyOf: chatLogEntryKey,
+      signatureOf: entry => logEntrySignature(entry, filterQuery),
       emptyLabel: 'No recent mesh activity.'
     });
-
-    // Replaced (not mutated) each render: a stale entry for a channel that
-    // dropped out of the window would otherwise linger and let a late click
-    // on an since-removed tab resurrect it.
-    const nextChannelContentFactories = new Map();
-    const channelTabs = filteredChannels.map(channel => {
-      const tabId = channelTabId(channel);
-      // Channel tabs are the chat proper: render the entire window (issue #796,
-      // amended — load the whole window, render on demand) rather than only the
-      // newest CHAT_LIMIT. CHAT_CHANNEL_RENDER_CAP bounds the *initial* paint;
-      // "show older" (expandChatTab) lifts it per tab, mirroring the node
-      // table's "show all" (issue: frontend perf regression, Phase 3c).
-      const contentFactory = () => buildChatFragment({
-        namespace: tabId,
-        entries: channel.entries.map(e => ({ ts: e.ts, item: e.message })),
-        renderParts: entry => buildMessageChatEntryParts(entry.item),
-        keyOf: entry => chatMessageEntryKey(entry.item),
-        emptyLabel: 'No messages on this channel.',
-        limit: Infinity,
-        cap: CHAT_CHANNEL_RENDER_CAP,
-        expanded: expandedChatTabs.has(tabId),
-        tabId
-      });
-      nextChannelContentFactories.set(tabId, contentFactory);
-      return {
-        id: tabId,
-        // The tab label always shows the full window's count, regardless of
-        // the render cap — only what's painted is capped, not what the reader
-        // is told is there.
-        label: `${channel.label} (${channel.messageCount})`,
-        iconSrc: isMeshtasticProtocol(channel.protocol)
-          ? MESHTASTIC_ICON_SRC
-          : isMeshcoreProtocol(channel.protocol)
-            ? MESHCORE_ICON_SRC
-            : null,
-        content: contentFactory,
-        index: channel.index,
-        isPrimaryFallback: Boolean(channel.isPrimaryFallback)
-      };
-    });
-    lastChannelContentFactories = nextChannelContentFactories;
 
     const tabs = [
       { id: 'log', label: 'Log', content: logContent },
@@ -3901,6 +3996,7 @@ export function initializeApp(config) {
    *   entries: Array<{ ts: number, item?: Object }>,
    *   renderParts: Function,
    *   keyOf: Function,
+   *   signatureOf?: ?Function,
    *   emptyLabel?: string,
    *   limit?: number,
    *   cap?: ?number,
@@ -3913,7 +4009,11 @@ export function initializeApp(config) {
    *   user-liftable per-channel render cap ({@link CHAT_CHANNEL_RENDER_CAP}):
    *   when finite and not ``expanded``, only the newest ``cap`` entries render
    *   and a "show older" control (stamped with ``tabId``) is prepended above
-   *   them; the Log tab passes no ``cap`` and is unaffected.
+   *   them; the Log tab passes no ``cap`` and is unaffected. ``signatureOf``
+   *   is the cheap-to-compute proxy {@link module:main/chat-entry-cache}'s
+   *   ``materializeLazy`` uses to skip calling ``renderParts`` at all when an
+   *   entry's rendered HTML could not have changed (Phase 3d); omit it to fall
+   *   back to always calling ``renderParts`` (matches pre-Phase-3d behaviour).
    * @returns {DocumentFragment} Populated fragment.
    */
   function buildChatFragment({
@@ -3921,6 +4021,7 @@ export function initializeApp(config) {
     entries = [],
     renderParts,
     keyOf,
+    signatureOf = null,
     emptyLabel,
     limit = CHAT_LIMIT,
     cap = null,
@@ -3950,11 +4051,17 @@ export function initializeApp(config) {
       if (typeof renderParts !== 'function' || typeof keyOf !== 'function') {
         continue;
       }
-      const parts = renderParts(entry);
-      if (!parts) {
+      // A signature hit skips renderParts entirely (Phase 3d) — the HTML
+      // string is never built just to discover it is unchanged. A fresh
+      // ``Symbol()`` when no ``signatureOf`` is given never equals a stored
+      // signature, so that path always falls through to renderParts, exactly
+      // matching pre-Phase-3d behaviour.
+      const key = keyOf(entry);
+      const signature = typeof signatureOf === 'function' ? signatureOf(entry) : Symbol('no-signature');
+      const node = chatEntryCache.materializeLazy(namespace, key, signature, () => renderParts(entry));
+      if (!node) {
         continue;
       }
-      const node = chatEntryCache.materialize(namespace, keyOf(entry), parts.className, parts.html);
       // Tag message rows so a live update can flash them (SPEC VF3). The
       // message→tab map itself is populated at the model level in
       // renderChatLog (Phase 3a), not here — a channel tab whose content is
@@ -5376,9 +5483,13 @@ export function initializeApp(config) {
    *
    * @param {string} [filterQuery] Raw filter text for substring highlighting;
    *   defaults to the current filter input value.
+   * @param {Object} [stages] Which render stages need to run this tick (see
+   *   `main/render-stages.js`); defaults to every stage. Lets
+   *   {@link renderChatLog} skip rebuilding the channel tabs entirely on a
+   *   Log-only tick (Phase 3e).
    * @returns {void}
    */
-  function rerenderChatLog(filterQuery = filterInput ? filterInput.value : '') {
+  function rerenderChatLog(filterQuery = filterInput ? filterInput.value : '', stages = ALL_RENDER_STAGES) {
     renderChatLog({
       nodes: allNodes,
       messages: allMessages,
@@ -5388,7 +5499,8 @@ export function initializeApp(config) {
       neighborEntries: allNeighbors,
       traceEntries: allTraces,
       waypointEntries: allWaypoints,
-      filterQuery
+      filterQuery,
+      stages
     });
   }
 
@@ -5431,7 +5543,7 @@ export function initializeApp(config) {
     // nodes-only ping with no display-field change) skips the chat rebuild
     // entirely.
     if (stages.chatChannels || stages.log) {
-      rerenderChatLog(filterQuery);
+      rerenderChatLog(filterQuery, stages);
     }
   }
 
@@ -6138,6 +6250,13 @@ export function initializeApp(config) {
       resetChatRenderStats: () => {
         chatEntryCache.resetStats();
       },
+      /**
+       * The most recent full render's channel tab descriptor array (test use
+       * only) — asserts Phase 3e's log-only reuse by reference identity: a
+       * log-only tick must return this *same* array/factories, not rebuild
+       * equivalent-looking new ones.
+       */
+      getLastChannelTabs: () => lastChannelTabs,
       /** Number of plaintext chat messages currently loaded (test use only). */
       getLoadedMessageCount: () => allMessages.length,
       /** Number of node rows currently loaded into the table (test use only). */
