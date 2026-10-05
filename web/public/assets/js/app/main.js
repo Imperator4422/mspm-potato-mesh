@@ -69,7 +69,7 @@ import { createShortInfoOverlayStack } from './short-info-overlay-manager.js';
 // (see loadNodeDetailOverlayManager) to keep its heavy node-detail renderer
 // subtree out of the dashboard boot graph (frontend perf).
 import { refreshNodeInformation } from './node-details.js';
-import { extractModemMetadata, formatLoraFrequencyMHz, formatModemDisplay, formatPresetDisplay } from './node-modem-metadata.js';
+import { extractModemMetadata, formatModemDisplay } from './node-modem-metadata.js';
 import {
   TELEMETRY_FIELDS,
   buildTelemetryDisplayEntries,
@@ -341,18 +341,6 @@ export function initializeApp(config) {
     node_id: { getValue: n => n.node_id, compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
     short_name: { getValue: n => n.short_name, compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
     long_name: { getValue: n => n.long_name, compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
-    lora_freq: {
-      getValue: n => n.lora_freq ?? n.loraFreq ?? n.frequency,
-      compare: compareNumber,
-      hasValue: hasNumberValue,
-      defaultDirection: 'desc'
-    },
-    modem_preset: {
-      getValue: n => n.modem_preset ?? n.modemPreset,
-      compare: compareString,
-      hasValue: hasStringValue,
-      defaultDirection: 'asc'
-    },
     last_heard: { getValue: n => n.last_heard, compare: compareNumber, hasValue: hasNumberValue, defaultDirection: 'desc' },
     role: { getValue: n => n.role, compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
     hw_model: { getValue: n => n.hw_model, compare: compareString, hasValue: hasStringValue, defaultDirection: 'asc' },
@@ -4949,11 +4937,6 @@ export function initializeApp(config) {
       const latitudeDisplay = fmtCoords(n.latitude);
       const longitudeDisplay = fmtCoords(n.longitude);
       const nodeDisplayName = getNodeDisplayNameForOverlay(n);
-      const modemMetadata = extractModemMetadata(n);
-      const loraFrequencyText = formatLoraFrequencyMHz(modemMetadata.loraFreq);
-      const loraFrequencyDisplay = loraFrequencyText ? escapeHtml(loraFrequencyText) : '';
-      const resolvedPreset = formatPresetDisplay(modemMetadata.modemPreset, modemMetadata.loraFreq);
-      const modemPresetDisplay = resolvedPreset ? escapeHtml(resolvedPreset) : '';
       const longNameHtml = renderNodeLongNameLink(n.long_name, n.node_id);
       const protocolIconCell = protocolIconPrefixHtml(n.protocol);
       // Measurement cells render the muted dash for absent values (SPEC UX4)
@@ -4964,8 +4947,6 @@ export function initializeApp(config) {
         <td class="mono nodes-col nodes-col--node-id">${escapeHtml(n.node_id || "")}</td>
         <td class="nodes-col nodes-col--short-name">${renderShortHtml(n.short_name, n.role, n.long_name, n)}</td>
         <td class="nodes-col nodes-col--long-name">${longNameHtml}</td>
-        <td class="nodes-col nodes-col--frequency num">${formatTableCell(loraFrequencyDisplay)}</td>
-        <td class="nodes-col nodes-col--modem-preset">${formatTableCell(modemPresetDisplay)}</td>
         ${timestampCells.lastSeen}
         <td class="nodes-col nodes-col--role">${escapeHtml(n.role || "CLIENT")}</td>
         <td class="nodes-col nodes-col--hw-model">${formatTableCell(escapeHtml(fmtHw(n.hw_model)))}</td>
@@ -5016,8 +4997,6 @@ export function initializeApp(config) {
       const extraParts = nodeExtraRowParts(
         filterReportedFields([
           { label: 'Node ID', valueHtml: formatTableCell(escapeHtml(n.node_id || '')) },
-          { label: 'Frequency', valueHtml: formatTableCell(loraFrequencyDisplay) },
-          { label: 'LoRa Preset', valueHtml: formatTableCell(modemPresetDisplay) },
           { label: 'Role', valueHtml: escapeHtml(n.role || 'CLIENT') },
           { label: 'HW Model', valueHtml: formatTableCell(escapeHtml(fmtHw(n.hw_model))) },
           { label: 'Voltage', valueHtml: formatTableCell(fmtVoltage(n.voltage)) },

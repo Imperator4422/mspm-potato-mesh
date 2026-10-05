@@ -21,7 +21,6 @@
           colspans are kept in sync with the responsive tiers by JS. %>
       <tr class="nodes-group-header">
         <th data-group="Identity" colspan="4" scope="colgroup">Identity</th>
-        <th data-group="Radio" colspan="2" scope="colgroup">Radio</th>
         <th data-group="Activity" colspan="2" scope="colgroup">Activity</th>
         <th data-group="Health" colspan="4" scope="colgroup">Health</th>
         <th data-group="Utilization" colspan="2" scope="colgroup">Utilization</th>
@@ -34,8 +33,6 @@
         <th class="nodes-col nodes-col--node-id" scope="col"><button type="button" class="sort-button" data-sort-key="node_id" data-sort-label="Node ID">Node ID <span class="sort-indicator" aria-hidden="true"></span></button></th>
         <th class="nodes-col nodes-col--short-name" scope="col"><button type="button" class="sort-button" data-sort-key="short_name" data-sort-label="Short Name">Short <span class="sort-indicator" aria-hidden="true"></span></button></th>
         <th class="nodes-col nodes-col--long-name" scope="col"><button type="button" class="sort-button" data-sort-key="long_name" data-sort-label="Long Name">Long Name <span class="sort-indicator" aria-hidden="true"></span></button></th>
-        <th class="nodes-col nodes-col--frequency num" scope="col"><button type="button" class="sort-button" data-sort-key="lora_freq" data-sort-label="Modem Frequency">Frequency <span class="sort-indicator" aria-hidden="true"></span></button></th>
-        <th class="nodes-col nodes-col--modem-preset" scope="col"><button type="button" class="sort-button" data-sort-key="modem_preset" data-sort-label="LoRa Preset">LoRa Preset <span class="sort-indicator" aria-hidden="true"></span></button></th>
         <th class="nodes-col nodes-col--last-seen" scope="col"><button type="button" class="sort-button" data-sort-key="last_heard" data-sort-label="Last Seen">Last Seen <span class="sort-indicator" aria-hidden="true"></span></button></th>
         <th class="nodes-col nodes-col--role" scope="col"><button type="button" class="sort-button" data-sort-key="role" data-sort-label="Role">Role <span class="sort-indicator" aria-hidden="true"></span></button></th>
         <th class="nodes-col nodes-col--hw-model" scope="col"><button type="button" class="sort-button" data-sort-key="hw_model" data-sort-label="Hardware Model">HW Model <span class="sort-indicator" aria-hidden="true"></span></button></th>
@@ -57,7 +54,7 @@
       <%# Server-rendered waiting row (SPEC UX4): visible pre-boot, with JS
           disabled, and while the mesh is genuinely silent; the render path
           removes it once nodes exist. %>
-      <tr class="nodes-empty-row"><td colspan="22">No nodes heard yet — waiting for the first ingestor report.</td></tr>
+      <tr class="nodes-empty-row"><td colspan="20">No nodes heard yet — waiting for the first ingestor report.</td></tr>
     </tbody>
   </table>
 </div>

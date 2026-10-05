@@ -36,16 +36,15 @@ import {
   rowActivationHref,
 } from '../nodes-table-ia.js';
 
-test('column groups cover all 21 data columns exactly once, in order', () => {
+test('column groups cover all 19 data columns exactly once, in order', () => {
   const columns = NODES_TABLE_COLUMN_GROUPS.flatMap(group => group.columns);
-  assert.equal(columns.length, 21);
-  assert.equal(new Set(columns).size, 21, 'no column sits in two groups');
+  assert.equal(columns.length, 19);
+  assert.equal(new Set(columns).size, 19, 'no column sits in two groups');
   assert.equal(columns[0], 'nodes-col--protocol');
   assert.equal(columns[columns.length - 1], 'nodes-col--last-position');
   const labels = NODES_TABLE_COLUMN_GROUPS.map(group => group.label);
   assert.deepEqual(labels, [
     'Identity',
-    'Radio',
     'Activity',
     'Health',
     'Utilization',
@@ -55,14 +54,13 @@ test('column groups cover all 21 data columns exactly once, in order', () => {
 });
 
 test('group colspans shrink with hidden columns and drop empty groups', () => {
-  const hidden = new Set(['nodes-col--frequency', 'nodes-col--modem-preset']);
+  const hidden = new Set(['nodes-col--node-id']);
   const spans = computeGroupColspans(NODES_TABLE_COLUMN_GROUPS, cls => !hidden.has(cls));
-  assert.ok(!spans.some(span => span.label === 'Radio'), 'a fully hidden group is omitted');
   const identity = spans.find(span => span.label === 'Identity');
-  assert.equal(identity.colspan, 4);
+  assert.equal(identity.colspan, 3);
 });
 
-test('numeric column set matches the 12 measurement columns', () => {
+test('numeric column set matches the 11 measurement columns', () => {
   assert.deepEqual(
     [...NUMERIC_COLUMN_CLASSES].sort(),
     [
@@ -70,7 +68,6 @@ test('numeric column set matches the 12 measurement columns', () => {
       'nodes-col--altitude',
       'nodes-col--battery',
       'nodes-col--channel-util',
-      'nodes-col--frequency',
       'nodes-col--humidity',
       'nodes-col--latitude',
       'nodes-col--longitude',
@@ -251,17 +248,17 @@ function groupCellStub(group, colspan) {
 
 test('syncGroupHeaderColspans rewrites colspans and hides empty groups', () => {
   const identity = groupCellStub('Identity', '4');
-  const radio = groupCellStub('Radio', '2');
+  const activity = groupCellStub('Activity', '2');
   const stray = groupCellStub('Nonexistent', '1');
-  const row = { querySelectorAll: () => [identity, radio, stray] };
-  const hidden = new Set(['nodes-col--frequency', 'nodes-col--modem-preset', 'nodes-col--node-id']);
+  const row = { querySelectorAll: () => [identity, activity, stray] };
+  const hidden = new Set(['nodes-col--node-id', 'nodes-col--last-seen', 'nodes-col--role']);
   syncGroupHeaderColspans(row, NODES_TABLE_COLUMN_GROUPS, cls => !hidden.has(cls));
   assert.equal(identity.attrs.colspan, '3', 'Identity shrinks with its hidden column');
-  assert.equal(radio.hidden, true, 'a fully hidden group hides its header');
+  assert.equal(activity.hidden, true, 'a fully hidden group hides its header');
   assert.equal(stray.attrs.colspan, '1', 'unknown groups are left alone');
   // Restoring visibility un-hides and re-spans.
   syncGroupHeaderColspans(row, NODES_TABLE_COLUMN_GROUPS, () => true);
-  assert.equal(radio.hidden, false);
-  assert.equal(radio.attrs.colspan, '2');
+  assert.equal(activity.hidden, false);
+  assert.equal(activity.attrs.colspan, '2');
   assert.doesNotThrow(() => syncGroupHeaderColspans(null, NODES_TABLE_COLUMN_GROUPS, () => true));
 });

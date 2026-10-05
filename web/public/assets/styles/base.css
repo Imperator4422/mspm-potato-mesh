@@ -2369,9 +2369,7 @@ button.legend-item[aria-pressed="true"] {
 }
 
 @media (max-width: 1679px) {
-  .nodes-col--node-id,
-  .nodes-col--frequency,
-  .nodes-col--modem-preset {
+  .nodes-col--node-id {
     display: none;
   }
 }
@@ -2401,9 +2399,7 @@ button.legend-item[aria-pressed="true"] {
 }
 
 @media (max-width: 899px) {
-  .nodes-col--uptime,
-  .nodes-col--frequency,
-  .nodes-col--modem-preset {
+  .nodes-col--uptime {
     display: none;
   }
 }

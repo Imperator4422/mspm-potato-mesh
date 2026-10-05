@@ -43,10 +43,6 @@ export const NODES_TABLE_COLUMN_GROUPS = Object.freeze([
     ]),
   }),
   Object.freeze({
-    label: 'Radio',
-    columns: Object.freeze(['nodes-col--frequency', 'nodes-col--modem-preset']),
-  }),
-  Object.freeze({
     label: 'Activity',
     columns: Object.freeze(['nodes-col--last-seen', 'nodes-col--role']),
   }),
@@ -94,8 +90,6 @@ export const NODES_TABLE_HIDE_TIERS = Object.freeze([
     maxWidth: 1679,
     columns: Object.freeze([
       'nodes-col--node-id',
-      'nodes-col--frequency',
-      'nodes-col--modem-preset',
     ]),
   }),
   Object.freeze({
@@ -138,7 +132,6 @@ export const NODES_TABLE_HIDE_TIERS = Object.freeze([
 
 /** Column classes whose cells are numeric measurements (right-aligned mono). */
 export const NUMERIC_COLUMN_CLASSES = Object.freeze([
-  'nodes-col--frequency',
   'nodes-col--battery',
   'nodes-col--voltage',
   'nodes-col--uptime',
@@ -220,10 +213,10 @@ export function syncGroupHeaderColspans(groupRow, groups, isColumnVisible) {
 }
 
 /**
- * Total column count of the rendered nodes table: the 21 data columns plus
+ * Total column count of the rendered nodes table: the 19 data columns plus
  * the disclosure (`+`) column.
  */
-export const NODES_TABLE_TOTAL_COLUMNS = 22;
+export const NODES_TABLE_TOTAL_COLUMNS = 20;
 
 /**
  * Decide whether a hidden field actually reported a value.
